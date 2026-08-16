@@ -16,6 +16,7 @@ import {
   type ChatNativeToolsConfig,
   type ChatMemoryConfig,
   defaultNativeTools,
+  defaultImGateway,
   type ReplaceTranslationPackStatus,
   type RapidOcrTier,
 } from '../api/tauri'
@@ -29,7 +30,7 @@ import {
 import { i18n } from './i18n'
 import {
   GeneralIcon, HotkeysIcon, TranslateIcon, LensIcon, ChatIcon, MemoryIcon, MixerIcon,
-  AgentIcon, WebSearchIcon, ConnectorsIcon, PluginsIcon, UsageIcon, ProvidersIcon, AboutIcon, HooksIcon,
+  AgentIcon, WebSearchIcon, ConnectorsIcon, PluginsIcon, UsageIcon, ProvidersIcon, AboutIcon, HooksIcon, ImGatewayIcon,
 } from './NavIcons'
 import { PluginCenter } from '../chat/PluginCenter'
 import { buildHotkey, formatHotkeyError, getPlatform, isProviderEnabled, stableStringify } from './utils'
@@ -48,6 +49,7 @@ import { MemoryTab } from './tabs/MemoryTab'
 import { ChatTab } from './tabs/ChatTab'
 import { ProvidersTab } from './tabs/ProvidersTab'
 import { HooksTab } from './tabs/HooksTab'
+import { ImGatewayTab } from './tabs/ImGatewayTab'
 import { AppearanceGroup, BehaviorGroup, PermissionsGroup } from './tabs/GeneralTab'
 import { AppInfoGroup, UpdateGroup } from './tabs/AboutTab'
 import { MEMORY_L1_MAX_BYTES, utf8ByteLength, type MemoryLayerKey } from './memoryLayers'
@@ -67,7 +69,7 @@ import { ConnectorsPanel } from './ConnectorsPanel'
 import { WebSearchPanel } from './WebSearchPanel'
 import { defaultChatTools } from './chatToolsShared'
 
-export type SettingsTab = 'general' | 'hotkeys' | 'translate' | 'lens' | 'chat' | 'memory' | 'mixer' | 'externalAgents' | 'hooks' | 'webSearch' | 'connectors' | 'plugins' | 'usage' | 'providers' | 'about'
+export type SettingsTab = 'general' | 'hotkeys' | 'translate' | 'lens' | 'chat' | 'memory' | 'mixer' | 'externalAgents' | 'hooks' | 'imGateway' | 'webSearch' | 'connectors' | 'plugins' | 'usage' | 'providers' | 'about'
 
 type SettingsData = SettingsType
 // UI 字号：以 px 展示、以整体缩放（zoom）实现。CSS 全是 px 硬编码，做不了真正的 rem 基准字号，
@@ -1704,6 +1706,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     { id: 'mixer' as const, label: t.tabMixer, icon: MixerIcon },
     { id: 'externalAgents' as const, label: t.tabExternalAgents, icon: AgentIcon },
     { id: 'hooks' as const, label: t.tabHooks, icon: HooksIcon },
+    { id: 'imGateway' as const, label: lang === 'zh' ? 'IM 网关' : 'IM Gateway', icon: ImGatewayIcon },
     { id: 'connectors' as const, label: t.tabConnectors, icon: ConnectorsIcon },
     { id: 'plugins' as const, label: t.tabPlugins, icon: PluginsIcon },
     { id: 'webSearch' as const, label: t.tabWebSearch, icon: WebSearchIcon },
@@ -1755,6 +1758,12 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     hooks: {
       title: t.tabHooks,
       subtitle: t.hooksPageSubtitle,
+    },
+    imGateway: {
+      title: lang === 'zh' ? 'IM 网关' : 'IM Gateway',
+      subtitle: lang === 'zh'
+        ? 'QQ（NapCat/OneBot11）私聊驱动 Kivio 会话，结果回发手机。'
+        : 'Drive Kivio conversations from QQ (NapCat/OneBot11); results are sent back to your phone.',
     },
     connectors: {
       title: t.tabConnectors,
@@ -2093,6 +2102,15 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
                 lang={lang}
                 hooks={chatTools.hooks ?? []}
                 onChange={(hooks) => updateChatTools({ hooks })}
+              />
+            )}
+
+            {/* ===== IM 网关标签页（QQ ↔ Kivio） ===== */}
+            {activeTab === 'imGateway' && (
+              <ImGatewayTab
+                lang={lang}
+                config={settings.imGateway ?? defaultImGateway()}
+                onChange={(imGateway) => updateSettings({ imGateway })}
               />
             )}
 

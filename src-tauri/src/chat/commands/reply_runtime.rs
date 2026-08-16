@@ -5,7 +5,8 @@ use crate::state::AppState;
 
 use super::ChatMessage;
 
-pub(super) const CHAT_REPLY_BUSY_ERROR: &str = "该对话正在生成中，请稍后再试";
+// im_gateway（chat::commands 之外）也需要比对 busy 文案，故放宽到 crate 可见。
+pub(crate) const CHAT_REPLY_BUSY_ERROR: &str = "该对话正在生成中，请稍后再试";
 /// 多模型一问多答的并排上限（决策 D4）。超过此数不允许发送。
 pub(super) const MAX_REPLY_MODELS: usize = 4;
 

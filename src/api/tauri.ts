@@ -461,6 +461,27 @@ export function defaultNativeTools(): ChatNativeToolsConfig {
   }
 }
 
+/** IM 网关（QQ/NapCat OneBot11 ↔ Kivio 会话）。镜像 Rust ImGatewayConfig。 */
+export type ImGatewayConfig = {
+  enabled: boolean
+  wsUrl: string
+  accessToken: string
+  allowUsers: string[]
+  timeoutSec: number
+  splitLength: number
+}
+
+export function defaultImGateway(): ImGatewayConfig {
+  return {
+    enabled: false,
+    wsUrl: 'ws://127.0.0.1:3001',
+    accessToken: '',
+    allowUsers: [],
+    timeoutSec: 600,
+    splitLength: 3800,
+  }
+}
+
 export type SkillFileEntry = {
   relativePath: string
   kind: 'skillmd' | 'reference' | 'script' | 'asset' | 'other' | string
@@ -1028,6 +1049,7 @@ export type Settings = {
   translatorPrompt?: string
   providers: ModelProvider[]
   chatTools: ChatToolsConfig
+  imGateway?: ImGatewayConfig
   documentProcessing?: DocumentProcessingConfig
   knowledgeBase?: KnowledgeBaseConfig
   /** 供应商自定义图标：provider id → 图标 key（见 chat/ModelIcon 的 PROVIDER_BRANDS） */
@@ -1585,6 +1607,15 @@ function normalizeChatMemory(config?: Partial<ChatMemoryConfig> | null): ChatMem
   }
 }
 
+function normalizeImGateway(config?: Partial<ImGatewayConfig> | null): ImGatewayConfig {
+  const current = config ?? {}
+  return {
+    ...defaultImGateway(),
+    ...current,
+    allowUsers: Array.isArray(current.allowUsers) ? current.allowUsers : [],
+  }
+}
+
 function normalizeDefaultModelSelection(selection?: Partial<DefaultModelSelection> | null): DefaultModelSelection {
   return {
     providerId: selection?.providerId ?? '',
@@ -1703,6 +1734,7 @@ export function normalizeSettings(settings: Settings): Settings {
     chatMemory: normalizeChatMemory(current.chatMemory),
     providers: Array.isArray(current.providers) ? current.providers.map(normalizeProvider) : [],
     chatTools: normalizeChatTools(current.chatTools),
+    imGateway: normalizeImGateway(current.imGateway),
     retryEnabled: current.retryEnabled ?? true,
     retryAttempts: current.retryAttempts ?? 3,
     screenshotTranslation: {

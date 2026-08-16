@@ -1022,6 +1022,52 @@ pub fn default_chat_working_directory() -> String {
         .to_string()
 }
 
+fn default_im_gateway_ws_url() -> String {
+    "ws://127.0.0.1:3001".to_string()
+}
+
+fn default_im_gateway_timeout_sec() -> u64 {
+    600
+}
+
+fn default_im_gateway_split_length() -> usize {
+    3800
+}
+
+/// IM 网关（QQ/NapCat OneBot11 ↔ Kivio 会话）配置。
+///
+/// 网关以 WebSocket 客户端身份连接本机 NapCat 的 OneBot11 正向 WS；白名单外的私聊
+/// 静默丢弃。`allow_users` 沿用 hooks 的 null 归一（前端漏传字段会被序列化成 null，
+/// `default` 只兜「键不存在」，null 会让整个分区解析失败）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ImGatewayConfig {
+    pub enabled: bool,
+    #[serde(default = "default_im_gateway_ws_url")]
+    pub ws_url: String,
+    #[serde(default)]
+    pub access_token: String,
+    #[serde(default, deserialize_with = "null_tolerant_vec")]
+    pub allow_users: Vec<String>,
+    #[serde(default = "default_im_gateway_timeout_sec")]
+    pub timeout_sec: u64,
+    #[serde(default = "default_im_gateway_split_length")]
+    pub split_length: usize,
+}
+
+impl Default for ImGatewayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            ws_url: default_im_gateway_ws_url(),
+            access_token: String::new(),
+            allow_users: Vec::new(),
+            timeout_sec: default_im_gateway_timeout_sec(),
+            split_length: default_im_gateway_split_length(),
+        }
+    }
+}
+
 fn default_skill_auto_match() -> bool {
     true
 }
@@ -1565,6 +1611,8 @@ pub struct Settings {
     #[serde(default)]
     pub chat_tools: ChatToolsConfig,
     #[serde(default)]
+    pub im_gateway: ImGatewayConfig,
+    #[serde(default)]
     pub document_processing: DocumentProcessingConfig,
     #[serde(default)]
     pub knowledge_base: KnowledgeBaseConfig,
@@ -1719,6 +1767,7 @@ impl Default for Settings {
             close_chat_hotkey: default_close_chat_hotkey(),
             theme: "system".to_string(),
             theme_color: default_theme_color(),
+            im_gateway: ImGatewayConfig::default(),
             translucent_sidebar: false,
             ui_font_scale: default_ui_font_scale(),
             ui_font_family: String::new(),
@@ -2424,6 +2473,24 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
         crate::chat::sub_agent::SUB_AGENT_CONCURRENCY_MIN,
         crate::chat::sub_agent::SUB_AGENT_CONCURRENCY_MAX,
     );
+
+    // IM 网关：地址 trim；开了但没地址的直接关（监督循环依赖非空 ws_url）；
+    // 白名单去空去重；超时与分段长度钳到合理区间。
+    settings.im_gateway.ws_url = settings.im_gateway.ws_url.trim().to_string();
+    if settings.im_gateway.enabled && settings.im_gateway.ws_url.is_empty() {
+        settings.im_gateway.enabled = false;
+    }
+    let mut im_allow: Vec<String> = settings
+        .im_gateway
+        .allow_users
+        .iter()
+        .map(|u| u.trim().to_string())
+        .filter(|u| !u.is_empty())
+        .collect();
+    im_allow.dedup();
+    settings.im_gateway.allow_users = im_allow;
+    settings.im_gateway.timeout_sec = settings.im_gateway.timeout_sec.clamp(30, 7200);
+    settings.im_gateway.split_length = settings.im_gateway.split_length.clamp(200, 8000);
     settings.chat_tools.mcp_idle_timeout_ms = settings
         .chat_tools
         .mcp_idle_timeout_ms

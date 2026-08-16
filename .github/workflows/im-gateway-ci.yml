@@ -1,0 +1,46 @@
+name: IM Gateway CI
+
+# IM 网关分支的云端编译验证（Windows 目标，与开发机一致）：
+# Rust 编译检查 + 网关单测 + 前端类型检查。全部通过才允许合并。
+on:
+  push:
+    branches:
+      - im-gateway
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      # Windows 上生成空 stub，满足 tauri-build 对 externalBin 的存在性校验。
+      - name: Build sidecar stub
+        run: npm run build:swift
+
+      - name: Rust check
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: IM gateway unit tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml im_gateway
+
+      - name: Frontend typecheck
+        run: npx tsc --noEmit

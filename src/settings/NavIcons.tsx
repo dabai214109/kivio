@@ -156,6 +156,18 @@ export function AgentIcon(props: IconProps) {
   )
 }
 
+// IM 网关：聊天气泡 + 电波，表达「IM 消息远程驱动」
+export function ImGatewayIcon(props: IconProps) {
+  return (
+    <svg {...svgProps(props)}>
+      <path d="M5 6 H19 A1.5 1.5 0 0 1 20.5 7.5 V14.5 A1.5 1.5 0 0 1 19 16 H10 L6.5 19 V16 H5 A1.5 1.5 0 0 1 3.5 14.5 V7.5 A1.5 1.5 0 0 1 5 6 Z" />
+      <path d="M7 9.5 H13" />
+      <path d="M15 9.5 H16.5" />
+      <path d="M7 12.5 H10" />
+    </svg>
+  )
+}
+
 // MCP：插头/连接
 export function McpIcon(props: IconProps) {
   return (

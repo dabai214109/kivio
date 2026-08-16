@@ -10,6 +10,7 @@ pub mod connectors;
 pub mod dock;
 pub mod external_agents;
 pub mod fonts;
+pub mod im_gateway;
 pub mod inpainting;
 pub mod lens;
 pub mod lens_commands;
@@ -336,6 +337,15 @@ pub fn run() {
                 state.sub_agents.set_concurrency(n);
             }
 
+            // IM 网关监督循环：连接与否由循环自己按 imGateway 设置决定（每 2s 重读，
+            // 改开关/地址/token 无需重启）；真正退出时由 ExitRequested 分支发 shutdown。
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::im_gateway::run(app_handle).await;
+                });
+            }
+
             if let Err(err) = register_hotkeys(&app.handle()) {
                 eprintln!(
                     "Failed to register hotkeys: {}",
@@ -560,6 +570,7 @@ pub fn run() {
             chat::commands::interaction::chat_execute_agent_plan,
             chat::commands::send::chat_send_message,
             chat::commands::interaction::chat_cancel_stream,
+            im_gateway::im_gateway_status,
             chat::commands::interaction::chat_confirm_tool_call,
             chat::commands::interaction::chat_respond_session_consent,
             chat::commands::interaction::chat_submit_user_choice,
@@ -698,6 +709,8 @@ pub fn run() {
                     api.prevent_exit();
                 } else {
                     // 真正退出：同步排干 MCP 连接池，杀掉所有持久子进程，避免孤儿进程。
+                    // 先通知 IM 网关监督循环收摊（幂等；WS 断开后循环自然退出）。
+                    crate::im_gateway::request_shutdown();
                     let state: State<AppState> = app_handle.state();
                     // 带超时：一个卡在握手里的 server 会占着会话锁不放，没有这层
                     // 上限的话退出钩子会永久阻塞在主线程上 —— 表现是「点关闭没反应、

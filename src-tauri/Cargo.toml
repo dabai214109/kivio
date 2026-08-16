@@ -63,6 +63,8 @@ rmcp = { version = "3.0.1", default-features = false, features = [
 # HTTP 客户端与异步运行时
 reqwest = { version = "0.13", features = ["json", "rustls", "multipart", "form"] }
 tokio = { version = "1", features = ["time", "process", "io-util", "sync", "rt-multi-thread", "macros"] }
+# IM 网关：连本机 NapCat（OneBot11）的正向 WebSocket 客户端。仅 ws:// 明文，无需 TLS feature。
+tokio-tungstenite = "0.26"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 scraper = "0.23"
 html-escape = "0.2"

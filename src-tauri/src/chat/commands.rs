@@ -24,7 +24,8 @@ mod messages;
 
 mod sanitization;
 
-mod reply_runtime;
+// pub(crate)：im_gateway 模块需要比对 CHAT_REPLY_BUSY_ERROR 判别忙拒绝。
+pub(crate) mod reply_runtime;
 use reply_runtime::{ChatSendReservation, CHAT_REPLY_BUSY_ERROR, MAX_REPLY_MODELS};
 
 mod fan_out;
