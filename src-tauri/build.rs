@@ -14,4 +14,20 @@ fn main() {
     {
         println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
     }
+
+    // Windows：lib 测试二进制不带应用 manifest（tauri_build 只给 bins 生成），
+    // comctl32 按旧版 v5 解析，而依赖树导入 TaskDialogIndirect / SetWindowSubclass
+    // 等 v6 专属符号 → 进程启动即 0xC0000139（STATUS_ENTRYPOINT_NOT_FOUND）。
+    // 上游 CI 只在 macOS 跑测试所以从未暴露。给测试目标补嵌入 v6 依赖的 manifest，
+    // 与主程序行为对齐。只影响 tests，不碰 bins（主程序已有自己的 manifest）。
+    // 注意：该指令要求包存在显式 test target（tests/ 目录），由 tests/manifest_link.rs 提供。
+    #[cfg(target_os = "windows")]
+    {
+        println!("cargo:rustc-link-arg-tests=/MANIFEST:EMBED");
+        println!(
+            "cargo:rustc-link-arg-tests=/MANIFESTDEPENDENCY:type='win32' \
+             name='Microsoft.Windows.Common-Controls' version='6.0.0.0' \
+             publicKeyToken='6595b64144ccf1df' language='*' processorArchitecture='*'"
+        );
+    }
 }

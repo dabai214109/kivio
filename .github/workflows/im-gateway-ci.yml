@@ -40,7 +40,7 @@ jobs:
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
       - name: IM gateway unit tests
-        run: cargo test --manifest-path src-tauri/Cargo.toml im_gateway
+        run: cargo test --manifest-path src-tauri/Cargo.toml --test im_gateway
 
       - name: Frontend typecheck
         run: npx tsc --noEmit

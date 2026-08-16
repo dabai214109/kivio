@@ -111,7 +111,9 @@ pub(crate) fn im_gateway_status() -> Value {
 /* ========================================================================== */
 
 /// OneBot 消息段（数组或字符串）→ 纯文本。字符串格式剥掉 CQ 码；数组只取 text 段。
-pub(crate) fn onebot_message_to_text(message: &Value) -> String {
+/// pub：tests/ 集成测试需要（lib 单测二进制在 Windows 上因 comctl32 v6 manifest
+/// 缺失无法启动，见 build.rs 注释）。
+pub fn onebot_message_to_text(message: &Value) -> String {
     match message {
         Value::String(s) => strip_cq_codes(s),
         Value::Array(segments) => {
@@ -139,7 +141,7 @@ pub(crate) fn onebot_message_to_text(message: &Value) -> String {
 }
 
 /// 去掉 `[CQ:...]` 码（字符串格式消息里可能混有）。
-fn strip_cq_codes(s: &str) -> String {
+pub fn strip_cq_codes(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.char_indices().peekable();
     while let Some((i, c)) = chars.next() {
@@ -158,7 +160,7 @@ fn strip_cq_codes(s: &str) -> String {
 }
 
 /// 把回复按 `limit` 切块；多块时带 `（i/N）` 序号前缀。
-pub(crate) fn split_reply(text: &str, limit: usize) -> Vec<String> {
+pub fn split_reply(text: &str, limit: usize) -> Vec<String> {
     let limit = limit.max(50);
     if text.chars().count() <= limit {
         return vec![text.to_string()];
@@ -506,10 +508,10 @@ async fn serve_connection(
                 // 设置热生效：关掉或改地址/token → 断开，由监督循环决策。
                 let Some(state) = app.try_state::<AppState>() else { continue };
                 let latest = state.settings_read().im_gateway.clone();
-                if !latest.enabled
-                    || latest.ws_url != cfg.ws_url
-                    || latest.access_token != cfg.access_token
-                {
+                if !latest.enabled {
+                    return ServeStop::Disabled;
+                }
+                if latest.ws_url != cfg.ws_url || latest.access_token != cfg.access_token {
                     return ServeStop::SettingsChanged;
                 }
             }
@@ -544,7 +546,7 @@ async fn serve_connection(
 }
 
 /// 极简 URL query 编码（只处理 token 里常见的保留字符）。
-fn urlencoding_minimal(s: &str) -> String {
+pub fn urlencoding_minimal(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
         match b {
@@ -908,7 +910,7 @@ fn parse_send_result(result: Result<Value, String>) -> TurnOutcome {
     }
 }
 
-fn last_assistant_content(messages: &Vec<Value>) -> Option<String> {
+pub fn last_assistant_content(messages: &Vec<Value>) -> Option<String> {
     messages
         .iter()
         .rev()
@@ -940,78 +942,5 @@ async fn send_chunked(gateway: &Arc<Gateway>, user_id: i64, text: &str, limit: u
         if i + 1 < total {
             tokio::time::sleep(std::time::Duration::from_millis(SPLIT_INTERVAL_MS)).await;
         }
-    }
-}
-
-/* ========================================================================== */
-/* 单元测试                                                                    */
-/* ========================================================================== */
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_segment_array_message() {
-        let message = json!([
-            { "type": "text", "data": { "text": "你好 " } },
-            { "type": "at", "data": { "qq": 10001 } },
-            { "type": "text", "data": { "text": " 帮看看" } },
-            { "type": "image", "data": { "file": "a.jpg" } },
-        ]);
-        assert_eq!(onebot_message_to_text(&message), "你好 @10001 帮看看");
-    }
-
-    #[test]
-    fn parses_string_message_and_strips_cq() {
-        let message = json!("[CQ:at,qq=10001] 帮我看看 [CQ:image,file=abc.jpg] 这个报错");
-        assert_eq!(
-            onebot_message_to_text(&message),
-            "帮我看看  这个报错"
-        );
-    }
-
-    #[test]
-    fn ignores_non_text_shapes() {
-        assert_eq!(onebot_message_to_text(&Value::Null), "");
-        assert_eq!(onebot_message_to_text(&json!(42)), "");
-    }
-
-    #[test]
-    fn splits_long_reply_with_index() {
-        let text = "x".repeat(100);
-        let chunks = split_reply(&text, 40);
-        assert_eq!(chunks.len(), 3);
-        assert!(chunks[0].starts_with("（1/3）\n"));
-        let joined: String = chunks
-            .iter()
-            .map(|c| c.split_once('\n').map(|(_, rest)| rest).unwrap_or(c))
-            .collect();
-        assert_eq!(joined, text);
-    }
-
-    #[test]
-    fn short_reply_is_single_chunk() {
-        let chunks = split_reply("hello", 40);
-        assert_eq!(chunks, vec!["hello".to_string()]);
-    }
-
-    #[test]
-    fn urlencodes_reserved_chars() {
-        assert_eq!(urlencoding_minimal("a b/c+d"), "a%20b%2Fc%2Bd");
-        assert_eq!(urlencoding_minimal("plain-1_2.3~4"), "plain-1_2.3~4");
-    }
-
-    #[test]
-    fn extracts_last_assistant_content() {
-        let messages = vec![
-            json!({ "role": "user", "content": "hi" }),
-            json!({ "role": "assistant", "content": "first" }),
-            json!({ "role": "assistant", "content": "second" }),
-        ];
-        assert_eq!(
-            last_assistant_content(&messages),
-            Some("second".to_string())
-        );
     }
 }
