@@ -44,7 +44,7 @@ jobs:
           gh release create "$RELEASE_TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "Kivio Desktop $RELEASE_TAG" \
-            --notes "Automated macOS (Apple Silicon) + Windows (x64) build for ${RELEASE_TAG}. Built from: ${BUILD_REF}." \
+            --notes "Automated Windows (x64) build for ${RELEASE_TAG}. Built from: ${BUILD_REF}." \
             --verify-tag \
             "${extra[@]}"
 
@@ -54,10 +54,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-latest is Apple Silicon; the DMG name stays *_aarch64.dmg.
-          - platform: macos-latest
-            name: macOS
-            args: --bundles dmg
+          # 只出 Windows NSIS 安装包（本定制版仅自用 Windows；macOS 需要时再恢复该行）。
+          # - platform: macos-latest
+          #   name: macOS
+          #   args: --bundles dmg
           - platform: windows-latest
             name: Windows
             args: --bundles nsis
@@ -93,9 +93,8 @@ jobs:
           tagName: ${{ env.RELEASE_TAG }}
           releaseName: Kivio Desktop ${{ env.RELEASE_TAG }}
           releaseBody: |
-            Automated macOS (Apple Silicon / aarch64, unsigned) + Windows (x64) build for ${{ env.RELEASE_TAG }}.
+            Automated Windows (x64) build for ${{ env.RELEASE_TAG }}.
             Built from: ${{ env.BUILD_REF }}
-            - macOS: DMG (unsigned — first launch: right-click → Open, or `xattr -cr "/Applications/Kivio Desktop.app"`)
             - Windows: NSIS installer (.exe)
           releaseDraft: false
           prerelease: ${{ contains(env.RELEASE_TAG, 'beta') || contains(env.RELEASE_TAG, 'alpha') || contains(env.RELEASE_TAG, 'rc') }}
