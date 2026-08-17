@@ -1034,15 +1034,39 @@ fn default_im_gateway_split_length() -> usize {
     3800
 }
 
-/// IM 网关（QQ/NapCat OneBot11 ↔ Kivio 会话）配置。
+fn default_im_gateway_provider() -> String {
+    "onebot".to_string()
+}
+
+/// IM 网关的 QQ 官方机器人（q.qq.com 开放平台）凭据。WebSocket 接入方式。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ImGatewayQqOfficialConfig {
+    pub app_id: String,
+    pub client_secret: String,
+}
+
+impl Default for ImGatewayQqOfficialConfig {
+    fn default() -> Self {
+        Self {
+            app_id: String::new(),
+            client_secret: String::new(),
+        }
+    }
+}
+
+/// IM 网关（IM ↔ Kivio 会话）配置。
 ///
-/// 网关以 WebSocket 客户端身份连接本机 NapCat 的 OneBot11 正向 WS；白名单外的私聊
-/// 静默丢弃。`allow_users` 沿用 hooks 的 null 归一（前端漏传字段会被序列化成 null，
-/// `default` 只兜「键不存在」，null 会让整个分区解析失败）。
+/// `provider` 选择传输层：`onebot`（NapCat/Lagrange 的 OneBot11 正向 WS，本机）或
+/// `qqOfficial`（QQ 开放平台官方机器人，WebSocket 方式，连腾讯云 wss 网关）。
+/// 官方模式下 `allow_users` 按 openid 过滤且**空 = 允许所有**（openid 事先无从得知，
+/// 机器人本身私有：需要用户先加好友才能单聊）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ImGatewayConfig {
     pub enabled: bool,
+    #[serde(default = "default_im_gateway_provider")]
+    pub provider: String,
     #[serde(default = "default_im_gateway_ws_url")]
     pub ws_url: String,
     #[serde(default)]
@@ -1053,17 +1077,21 @@ pub struct ImGatewayConfig {
     pub timeout_sec: u64,
     #[serde(default = "default_im_gateway_split_length")]
     pub split_length: usize,
+    #[serde(default)]
+    pub qq_official: ImGatewayQqOfficialConfig,
 }
 
 impl Default for ImGatewayConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            provider: default_im_gateway_provider(),
             ws_url: default_im_gateway_ws_url(),
             access_token: String::new(),
             allow_users: Vec::new(),
             timeout_sec: default_im_gateway_timeout_sec(),
             split_length: default_im_gateway_split_length(),
+            qq_official: ImGatewayQqOfficialConfig::default(),
         }
     }
 }
@@ -2474,11 +2502,22 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
         crate::chat::sub_agent::SUB_AGENT_CONCURRENCY_MAX,
     );
 
-    // IM 网关：地址 trim；开了但没地址的直接关（监督循环依赖非空 ws_url）；
-    // 白名单去空去重；超时与分段长度钳到合理区间。
+    // IM 网关：地址 trim；开了但没地址/凭据的直接关（监督循环依赖非空配置）；
+    // provider 白名单校验；白名单去空去重；超时与分段长度钳到合理区间。
+    settings.im_gateway.provider = settings.im_gateway.provider.trim().to_lowercase();
+    if !matches!(settings.im_gateway.provider.as_str(), "onebot" | "qq_official") {
+        settings.im_gateway.provider = "onebot".to_string();
+    }
     settings.im_gateway.ws_url = settings.im_gateway.ws_url.trim().to_string();
-    if settings.im_gateway.enabled && settings.im_gateway.ws_url.is_empty() {
-        settings.im_gateway.enabled = false;
+    settings.im_gateway.qq_official.app_id =
+        settings.im_gateway.qq_official.app_id.trim().to_string();
+    if settings.im_gateway.enabled {
+        let missing_creds = settings.im_gateway.provider == "qq_official"
+            && (settings.im_gateway.qq_official.app_id.is_empty()
+                || settings.im_gateway.qq_official.client_secret.is_empty());
+        if settings.im_gateway.ws_url.is_empty() || missing_creds {
+            settings.im_gateway.enabled = false;
+        }
     }
     let mut im_allow: Vec<String> = settings
         .im_gateway

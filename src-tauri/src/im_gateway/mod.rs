@@ -1,22 +1,26 @@
-//! IM 网关：QQ（NapCat / OneBot11 正向 WebSocket）↔ Kivio 会话 双向桥。
+//! IM 网关：IM ↔ Kivio 会话 双向桥（多 provider）。
 //!
-//! 手机 QQ 私聊 → 本模块（常驻 tokio 任务）→ [`crate::chat::commands::send::chat_send_message`]
+//! 手机 IM 私聊 → 本模块（常驻 tokio 任务）→ [`crate::chat::commands::send::chat_send_message`]
 //! （与聊天窗口输入框**完全相同**的生成路径，消息真实出现在 Kivio 对话里）→ 该函数
-//! 本身 await 完整一轮并带回最终 assistant 消息 → 分段回发 QQ。
+//! 本身 await 完整一轮并带回最终 assistant 消息 → 分段回发 IM。
+//!
+//! 传输层两种 provider（设置 `imGateway.provider`）：
+//! - `onebot`：本机 NapCat/Lagrange 的 OneBot11 正向 WS（`ws://`，QQ 号即用户标识）；
+//! - `qq_official`：QQ 开放平台官方机器人（WebSocket 方式，wss://，openid 为用户标识，
+//!   被动回复 60 分钟窗口 / 每条消息 4 条 → 不发回执、分段上限 4）。见 `qq_official.rs`。
 //!
 //! 设计要点（对标库内既有范式）：
 //! - 监督循环照 MCP idle reaper / probe watcher 的写法（lib.rs setup 里 spawn），
-//!   每 2s 重读设置：改开关/地址/token 无需重启即生效；断线指数退避（封顶 30s）。
-//! - 会话映射 `qq号 → conversation_id` 持久化在 `{app_data}/im-gateway/sessions.json`，
-//!   与 external-agent-sessions 同思路。
-//! - 每用户用 keyed mutex 串行（同一用户同一时间只跑一轮），跨用户并行。
+//!   每 2s 重读设置：改开关/provider/凭据无需重启即生效；断线指数退避（封顶 30s）。
+//! - 会话映射 `用户 → conversation_id` 持久化在 `{app_data}/im-gateway/sessions.json`。
+//! - 每用户 keyed mutex 串行（同一用户同一时间只跑一轮），跨用户并行。
 //! - 超时取消走两条既有路径：内置循环 `AppState::cancel_chat_generation`，外部 CLI
-//!   会话 `SessionCommand::Cancel`；随后宽限等待收尾（`chat_send_message` 取消后以
-//!   `cancelled` 正常返回）。
-//! - 白名单（`imGateway.allowUsers`）外的私聊静默丢弃；群消息 v1 不处理。
+//!   会话 `SessionCommand::Cancel`；随后宽限等待收尾。
 //!
 //! 已知边界：无头执行时若全局审批策略不是 `auto`，工具审批请求会等 GUI，60s 超时后
 //! 按拒绝处理（interaction.rs 的 fail-closed）——设置页有提示文案。
+
+pub mod qq_official;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -42,6 +46,27 @@ const SEND_API_TIMEOUT_SECS: u64 = 15;
 const CANCEL_GRACE_SECS: u64 = 20;
 /// 分段发送之间的间隔，规避风控。
 const SPLIT_INTERVAL_MS: u64 = 350;
+
+/* ========================================================================== */
+/* 用户标识：统一两种 provider 的入站用户                                      */
+/* ========================================================================== */
+
+/// OneBot 用 QQ 号（数字），QQ 官方机器人用 openid（字符串）。
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum UserKey {
+    Onebot(i64),
+    C2c(String),
+}
+
+impl UserKey {
+    /// 会话映射 / 每用户锁的键。
+    pub(crate) fn session_key(&self) -> String {
+        match self {
+            UserKey::Onebot(qq) => format!("qq:{qq}"),
+            UserKey::C2c(openid) => format!("c2c:{openid}"),
+        }
+    }
+}
 
 /* ========================================================================== */
 /* 生命周期信号                                                                */
@@ -111,8 +136,6 @@ pub(crate) fn im_gateway_status() -> Value {
 /* ========================================================================== */
 
 /// OneBot 消息段（数组或字符串）→ 纯文本。字符串格式剥掉 CQ 码；数组只取 text 段。
-/// pub：tests/ 集成测试需要（lib 单测二进制在 Windows 上因 comctl32 v6 manifest
-/// 缺失无法启动，见 build.rs 注释）。
 pub fn onebot_message_to_text(message: &Value) -> String {
     match message {
         Value::String(s) => strip_cq_codes(s),
@@ -207,17 +230,17 @@ impl SessionStore {
         }
     }
 
-    fn get(&self, qq: &str) -> Option<&String> {
-        self.map.get(qq)
+    fn get(&self, key: &str) -> Option<&String> {
+        self.map.get(key)
     }
 
-    fn set(&mut self, qq: &str, conv_id: &str) {
-        self.map.insert(qq.to_string(), conv_id.to_string());
+    fn set(&mut self, key: &str, conv_id: &str) {
+        self.map.insert(key.to_string(), conv_id.to_string());
         self.save();
     }
 
-    fn remove(&mut self, qq: &str) {
-        if self.map.remove(qq).is_some() {
+    fn remove(&mut self, key: &str) {
+        if self.map.remove(key).is_some() {
             self.save();
         }
     }
@@ -232,78 +255,19 @@ fn sessions_file_path(app: &AppHandle) -> PathBuf {
 }
 
 /* ========================================================================== */
-/* 网关共享状态                                                                */
+/* 出站通道（两种 provider 的统一抽象）                                        */
 /* ========================================================================== */
 
-struct Gateway {
-    app: AppHandle,
-    sessions: Mutex<SessionStore>,
-    /// 每用户串行锁。
-    user_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    /// 每用户等待数（排队上限）。
-    user_waiting: Mutex<HashMap<String, Arc<AtomicUsize>>>,
-    /// 当前连接的回发通道（断线时为 None）。
-    outbound: Mutex<Option<OutboundHandle>>,
-}
-
-impl Gateway {
-    fn new(app: AppHandle) -> Self {
-        Self {
-            sessions: Mutex::new(SessionStore::load(&app)),
-            user_locks: Mutex::new(HashMap::new()),
-            user_waiting: Mutex::new(HashMap::new()),
-            outbound: Mutex::new(None),
-            app,
-        }
-    }
-
-    fn user_lock(&self, qq: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut locks = self.user_locks.lock().unwrap_or_else(|e| e.into_inner());
-        locks
-            .entry(qq.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
-    }
-
-    fn user_waiting(&self, qq: &str) -> Arc<AtomicUsize> {
-        let mut map = self.user_waiting.lock().unwrap_or_else(|e| e.into_inner());
-        map.entry(qq.to_string())
-            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-            .clone()
-    }
-
-    /// 回发私聊；未连接时静默失败（调用方已尽量在连接内使用）。
-    async fn send_private(&self, user_id: i64, text: &str) -> Result<(), String> {
-        let outbound = self
-            .outbound
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let Some(outbound) = outbound else {
-            return Err("gateway not connected".to_string());
-        };
-        outbound.call("send_private_msg", json!({ "user_id": user_id, "message": text })).await
-    }
-
-    /// 连接断开后清掉出站通道，让后续回发快速失败而不是挂在死流上。
-    fn clear_outbound(&self) {
-        self.outbound
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-    }
-}
-
-/// 一条已建立连接的出站能力（API echo 匹配 + 写半流）。
+/// OneBot11 的写半流 + echo 匹配表。
 #[derive(Clone)]
-struct OutboundHandle {
+pub(crate) struct OutboundHandle {
     writer: Arc<tokio::sync::Mutex<futures::stream::SplitSink<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, tokio_tungstenite::tungstenite::Message>>>,
     pending: Arc<tokio::sync::Mutex<HashMap<String, oneshot::Sender<Value>>>>,
     echo_seq: Arc<AtomicUsize>,
 }
 
 impl OutboundHandle {
-    /// 调用 OneBot API，成功时返回完整响应 JSON（`data` 由调用方自行取用）。
+    /// 调用 OneBot API，成功时返回完整响应 JSON。
     async fn call_raw(&self, action: &str, params: Value) -> Result<Value, String> {
         let echo = format!("im-{}", self.echo_seq.fetch_add(1, Ordering::Relaxed));
         let (tx, rx) = oneshot::channel::<Value>();
@@ -348,6 +312,113 @@ impl OutboundHandle {
     }
 }
 
+/// 当前连接的出站能力；断线时置 None。
+#[derive(Clone)]
+pub(crate) enum OutboundChannel {
+    Onebot(OutboundHandle),
+    QqOfficial(qq_official::QqOfficialOutbound),
+}
+
+/* ========================================================================== */
+/* 网关共享状态                                                                */
+/* ========================================================================== */
+
+struct Gateway {
+    app: AppHandle,
+    sessions: Mutex<SessionStore>,
+    /// 每用户串行锁。
+    user_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// 每用户等待数（排队上限）。
+    user_waiting: Mutex<HashMap<String, Arc<AtomicUsize>>>,
+    /// 当前连接的出站通道（断线时为 None）。
+    outbound: Mutex<Option<OutboundChannel>>,
+}
+
+impl Gateway {
+    fn new(app: AppHandle) -> Self {
+        Self {
+            sessions: Mutex::new(SessionStore::load(&app)),
+            user_locks: Mutex::new(HashMap::new()),
+            user_waiting: Mutex::new(HashMap::new()),
+            outbound: Mutex::new(None),
+            app,
+        }
+    }
+
+    fn user_lock(&self, key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.user_locks.lock().unwrap_or_else(|e| e.into_inner());
+        locks
+            .entry(key.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    fn user_waiting(&self, key: &str) -> Arc<AtomicUsize> {
+        let mut map = self.user_waiting.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(key.to_string())
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+            .clone()
+    }
+
+    /// 连接建立时由 provider 的 serve 循环调用。
+    pub(crate) fn set_outbound(&self, channel: OutboundChannel) {
+        *self
+            .outbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(channel);
+    }
+
+    /// 连接断开后清掉出站通道，让后续回发快速失败而不是挂在死流上。
+    fn clear_outbound(&self) {
+        self.outbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+    }
+
+    /// 统一回发入口：按当前 provider 把文本发给指定用户。
+    async fn send_user(&self, user: &UserKey, text: &str) -> Result<(), String> {
+        let channel = self
+            .outbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(channel) = channel else {
+            return Err("gateway not connected".to_string());
+        };
+        match (channel, user) {
+            (OutboundChannel::Onebot(handle), UserKey::Onebot(qq)) => {
+                handle
+                    .call("send_private_msg", json!({ "user_id": qq, "message": text }))
+                    .await
+            }
+            (OutboundChannel::QqOfficial(outbound), UserKey::C2c(openid)) => {
+                outbound.send(openid, text).await
+            }
+            (channel, user) => Err(format!(
+                "provider/channel 不匹配（{:?} vs {:?}）——设置变更后的旧任务",
+                channel_kind(&channel),
+                user
+            )),
+        }
+    }
+
+    /// 当前 provider 是否为 QQ 官方机器人（决定回执与分段策略）。
+    fn is_qq_official(&self) -> bool {
+        matches!(
+            self.outbound.lock().unwrap_or_else(|e| e.into_inner()).as_ref(),
+            Some(OutboundChannel::QqOfficial(_))
+        )
+    }
+}
+
+fn channel_kind(channel: &OutboundChannel) -> &'static str {
+    match channel {
+        OutboundChannel::Onebot(_) => "onebot",
+        OutboundChannel::QqOfficial(_) => "qq_official",
+    }
+}
+
 /* ========================================================================== */
 /* 监督循环                                                                    */
 /* ========================================================================== */
@@ -379,7 +450,11 @@ pub async fn run(app: AppHandle) {
         let cfg = state.settings_read().im_gateway.clone();
         update_status(|s| {
             s.enabled = cfg.enabled;
-            s.ws_url = cfg.ws_url.clone();
+            s.ws_url = if cfg.provider == "qq_official" {
+                "wss://api.sgroup.qq.com (QQ 官方机器人)".to_string()
+            } else {
+                cfg.ws_url.clone()
+            };
         });
 
         if !cfg.enabled {
@@ -392,8 +467,15 @@ pub async fn run(app: AppHandle) {
             continue;
         }
 
-        eprintln!("[im-gateway] connecting {} ...", cfg.ws_url);
-        match serve_connection(&app, &gateway, &cfg, &mut shutdown).await {
+        let stop = if cfg.provider == "qq_official" {
+            eprintln!("[im-gateway] connecting QQ 官方机器人 (app_id={}) ...", cfg.qq_official.app_id);
+            qq_official::serve(&app, &gateway, &cfg, &mut shutdown).await
+        } else {
+            eprintln!("[im-gateway] connecting {} ...", cfg.ws_url);
+            serve_onebot(&app, &gateway, &cfg, &mut shutdown).await
+        };
+
+        match stop {
             ServeStop::Shutdown => break,
             ServeStop::Disabled => {
                 eprintln!("[im-gateway] disabled by settings; standing by");
@@ -418,7 +500,11 @@ pub async fn run(app: AppHandle) {
     eprintln!("[im-gateway] supervisor exited");
 }
 
-async fn serve_connection(
+/* ========================================================================== */
+/* Provider 1：OneBot11（本机 NapCat/Lagrange）                                */
+/* ========================================================================== */
+
+async fn serve_onebot(
     app: &AppHandle,
     gateway: &Arc<Gateway>,
     cfg: &ImGatewayConfig,
@@ -465,10 +551,7 @@ async fn serve_connection(
         pending: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         echo_seq: Arc::new(AtomicUsize::new(0)),
     };
-    *gateway
-        .outbound
-        .lock()
-        .unwrap_or_else(|e| e.into_inner()) = Some(outbound.clone());
+    gateway.set_outbound(OutboundChannel::Onebot(outbound.clone()));
 
     // 连上后问一下机器人身份（失败不影响主流程）。
     let info = outbound
@@ -505,13 +588,14 @@ async fn serve_connection(
                 return ServeStop::Shutdown;
             }
             _ = settings_ticker.tick() => {
-                // 设置热生效：关掉或改地址/token → 断开，由监督循环决策。
+                // 设置热生效：关掉、换 provider 或改地址/token → 断开，由监督循环决策。
                 let Some(state) = app.try_state::<AppState>() else { continue };
                 let latest = state.settings_read().im_gateway.clone();
-                if !latest.enabled {
-                    return ServeStop::Disabled;
-                }
-                if latest.ws_url != cfg.ws_url || latest.access_token != cfg.access_token {
+                if !latest.enabled
+                    || latest.provider != cfg.provider
+                    || latest.ws_url != cfg.ws_url
+                    || latest.access_token != cfg.access_token
+                {
                     return ServeStop::SettingsChanged;
                 }
             }
@@ -521,15 +605,11 @@ async fn serve_connection(
                 };
                 match frame {
                     Ok(tokio_tungstenite::tungstenite::Message::Text(text)) => {
-                        handle_packet(app, gateway, &outbound, &text).await;
+                        handle_packet(gateway, &outbound, &text).await;
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Ping(payload)) => {
-                        let _ = outbound
-                            .writer
-                            .lock()
-                            .await
-                            .send(tokio_tungstenite::tungstenite::Message::Pong(payload))
-                            .await;
+                        let pong = tokio_tungstenite::tungstenite::Message::Pong(payload);
+                        let _ = outbound.writer.lock().await.send(pong).await;
                     }
                     Ok(tokio_tungstenite::tungstenite::Message::Close(_)) => {
                         return ServeStop::Disconnected;
@@ -560,7 +640,6 @@ pub fn urlencoding_minimal(s: &str) -> String {
 }
 
 async fn handle_packet(
-    app: &AppHandle,
     gateway: &Arc<Gateway>,
     outbound: &OutboundHandle,
     text: &str,
@@ -578,7 +657,7 @@ async fn handle_packet(
     }
 
     if packet.get("post_type").and_then(Value::as_str) != Some("message") {
-        return; // 心跳/生命周期等 v1 不关心
+        return; // 心跳/生命周期等不关心
     }
     if packet.get("message_type").and_then(Value::as_str) != Some("private") {
         return; // v1 仅私聊
@@ -591,8 +670,9 @@ async fn handle_packet(
         return;
     }
 
-    // 白名单。
-    let allowed = app
+    // 白名单（OneBot：QQ 号；空列表 = 拒绝所有，与官方模式的"空=允许"相反，注意区分）。
+    let allowed = gateway
+        .app
         .try_state::<AppState>()
         .map(|state| {
             state
@@ -607,50 +687,56 @@ async fn handle_packet(
         return;
     }
 
-    dispatch_inbound(gateway.clone(), user_id, text);
+    dispatch_inbound(gateway.clone(), UserKey::Onebot(user_id), text);
 }
 
 /* ========================================================================== */
-/* 入站消息分发（指令 / 排队 / 执行）                                           */
+/* 入站消息分发（指令 / 排队 / 执行）—— 两种 provider 共用                      */
 /* ========================================================================== */
 
-fn dispatch_inbound(gateway: Arc<Gateway>, user_id: i64, text: String) {
+pub(crate) fn dispatch_inbound(gateway: Arc<Gateway>, user: UserKey, text: String) {
     tokio::spawn(async move {
-        let qq = user_id.to_string();
+        let session_key = user.session_key();
 
         if text.starts_with('/') {
-            handle_command(&gateway, user_id, &qq, text.trim()).await;
+            handle_command(&gateway, &user, &session_key, text.trim()).await;
             return;
         }
 
         // 排队上限：等待者 + 在途 ≤ MAX_QUEUED_PER_USER。
-        let waiting = gateway.user_waiting(&qq);
+        let waiting = gateway.user_waiting(&session_key);
         let current = waiting.load(Ordering::Relaxed);
         if current >= MAX_QUEUED_PER_USER {
             let _ = gateway
-                .send_private(user_id, &format!("队列已满（{MAX_QUEUED_PER_USER} 条），请稍后再试。"))
+                .send_user(&user, &format!("队列已满（{MAX_QUEUED_PER_USER} 条），请稍后再试。"))
                 .await;
             return;
         }
         waiting.store(current + 1, Ordering::Relaxed);
 
-        let lock = gateway.user_lock(&qq);
+        let lock = gateway.user_lock(&session_key);
         let is_busy = lock.try_lock().is_err();
         if is_busy {
-            let _ = gateway.send_private(user_id, "上一条仍在执行，已排队。").await;
+            // QQ 官方模式省掉排队回执（被动回复配额 4 条，留给正文）。
+            if !gateway.is_qq_official() {
+                let _ = gateway.send_user(&user, "上一条仍在执行，已排队。").await;
+            }
         }
         let _guard = lock.lock().await;
         waiting.fetch_sub(1, Ordering::Relaxed);
 
-        let result = std::panic::AssertUnwindSafe(run_turn_for_user(&gateway, user_id, &qq, &text));
+        let result =
+            std::panic::AssertUnwindSafe(run_turn_for_user(&gateway, &user, &session_key, &text));
         if let Err(panic) = futures::FutureExt::catch_unwind(result).await {
             eprintln!("[im-gateway] turn panicked: {panic:?}");
-            let _ = gateway.send_private(user_id, "执行发生内部错误，请重试或 /new 新建会话。").await;
+            let _ = gateway
+                .send_user(&user, "执行发生内部错误，请重试或 /new 新建会话。")
+                .await;
         }
     });
 }
 
-async fn handle_command(gateway: &Arc<Gateway>, user_id: i64, qq: &str, text: &str) {
+async fn handle_command(gateway: &Arc<Gateway>, user: &UserKey, session_key: &str, text: &str) {
     let mut parts = text.split_whitespace();
     let cmd = parts.next().unwrap_or("");
     match cmd {
@@ -664,21 +750,21 @@ async fn handle_command(gateway: &Arc<Gateway>, user_id: i64, qq: &str, text: &s
                 "其余文本将作为消息送入 Kivio 会话执行，结果回发到本对话。",
             ]
             .join("\n");
-            let _ = gateway.send_private(user_id, &help).await;
+            let _ = gateway.send_user(user, &help).await;
         }
         "/status" => {
             let conv = gateway
                 .sessions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .get(qq)
+                .get(session_key)
                 .cloned()
                 .unwrap_or_default();
             let (connected, bot) = {
                 let guard = status_mut().lock().unwrap_or_else(|e| e.into_inner());
                 (guard.connected, guard.bot_name.clone())
             };
-            let busy = gateway.user_lock(qq).try_lock().is_err();
+            let busy = gateway.user_lock(session_key).try_lock().is_err();
             let lines = [
                 format!("网关：{}", if connected { "已连接" } else { "未连接" }),
                 if bot.is_empty() { String::new() } else { format!("机器人：{bot}") },
@@ -690,16 +776,16 @@ async fn handle_command(gateway: &Arc<Gateway>, user_id: i64, qq: &str, text: &s
                 },
             ];
             let body = lines.into_iter().filter(|l| !l.is_empty()).collect::<Vec<_>>().join("\n");
-            let _ = gateway.send_private(user_id, &body).await;
+            let _ = gateway.send_user(user, &body).await;
         }
         "/new" => {
             gateway
                 .sessions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .remove(qq);
+                .remove(session_key);
             let _ = gateway
-                .send_private(user_id, "已解除会话映射，下一条消息将在新 Kivio 会话中执行。")
+                .send_user(user, "已解除会话映射，下一条消息将在新 Kivio 会话中执行。")
                 .await;
         }
         "/stop" => {
@@ -707,19 +793,19 @@ async fn handle_command(gateway: &Arc<Gateway>, user_id: i64, qq: &str, text: &s
                 .sessions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .get(qq)
+                .get(session_key)
                 .cloned()
                 .unwrap_or_default();
             if conv.is_empty() {
-                let _ = gateway.send_private(user_id, "当前没有关联的 Kivio 会话。").await;
+                let _ = gateway.send_user(user, "当前没有关联的 Kivio 会话。").await;
                 return;
             }
             cancel_turn(&gateway.app, &conv);
-            let _ = gateway.send_private(user_id, "已发出停止请求。").await;
+            let _ = gateway.send_user(user, "已发出停止请求。").await;
         }
         _ => {
             let _ = gateway
-                .send_private(user_id, &format!("未知指令 {cmd}，/help 查看可用指令。"))
+                .send_user(user, &format!("未知指令 {cmd}，/help 查看可用指令。"))
                 .await;
         }
     }
@@ -753,19 +839,22 @@ enum TurnOutcome {
     TimedOut { partial: Option<String> },
 }
 
-async fn run_turn_for_user(gateway: &Arc<Gateway>, user_id: i64, qq: &str, text: &str) {
+async fn run_turn_for_user(gateway: &Arc<Gateway>, user: &UserKey, session_key: &str, text: &str) {
     let app = gateway.app.clone();
 
     // 1) 确保会话：映射存在且文件仍在 → 复用；否则新建。
-    let conv_id = ensure_conversation(gateway, qq).await;
+    let conv_id = ensure_conversation(gateway, session_key).await;
     let Some(conv_id) = conv_id else {
         let _ = gateway
-            .send_private(user_id, "无法创建 Kivio 会话（详见应用日志）。")
+            .send_user(user, "无法创建 Kivio 会话（详见应用日志）。")
             .await;
         return;
     };
 
-    let _ = gateway.send_private(user_id, "⏳ 已提交给 Kivio，执行完成后回发结果…").await;
+    // 回执：OneBot 发（无配额压力）；QQ 官方模式省掉（每条消息被动回复仅 4 条，留给正文）。
+    if !gateway.is_qq_official() {
+        let _ = gateway.send_user(user, "⏳ 已提交给 Kivio，执行完成后回发结果…").await;
+    }
 
     let timeout_sec = app
         .try_state::<AppState>()
@@ -787,37 +876,37 @@ async fn run_turn_for_user(gateway: &Arc<Gateway>, user_id: i64, qq: &str, text:
             } else {
                 reply.trim().to_string()
             };
-            send_chunked(gateway, user_id, &body, split_length).await;
+            send_chunked(gateway, user, &body, split_length).await;
         }
         TurnOutcome::Failed { error, reply } => {
             let _ = gateway
-                .send_private(user_id, &format!("⚠️ 执行失败：{error}"))
+                .send_user(user, &format!("⚠️ 执行失败：{error}"))
                 .await;
             if let Some(reply) = reply.filter(|r| !r.trim().is_empty()) {
-                send_chunked(gateway, user_id, &format!("已生成的部分：\n{}", reply.trim()), split_length).await;
+                send_chunked(gateway, user, &format!("已生成的部分：\n{}", reply.trim()), split_length).await;
             }
         }
         TurnOutcome::Busy => {
             let _ = gateway
-                .send_private(user_id, "该 Kivio 会话正在生成中（可能正被电脑端使用），请稍后再发。")
+                .send_user(user, "该 Kivio 会话正在生成中（可能正被电脑端使用），请稍后再发。")
                 .await;
         }
         TurnOutcome::TimedOut { partial } => {
             let _ = gateway
-                .send_private(user_id, &format!("⚠️ 超时（{timeout_sec} 秒），已请求停止。"))
+                .send_user(user, &format!("⚠️ 超时（{timeout_sec} 秒），已请求停止。"))
                 .await;
             if let Some(partial) = partial.filter(|p| !p.trim().is_empty()) {
-                send_chunked(gateway, user_id, &format!("已生成的部分：\n{}", partial.trim()), split_length).await;
+                send_chunked(gateway, user, &format!("已生成的部分：\n{}", partial.trim()), split_length).await;
             }
         }
     }
 }
 
-async fn ensure_conversation(gateway: &Arc<Gateway>, qq: &str) -> Option<String> {
+async fn ensure_conversation(gateway: &Arc<Gateway>, session_key: &str) -> Option<String> {
     // 复用：映射存在且对话文件仍可加载。
     let existing = {
         let sessions = gateway.sessions.lock().unwrap_or_else(|e| e.into_inner());
-        sessions.get(qq).cloned()
+        sessions.get(session_key).cloned()
     };
     if let Some(conv_id) = existing {
         if crate::chat::storage::load_conversation(&gateway.app, &conv_id).is_ok() {
@@ -841,8 +930,8 @@ async fn ensure_conversation(gateway: &Arc<Gateway>, qq: &str) -> Option<String>
                 .sessions
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .set(qq, &conv_id);
-            eprintln!("[im-gateway] created conversation {conv_id} for {qq}");
+                .set(session_key, &conv_id);
+            eprintln!("[im-gateway] created conversation {conv_id} for {session_key}");
             Some(conv_id)
         }
         Err(err) => {
@@ -931,11 +1020,15 @@ fn load_last_assistant(app: &AppHandle, conv_id: &str) -> Option<String> {
         .map(|m| m.content.clone())
 }
 
-async fn send_chunked(gateway: &Arc<Gateway>, user_id: i64, text: &str, limit: usize) {
-    let chunks = split_reply(text, limit);
+async fn send_chunked(gateway: &Arc<Gateway>, user: &UserKey, text: &str, limit: usize) {
+    let mut chunks = split_reply(text, limit);
+    // QQ 官方模式：被动回复配额每条消息 4 条，超出的尾部并进最后一段。
+    if gateway.is_qq_official() {
+        chunks = qq_official::clamp_passive_chunks(chunks, qq_official::MAX_PASSIVE_REPLIES);
+    }
     let total = chunks.len();
     for (i, chunk) in chunks.into_iter().enumerate() {
-        if let Err(err) = gateway.send_private(user_id, &chunk).await {
+        if let Err(err) = gateway.send_user(user, &chunk).await {
             eprintln!("[im-gateway] send chunk {}/{} failed: {err}", i + 1, total);
             return;
         }

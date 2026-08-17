@@ -461,24 +461,34 @@ export function defaultNativeTools(): ChatNativeToolsConfig {
   }
 }
 
-/** IM 网关（QQ/NapCat OneBot11 ↔ Kivio 会话）。镜像 Rust ImGatewayConfig。 */
+/** IM 网关的 QQ 官方机器人凭据（q.qq.com，WebSocket 接入）。镜像 Rust ImGatewayQqOfficialConfig。 */
+export type ImGatewayQqOfficialConfig = {
+  appId: string
+  clientSecret: string
+}
+
+/** IM 网关（IM ↔ Kivio 会话）。镜像 Rust ImGatewayConfig。provider 值沿用 Rust 侧 snake_case。 */
 export type ImGatewayConfig = {
   enabled: boolean
+  provider: 'onebot' | 'qq_official' | string
   wsUrl: string
   accessToken: string
   allowUsers: string[]
   timeoutSec: number
   splitLength: number
+  qqOfficial: ImGatewayQqOfficialConfig
 }
 
 export function defaultImGateway(): ImGatewayConfig {
   return {
     enabled: false,
+    provider: 'onebot',
     wsUrl: 'ws://127.0.0.1:3001',
     accessToken: '',
     allowUsers: [],
     timeoutSec: 600,
     splitLength: 3800,
+    qqOfficial: { appId: '', clientSecret: '' },
   }
 }
 
@@ -1609,10 +1619,16 @@ function normalizeChatMemory(config?: Partial<ChatMemoryConfig> | null): ChatMem
 
 function normalizeImGateway(config?: Partial<ImGatewayConfig> | null): ImGatewayConfig {
   const current = config ?? {}
+  const provider = current.provider === 'qq_official' ? 'qq_official' : 'onebot'
   return {
     ...defaultImGateway(),
     ...current,
+    provider,
     allowUsers: Array.isArray(current.allowUsers) ? current.allowUsers : [],
+    qqOfficial: {
+      appId: current.qqOfficial?.appId ?? '',
+      clientSecret: current.qqOfficial?.clientSecret ?? '',
+    },
   }
 }
 
