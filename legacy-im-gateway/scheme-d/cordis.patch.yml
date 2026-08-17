@@ -1,0 +1,63 @@
+# dsh profile "kivio-im" 的插件树补丁（方案 D）。
+# 组装顺序：dsh-base bundle -> 本文件 -> 任何 --patch 覆盖。
+# 与 Kivio 官方 profile（~/.dsh/profiles/kivio/cordis.patch.yml）保持同构：
+#   关掉 host 平面工具（改由 agent preset 组装）、挂同一个自建 provider、关掉会话标题调用。
+
+# 常驻进程不需要热重载。
+- id: hmr
+  disabled: true
+
+# QQ 场景不需要会话标题（还省一次模型调用）。
+- id: session-title-llm
+  disabled: true
+
+# 四档 Agent 模式（standard/code/minimal/cordis），随包 roots 由 composeProfile 注入。
+- insert:
+    - id: agent-presets
+      name: '@deepseek-ai/dsh-agent-presets'
+      config:
+        default: standard
+
+# OneBot(QQ) <-> dsh agent 网关插件（本目录 onebot-im.mjs）。
+# 必改项：allowUsers 里加你的 QQ 号；wsUrl 对准 NapCat 的 OneBot11 正向 WS 端口。
+- insert:
+    - id: onebot-im
+      name: './onebot-im.mjs'
+      config:
+        wsUrl: "ws://127.0.0.1:3001"
+        accessToken: ""
+        allowUsers: []          # 例：["123456789"]
+        allowGroups: []
+        onNotAllowed: "drop"
+        provider: "p-msuetdmv"              # 与下面 llm-pi-ai providers 对应
+        model: "deepseek-v4-flash-free"
+        agentPreset: "standard"
+        timeoutMs: 600000
+        idleDisposeMs: 1800000
+        splitLength: 4000
+        ackMessage: true
+
+# 与 Kivio 相同的自建 provider（API Key 只经环境变量 KIVIO_DSH_P_MSUETDMV_API_KEY 注入）。
+- id: llm-pi-ai
+  config:
+    providers:
+      p-msuetdmv:
+        api: openai-completions
+        apiKeyEnv: KIVIO_DSH_P_MSUETDMV_API_KEY
+        baseURL: https://8080-4ce50dca78688149.monkeycode-ai.online/v1
+        displayName: 自建
+        models:
+        - contextWindow: 1024000
+          id: deepseek-v4-flash-free
+          input:
+          - text
+          maxTokens: 16384
+          name: deepseek-v4-flash-free
+          reasoningEfforts: false
+        - contextWindow: 128000
+          id: mimo-v2.5-free
+          input:
+          - text
+          maxTokens: 16384
+          name: mimo-v2.5-free
+          reasoningEfforts: false

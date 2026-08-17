@@ -1,0 +1,52 @@
+# kivio-im-gateway 配置模板 —— 复制为 config.yaml 后按需修改。
+# 所有键均可省略，省略时使用此处展示的默认值。
+
+onebot:
+  # NapCat/Lagrange 开启的 OneBot11 正向 WebSocket 服务端地址。
+  ws_url: "ws://127.0.0.1:3001"
+  # 与 NapCat 网络配置里的 accessToken 一致；留空表示无鉴权。
+  access_token: ""
+  # 断线重连间隔（秒）。
+  reconnect_interval_sec: 5
+  # 私聊白名单（QQ 号，字符串或数字均可）。空数组 = 拒绝所有私聊消息（安全默认）。
+  allow_private: []
+  # 群白名单（群号）。空数组 = 忽略所有群消息。
+  allow_group: []
+  # 白名单之外的消息处理方式：drop（静默丢弃）| reject（回复一句“未授权”）。
+  on_not_allowed: "drop"
+
+kivio:
+  # 会话目录。留空 = 自动探测 %APPDATA%\com.zmair.kivio\conversations
+  conversations_dir: ""
+  # Kivio 进程名（Get-Process 用，不带 .exe）。
+  process_name: "kivio"
+  # 对话文件轮询间隔（毫秒）。
+  poll_interval_ms: 800
+  # 发送后扫描 index.json 识别“新对话/目标对话 revision 变化”的超时（秒）。
+  identify_timeout_sec: 20
+  # 判定“回复已写完”的静默期：对话文件 revision 连续 N 次轮询无变化即认为稳定。
+  settle_polls: 3
+  # UIA 定位输入框失败时，用窗口相对坐标兜底点击输入条。
+  input_coords:
+    x_ratio: 0.5    # 窗口宽度比例（0=左, 1=右）
+    y_ratio: 0.93   # 窗口高度比例（0=顶, 1=底）
+  # 每次 UIA FindAll 的最大后代数量（防止无障碍树过大时 PowerShell 卡死）。
+  uia_max_results: 50
+
+session:
+  # 单轮执行超时（分钟）：超时后向用户回发提示。
+  timeout_min: 10
+  # 每个会话的排队上限，超出直接拒绝。
+  max_queue: 10
+  # 回复分段单条最大字符数（QQ 单条上限约 4500，留余量）。
+  split_length: 4000
+  # 分段发送间隔（毫秒），避免风控。
+  split_interval_ms: 400
+  # 收到消息后先回执一句“已提交”（true/false）。
+  ack_message: true
+  # 空闲多少分钟后忘记会话映射（下次消息将新建对话；0 = 永不忘记）。
+  forget_after_min: 720
+
+log:
+  # debug | info | warn | error
+  level: "info"

@@ -1,0 +1,19 @@
+{
+  "name": "kivio-im-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "description": "QQ(NapCat/OneBot11) <-> Kivio Desktop 双向桥：IM 消息经 UI 自动化送入 Kivio 对话框，执行结果轮询对话文件后回发手机。方案 C（完全自研极简网关）。",
+  "type": "module",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "probe": "node src/probe.js",
+    "doctor": "node src/probe.js --doctor"
+  },
+  "dependencies": {
+    "ws": "^8.18.0",
+    "yaml": "^2.5.0"
+  }
+}

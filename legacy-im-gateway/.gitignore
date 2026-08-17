@@ -1,0 +1,12 @@
+# Local dependencies and runtime state
+scheme-c/node_modules/
+scheme-c/config.yaml
+scheme-c/data/
+scheme-c/*.log
+scheme-c/run.log
+scheme-d/node_modules/
+scheme-d/onebot-sessions.json
+scheme-d/workspaces/
+scheme-d/.dsh/
+scheme-d/*.log
+scheme-d/run.log
