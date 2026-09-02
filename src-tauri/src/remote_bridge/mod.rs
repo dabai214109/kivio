@@ -20,6 +20,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::StreamExt;
+use tokio_tungstenite::tungstenite::Message;
 use serde_json::{json, Value};
 use tauri::{AppHandle, Manager};
 
@@ -127,13 +128,13 @@ pub fn qr_svg(text: &str) -> Result<String, String> {
     .map_err(|e| format!("二维码生成失败: {e}"))?;
     let colors = code.to_colors();
     let width = code.width();
-    let margin = 4u32;
+    let margin = 4usize;
     let size = width + margin * 2;
     let mut path = String::new();
     for y in 0..width {
         for x in 0..width {
             if colors[y * width + x] == qrcode::Color::Dark {
-                path.push_str(&format!("M{}{}h1v1h-1z", x + margin as usize, y + margin as usize));
+                path.push_str(&format!("M{}{}h1v1h-1z", x + margin, y + margin));
             }
         }
     }
@@ -232,7 +233,6 @@ async fn serve_device(
     eprintln!("[remote-bridge] device connected");
 
     use futures::SinkExt;
-    use tokio_tungstenite::tungstenite::Message;
     let (mut sink, mut stream) = ws.split();
 
     // writer 任务独占 sink；读循环和各长任务通过 mpsc 投递回复。
@@ -248,7 +248,7 @@ async fn serve_device(
     let stop = loop {
         tokio::select! {
             _ = shutdown.changed() => {
-                out_tx.send(Message::Text(json!({"type":"bye"}).to_string().into())).ok();
+                let _ = out_tx.send(Message::Text(json!({"type":"bye"}).to_string().into())).await;
                 break ServeStop::Shutdown;
             }
             frame = stream.next() => {
@@ -279,7 +279,6 @@ async fn serve_device(
 }
 
 async fn handle_frame(app: &AppHandle, text: &str, out_tx: &tokio::sync::mpsc::Sender<Message>) {
-    use tokio_tungstenite::tungstenite::Message;
     let Ok(frame) = serde_json::from_str::<Value>(text) else { return };
     let Some(kind) = frame.get("type").and_then(Value::as_str) else { return };
     let reply_of = |mut v: Value| {
@@ -413,7 +412,6 @@ async fn run_send(
     content: String,
     out_tx: &tokio::sync::mpsc::Sender<Message>,
 ) -> Value {
-    use tokio_tungstenite::tungstenite::Message;
     if content.trim().is_empty() {
         return json!({"type":"turn_error","error":"消息为空"});
     }
@@ -505,7 +503,6 @@ fn cancel_generation(app: &AppHandle, conv_id: &str) {
 
 async fn pairing_connect(app: AppHandle, server_url: String, code: String) {
     use futures::SinkExt;
-    use tokio_tungstenite::tungstenite::Message;
 
     let ws_url = format!(
         "{}/ws?mode=device&code={}",

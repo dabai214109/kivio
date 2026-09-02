@@ -1230,6 +1230,9 @@ pub struct ImGatewayConfig {
     pub split_length: usize,
     #[serde(default)]
     pub qq_official: ImGatewayQqOfficialConfig,
+    /// 企业微信自建应用通道（独立于 QQ provider，可同时启用）。
+    #[serde(default)]
+    pub wecom: ImGatewayWecomConfig,
 }
 
 impl Default for ImGatewayConfig {
@@ -1243,6 +1246,7 @@ impl Default for ImGatewayConfig {
             timeout_sec: default_im_gateway_timeout_sec(),
             split_length: default_im_gateway_split_length(),
             qq_official: ImGatewayQqOfficialConfig::default(),
+            wecom: ImGatewayWecomConfig::default(),
         }
     }
 }
@@ -1762,8 +1766,6 @@ pub struct Settings {
     #[serde(default)]
     pub im_gateway: ImGatewayConfig,
     #[serde(default)]
-    pub wecom: ImGatewayWecomConfig,
-    #[serde(default)]
     pub remote_bridge: RemoteBridgeConfig,
     #[serde(default)]
     pub document_processing: DocumentProcessingConfig,
@@ -1945,7 +1947,6 @@ impl Default for Settings {
             theme: "system".to_string(),
             theme_color: default_theme_color(),
             im_gateway: ImGatewayConfig::default(),
-            wecom: ImGatewayWecomConfig::default(),
             remote_bridge: RemoteBridgeConfig::default(),
             translucent_sidebar: false,
             ui_font_scale: default_ui_font_scale(),
@@ -2693,7 +2694,7 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
 
     // 企业微信：全部字段 trim；开了但凭据/中继不齐、AgentId 非法、AESKey 长度不对的直接关。
     {
-        let w = &mut settings.wecom;
+        let w = &mut settings.im_gateway.wecom;
         w.relay_url = w.relay_url.trim().trim_end_matches('/').to_string();
         w.relay_token = w.relay_token.trim().to_string();
         w.corp_id = w.corp_id.trim().to_string();

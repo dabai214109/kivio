@@ -60,10 +60,10 @@ pub fn wecom_signature(token: &str, timestamp: &str, nonce: &str, encrypt: &str)
 }
 
 /// 解密密文 → 原始明文（16B random + 4B len + msg + receiveid），并校验 receiveid。
+/// AES-256-CBC 手动链式解密：P_i = D(C_i) XOR C_{i-1}（不依赖 cbc crate 的 feature 矩阵）。
 pub fn decrypt_message(aes_key: &[u8; 32], encrypt_b64: &str, receive_id: &str) -> Result<String, String> {
-    use aes::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
+    use aes::cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
     use base64::Engine;
-    type Aes256CbcDec = cbc::Decryptor<aes::Aes256>;
 
     let cipher_b64 = encrypt_b64.trim();
     if cipher_b64.is_empty() {
@@ -76,12 +76,19 @@ pub fn decrypt_message(aes_key: &[u8; 32], encrypt_b64: &str, receive_id: &str) 
         return Err("密文长度不是 16 的倍数".into());
     }
 
-    let iv: &[u8; 16] = &aes_key[..16].try_into().map_err(|_| "IV 转换失败".to_string())?;
+    let cipher = aes::Aes256::new(GenericArray::from_slice(aes_key));
     let mut buf = data;
-    let plain = Aes256CbcDec::new(aes_key.into(), iv.into())
-        .decrypt_padded_mut::<NoPadding>(&mut buf)
-        .map_err(|e| format!("AES 解密失败: {e}"))?;
+    let mut prev: [u8; 16] = aes_key[..16].try_into().map_err(|_| "IV 转换失败".to_string())?;
+    for block in buf.chunks_exact_mut(16) {
+        let cipher_block: [u8; 16] = block.try_into().map_err(|_| "块拷贝失败".to_string())?;
+        cipher.decrypt_block(GenericArray::from_mut_slice(block));
+        for (b, p) in block.iter_mut().zip(prev.iter()) {
+            *b ^= p;
+        }
+        prev = cipher_block;
+    }
 
+    let plain: &[u8] = &buf;
     if plain.len() < 20 {
         return Err("解密结果过短".into());
     }
@@ -124,11 +131,11 @@ pub fn xml_extract(xml: &str, tag: &str) -> Option<String> {
     let rest = &xml[gt + 1..];
     let end = rest.find(&close)?;
     let inner = &rest[..end];
-    let inner = inner.strip_prefix("<![CDATA[").map(|s| {
-        s.strip_suffix("]]>").unwrap_or(s)
-    });
+    let cdata = inner
+        .strip_prefix("<![CDATA[")
+        .map(|s| s.strip_suffix("]]>").unwrap_or(s));
     Some(
-        inner
+        cdata
             .map(|s| s.to_string())
             .unwrap_or_else(|| inner_text(inner)),
     )
@@ -199,7 +206,7 @@ impl MsgIdDedup {
 /* Outbound：token 缓存 + 应用消息发送                                          */
 /* ========================================================================== */
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct WecomOutbound {
     http: reqwest::Client,
     corp_id: String,
@@ -208,10 +215,19 @@ pub struct WecomOutbound {
     token: Mutex<TokenState>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct TokenState {
     access_token: String,
     refresh_at: std::time::Instant,
+}
+
+impl Default for TokenState {
+    fn default() -> Self {
+        Self {
+            access_token: String::new(),
+            refresh_at: std::time::Instant::now(),
+        }
+    }
 }
 
 impl WecomOutbound {
@@ -237,11 +253,11 @@ impl WecomOutbound {
         }
         let resp = self
             .http
-            .get(format!("{WECOM_API_BASE}/gettoken"))
-            .query(&[
-                ("corpid", self.corp_id.as_str()),
-                ("corpsecret", self.corp_secret.as_str()),
-            ])
+            .get(format!(
+                "{WECOM_API_BASE}/gettoken?corpid={}&corpsecret={}",
+                urlencoding_minimal(&self.corp_id),
+                urlencoding_minimal(&self.corp_secret),
+            ))
             .send()
             .await
             .map_err(|e| format!("请求 access_token 失败: {e}"))?;
@@ -272,16 +288,18 @@ impl WecomOutbound {
             let http = &self.http;
             let agent_id = self.agent_id;
             async move {
-                http.post(format!("{WECOM_API_BASE}/message/send"))
-                    .query(&[("access_token", token)])
-                    .json(&json!({
-                        "touser": user,
-                        "msgtype": "text",
-                        "agentid": agent_id,
-                        "text": { "content": content },
-                    }))
-                    .send()
-                    .await
+                http.post(format!(
+                    "{WECOM_API_BASE}/message/send?access_token={}",
+                    urlencoding_minimal(&token)
+                ))
+                .json(&json!({
+                    "touser": user,
+                    "msgtype": "text",
+                    "agentid": agent_id,
+                    "text": { "content": content },
+                }))
+                .send()
+                .await
             }
         };
 
@@ -436,12 +454,12 @@ pub async fn serve_wecom(
                     Some(Ok(Message::Text(text))) => {
                         let Ok(frame) = serde_json::from_str::<Value>(&text) else { continue };
                         match frame.get("type").and_then(Value::as_str) {
-                            "hello" => eprintln!("[im-gateway/wecom] ready"),
-                            "wecom_verify" => {
+                            Some("hello") => eprintln!("[im-gateway/wecom] ready"),
+                            Some("wecom_verify") => {
                                 let reply = handle_verify(&frame);
                                 let _ = writer.send(Message::Text(reply.to_string().into())).await;
                             }
-                            "wecom_msg" => {
+                            Some("wecom_msg") => {
                                 handle_msg(gateway, &mut dedup, &frame);
                             }
                             _ => {}

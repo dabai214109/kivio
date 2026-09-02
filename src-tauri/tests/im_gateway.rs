@@ -162,21 +162,29 @@ fn test_aes_key() -> [u8; 32] {
 
 /// 用与官方相同的构造方式生成密文（16B random + 4B len + msg + receiveid，PKCS7）。
 fn encrypt_like_wecom(aes_key: &[u8; 32], msg: &str, receive_id: &str) -> String {
-    use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
-    type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+    use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
     use base64::Engine;
 
     let payload_len = msg.len() + receive_id.len();
-    let mut plain = Vec::with_capacity(16 + 4 + payload_len);
-    plain.extend_from_slice(&[0u8; 16]); // random
-    plain.extend_from_slice(&(msg.len() as u32).to_be_bytes());
-    plain.extend_from_slice(msg.as_bytes());
-    plain.extend_from_slice(receive_id.as_bytes());
+    let mut buf = Vec::with_capacity(16 + 4 + payload_len + 16);
+    buf.extend_from_slice(&[0u8; 16]); // random
+    buf.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+    buf.extend_from_slice(msg.as_bytes());
+    buf.extend_from_slice(receive_id.as_bytes());
+    // PKCS7 padding
+    let pad = 16 - (buf.len() % 16);
+    buf.extend(std::iter::repeat(pad as u8).take(pad));
 
-    let iv = [7u8; 16]; // 测试用固定 IV
-    let enc = Aes256CbcEnc::new(aes_key.into(), (&iv).into())
-        .encrypt_padded_vec_mut::<Pkcs7>(&plain);
-    base64::engine::general_purpose::STANDARD.encode(enc)
+    let cipher = aes::Aes256::new(GenericArray::from_slice(aes_key));
+    let mut prev = [7u8; 16]; // 测试用固定 IV
+    for block in buf.chunks_exact_mut(16) {
+        for (b, p) in block.iter_mut().zip(prev.iter()) {
+            *b ^= p;
+        }
+        cipher.encrypt_block(GenericArray::from_mut_slice(block));
+        prev.copy_from_slice(block);
+    }
+    base64::engine::general_purpose::STANDARD.encode(&buf)
 }
 
 #[test]
