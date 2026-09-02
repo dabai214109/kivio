@@ -69,7 +69,7 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 qrcode = { version = "0.14", default-features = false }
 # 企业微信回调加解密（WXBizMsgCrypt：AES-256-CBC + PKCS7 + SHA1 签名）
 aes = "0.8"
-cbc = { version = "0.4", features = ["block-padding"] }
+cbc = { version = "0.2", features = ["block-padding"] }
 sha1 = "0.10"
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 scraper = "0.23"
