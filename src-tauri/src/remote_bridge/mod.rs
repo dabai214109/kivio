@@ -134,7 +134,7 @@ pub fn qr_svg(text: &str) -> Result<String, String> {
     for y in 0..width {
         for x in 0..width {
             if colors[y * width + x] == qrcode::Color::Dark {
-                path.push_str(&format!("M{}{}h1v1h-1z", x + margin, y + margin));
+                path.push_str(&format!("M{},{}h1v1h-1z", x + margin, y + margin));
             }
         }
     }

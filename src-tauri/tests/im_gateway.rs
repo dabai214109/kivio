@@ -200,7 +200,7 @@ fn wecom_signature_is_lexicographic_and_matches_vector() {
     // token=1, ts=2, nonce=3, encrypt=4 → sort → "1234" → sha1("1234")
     assert_eq!(
         wecom_signature("1", "2", "3", "4"),
-        "81dc9bdb52d04dc20036dbd8313ed055"
+        "7110eda4d09e062aa5e4a390b0a572ac0d2c0220"
     );
     // 传参顺序无关（内部按字典序排序）。
     assert_eq!(
