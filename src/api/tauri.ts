@@ -464,6 +464,19 @@ export type ImGatewayQqOfficialConfig = {
   clientSecret: string
 }
 
+/** 企业微信自建应用通道（回调 → 自建中继 → 桌面端）。镜像 Rust ImGatewayWecomConfig。 */
+export type ImGatewayWecomConfig = {
+  enabled: boolean
+  relayUrl: string
+  relayToken: string
+  corpId: string
+  corpSecret: string
+  agentId: number
+  callbackToken: string
+  encodingAesKey: string
+  allowUsers: string[]
+}
+
 /** IM 网关（IM ↔ Kivio 会话）。镜像 Rust ImGatewayConfig。provider 值沿用 Rust 侧 snake_case。 */
 export type ImGatewayConfig = {
   enabled: boolean
@@ -474,6 +487,7 @@ export type ImGatewayConfig = {
   timeoutSec: number
   splitLength: number
   qqOfficial: ImGatewayQqOfficialConfig
+  wecom: ImGatewayWecomConfig
 }
 
 export function defaultImGateway(): ImGatewayConfig {
@@ -486,6 +500,17 @@ export function defaultImGateway(): ImGatewayConfig {
     timeoutSec: 600,
     splitLength: 3800,
     qqOfficial: { appId: '', clientSecret: '' },
+    wecom: {
+      enabled: false,
+      relayUrl: '',
+      relayToken: '',
+      corpId: '',
+      corpSecret: '',
+      agentId: 0,
+      callbackToken: '',
+      encodingAesKey: '',
+      allowUsers: [],
+    },
   }
 }
 
@@ -515,6 +540,16 @@ export type RemoteBridgeStatus = {
   connected: boolean
   server_url: string
   token_set: boolean
+}
+
+/** im_gateway_status 返回值（QQ classic 通道 + 企微通道）。 */
+export type ImGatewayStatusInfo = {
+  enabled: boolean
+  connected: boolean
+  wsUrl: string
+  botName: string
+  activeTurns: number
+  wecomConnected: boolean
 }
 
 export type SkillFileEntry = {
@@ -1702,6 +1737,17 @@ function normalizeImGateway(config?: Partial<ImGatewayConfig> | null): ImGateway
       appId: current.qqOfficial?.appId ?? '',
       clientSecret: current.qqOfficial?.clientSecret ?? '',
     },
+    wecom: {
+      enabled: current.wecom?.enabled ?? false,
+      relayUrl: current.wecom?.relayUrl ?? '',
+      relayToken: current.wecom?.relayToken ?? '',
+      corpId: current.wecom?.corpId ?? '',
+      corpSecret: current.wecom?.corpSecret ?? '',
+      agentId: typeof current.wecom?.agentId === 'number' ? current.wecom.agentId : 0,
+      callbackToken: current.wecom?.callbackToken ?? '',
+      encodingAesKey: current.wecom?.encodingAesKey ?? '',
+      allowUsers: Array.isArray(current.wecom?.allowUsers) ? current.wecom.allowUsers : [],
+    },
   }
 }
 
@@ -1987,6 +2033,7 @@ export const api = {
   remoteBridgePairingStatus: () => invoke<RemotePairingStatus>('remote_bridge_pairing_status'),
   remoteBridgeCancelPairing: () => invoke<void>('remote_bridge_cancel_pairing'),
   remoteBridgeStatus: () => invoke<RemoteBridgeStatus>('remote_bridge_status'),
+  imGatewayStatus: () => invoke<ImGatewayStatusInfo>('im_gateway_status'),
   // 某模型可选的思考等级列表（用户覆盖 modelOverrides → 模型库 reasoningEfforts → 家族兜底）。
   reasoningEffortsForModel: (model: string, providerId?: string) =>
     invoke<string[]>('chat_reasoning_efforts_for_model', { model, providerId }),

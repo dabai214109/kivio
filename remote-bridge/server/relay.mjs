@@ -113,8 +113,107 @@ function publicOrigin(req) {
   return `${proto}://${host}`;
 }
 
+/* ---------------- 企业微信回调透传 ---------------- */
+// 微信服务器 → relay（HTTPS 回调）→ 桌面端（出站 WS）。
+// relay 不持有企微凭据、不解密：GET 验证等桌面解密回显，POST 密文原样透传。
+// URL 形如 /wecom/callback?t=<device_token>，token 与桌面端「IM 网关 → 企业微信」设置一致。
+
+const wecomWaiters = new Map(); // wid -> { resolve, timer }
+let wecomWid = 0;
+
+function wecomDeviceSend(token, obj) {
+  const room = rooms.get(`d:${token}`);
+  if (!room || !room.device || room.device.readyState !== WebSocket.OPEN) return false;
+  try {
+    room.device.send(JSON.stringify(obj));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function wecomCallback(req, res, url) {
+  const token = url.searchParams.get('t') || '';
+  if (!token || !store.devices[token]) {
+    res.writeHead(404, { 'content-type': 'text/plain' });
+    res.end('unknown token');
+    return;
+  }
+
+  if (req.method === 'GET') {
+    // 验证 URL：签名校验与 echostr 解密由桌面端完成，relay 只等结果回显。
+    const wid = `w${++wecomWid}`;
+    const sent = wecomDeviceSend(token, {
+      type: 'wecom_verify',
+      wid,
+      query: {
+        msg_signature: url.searchParams.get('msg_signature') || '',
+        timestamp: url.searchParams.get('timestamp') || '',
+        nonce: url.searchParams.get('nonce') || '',
+        echostr: url.searchParams.get('echostr') || '',
+      },
+    });
+    if (!sent) {
+      console.log('[relay] wecom verify: device offline');
+      res.writeHead(400, { 'content-type': 'text/plain' });
+      res.end('device offline');
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (wecomWaiters.delete(wid)) console.log('[relay] wecom verify: timeout');
+      res.writeHead(400, { 'content-type': 'text/plain' });
+      res.end('timeout');
+    }, 5000);
+    wecomWaiters.set(wid, {
+      resolve: (frame) => {
+        clearTimeout(timer);
+        wecomWaiters.delete(wid);
+        if (frame.error) {
+          res.writeHead(400, { 'content-type': 'text/plain' });
+          res.end('verify failed');
+        } else {
+          res.writeHead(200, { 'content-type': 'text/plain' });
+          res.end(String(frame.echostr || ''));
+        }
+      },
+      timer,
+    });
+    return;
+  }
+
+  // POST 消息推送：5s 限制内立即应答，密文异步透传给桌面端。
+  let body = '';
+  let overflow = false;
+  req.on('data', (chunk) => {
+    body += chunk;
+    if (body.length > 512 * 1024) {
+      overflow = true;
+      req.destroy();
+    }
+  });
+  req.on('end', () => {
+    if (overflow) return;
+    res.writeHead(200, { 'content-type': 'text/plain' });
+    res.end('success');
+    const sent = wecomDeviceSend(token, {
+      type: 'wecom_msg',
+      query: {
+        msg_signature: url.searchParams.get('msg_signature') || '',
+        timestamp: url.searchParams.get('timestamp') || '',
+        nonce: url.searchParams.get('nonce') || '',
+      },
+      body,
+    });
+    console.log(`[relay] wecom msg forwarded=${sent} bytes=${body.length}`);
+  });
+}
+
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://local');
+  if (url.pathname === '/wecom/callback') {
+    wecomCallback(req, res, url);
+    return;
+  }
   if (req.method === 'POST' && url.pathname === '/api/pair') {
     // 清理过期码
     const now = Date.now();
@@ -236,6 +335,13 @@ wss.on('connection', (ws, req) => {
       return;
     }
     if (!frame || typeof frame.type !== 'string' || frame.type.length > 64) return;
+
+    // 设备端控制帧：企微验证结果路由到等待中的回调（不转发给手机）。
+    if (mode === 'device' && frame.type === 'wecom_verify_result') {
+      const waiter = wecomWaiters.get(frame.wid);
+      if (waiter) waiter.resolve(frame);
+      return;
+    }
 
     if (mode === 'client') {
       // 手机 → 桌面

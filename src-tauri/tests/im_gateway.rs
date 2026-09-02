@@ -144,3 +144,110 @@ fn token_refresh_leads_expiry_by_60s() {
     assert_eq!(token_refresh_after(120).as_secs(), 60);
     assert_eq!(token_refresh_after(10).as_secs(), 60, "过短的 expires_in 也保底 60s");
 }
+
+/* ========================================================================== */
+/* 企业微信（wecom.rs）                                                        */
+/* ========================================================================== */
+
+use kivio::im_gateway::wecom::{
+    aes_key_from_encoding_key, decrypt_message, parse_encrypt_from_xml, parse_plain_message,
+    wecom_signature, MsgIdDedup as WecomMsgIdDedup, WECOM_MAX_TEXT_CHARS,
+};
+
+const TEST_ENCODING_KEY: &str = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQ";
+
+fn test_aes_key() -> [u8; 32] {
+    aes_key_from_encoding_key(TEST_ENCODING_KEY).expect("valid key")
+}
+
+/// 用与官方相同的构造方式生成密文（16B random + 4B len + msg + receiveid，PKCS7）。
+fn encrypt_like_wecom(aes_key: &[u8; 32], msg: &str, receive_id: &str) -> String {
+    use aes::cipher::{block_padding::Pkcs7, BlockEncryptMut, KeyIvInit};
+    type Aes256CbcEnc = cbc::Encryptor<aes::Aes256>;
+    use base64::Engine;
+
+    let payload_len = msg.len() + receive_id.len();
+    let mut plain = Vec::with_capacity(16 + 4 + payload_len);
+    plain.extend_from_slice(&[0u8; 16]); // random
+    plain.extend_from_slice(&(msg.len() as u32).to_be_bytes());
+    plain.extend_from_slice(msg.as_bytes());
+    plain.extend_from_slice(receive_id.as_bytes());
+
+    let iv = [7u8; 16]; // 测试用固定 IV
+    let enc = Aes256CbcEnc::new(aes_key.into(), (&iv).into())
+        .encrypt_padded_vec_mut::<Pkcs7>(&plain);
+    base64::engine::general_purpose::STANDARD.encode(enc)
+}
+
+#[test]
+fn wecom_aes_key_requires_43_chars() {
+    assert!(aes_key_from_encoding_key(TEST_ENCODING_KEY).is_ok());
+    assert!(aes_key_from_encoding_key("short").is_err());
+    assert!(aes_key_from_encoding_key(&"a".repeat(42)).is_err());
+    assert!(aes_key_from_encoding_key(&"a".repeat(44)).is_err());
+}
+
+#[test]
+fn wecom_signature_is_lexicographic_and_matches_vector() {
+    // token=1, ts=2, nonce=3, encrypt=4 → sort → "1234" → sha1("1234")
+    assert_eq!(
+        wecom_signature("1", "2", "3", "4"),
+        "81dc9bdb52d04dc20036dbd8313ed055"
+    );
+    // 传参顺序无关（内部按字典序排序）。
+    assert_eq!(
+        wecom_signature("4", "3", "2", "1"),
+        wecom_signature("1", "2", "3", "4")
+    );
+    assert_eq!(wecom_signature("1", "2", "3", "4").len(), 40);
+}
+
+#[test]
+fn wecom_decrypt_roundtrip() {
+    let key = test_aes_key();
+    let cipher = encrypt_like_wecom(&key, "<xml><Content><![CDATA[你好]]></Content></xml>", "ww_corp_id");
+    let plain = decrypt_message(&key, &cipher, "ww_corp_id").expect("decrypt ok");
+    assert!(plain.contains("你好"));
+
+    // receiveid 不匹配 → 报错
+    assert!(decrypt_message(&key, &cipher, "other_corp").is_err());
+    // 非法 base64 → 报错
+    assert!(decrypt_message(&key, "!!!not-base64!!!", "ww_corp_id").is_err());
+    // 空串 → 报错
+    assert!(decrypt_message(&key, "", "ww_corp_id").is_err());
+}
+
+#[test]
+fn wecom_xml_helpers() {
+    let callback = r#"<xml><ToUserName><![CDATA[ww_corp]]></ToUserName><Encrypt><![CDATA[ABC123xyz==]]></Encrypt><AgentID><![CDATA[1000002]]></AgentID></xml>"#;
+    assert_eq!(parse_encrypt_from_xml(callback).as_deref(), Some("ABC123xyz=="));
+    assert_eq!(parse_encrypt_from_xml("<xml><NoEncrypt/></xml>"), None);
+
+    let plain = r#"<xml><ToUserName><![CDATA[ww_corp]]></ToUserName><FromUserName><![CDATA[userid_zhang]]></FromUserName><CreateTime>1756000000</CreateTime><MsgType><![CDATA[text]]></MsgType><Content><![CDATA[帮我看看这个报错]]></Content><MsgId>7064511234567890123</MsgId><AgentID><![CDATA[1000002]]></AgentID></xml>"#;
+    let msg = parse_plain_message(plain);
+    assert_eq!(msg.from, "userid_zhang");
+    assert_eq!(msg.content, "帮我看看这个报错");
+    assert_eq!(msg.msg_type, "text");
+    assert_eq!(msg.msg_id, "7064511234567890123");
+
+    // 无 CDATA 的纯文本节点
+    assert_eq!(
+        parse_plain_message("<xml><MsgType>event</MsgType></xml>").msg_type,
+        "event"
+    );
+}
+
+#[test]
+fn wecom_dedup_ignores_pushed_duplicates() {
+    let mut dedup = WecomMsgIdDedup::new(512);
+    assert!(dedup.push("7064511234567890123"));
+    assert!(!dedup.push("7064511234567890123"), "企微重推的相同 MsgId 应去重");
+    assert!(dedup.push("7064511234567890124"));
+    assert!(dedup.push(""), "空 MsgId（部分事件）不参与去重");
+}
+
+#[test]
+fn wecom_split_limit_is_conservative() {
+    // 企微 text 上限 2048 字节：600 汉字 ≈ 1800 字节，必须低于上限。
+    assert!(WECOM_MAX_TEXT_CHARS * 3 < 2048);
+}

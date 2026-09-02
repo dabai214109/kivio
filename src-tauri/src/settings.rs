@@ -1269,6 +1269,54 @@ impl Default for RemoteBridgeConfig {
     }
 }
 
+/// 企业微信自建应用通道。与 classic provider 并行独立运行：
+/// 微信服务器 → 回调 → 自建中继（透传密文）→ 桌面端解密进会话管线。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ImGatewayWecomConfig {
+    pub enabled: bool,
+    /// 自建中继地址（https://relay.example.com）。
+    #[serde(default)]
+    pub relay_url: String,
+    /// 中继下发的 device token（企微通道独立一条，与 remote_bridge 的 token 不同）。
+    #[serde(default)]
+    pub relay_token: String,
+    /// 企业 ID（我的企业 → 企业信息 → CorpID）。
+    #[serde(default)]
+    pub corp_id: String,
+    /// 自建应用 Secret。
+    #[serde(default)]
+    pub corp_secret: String,
+    /// 自建应用 AgentId。
+    #[serde(default)]
+    pub agent_id: i64,
+    /// 回调配置的 Token（企微后台「接收消息」页生成）。
+    #[serde(default)]
+    pub callback_token: String,
+    /// 回调配置的 EncodingAESKey（43 字符）。
+    #[serde(default)]
+    pub encoding_aes_key: String,
+    /// 允许的成员 UserID 白名单；空 = 允许所有在应用可见范围内的成员。
+    #[serde(default, deserialize_with = "null_tolerant_vec")]
+    pub allow_users: Vec<String>,
+}
+
+impl Default for ImGatewayWecomConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            relay_url: String::new(),
+            relay_token: String::new(),
+            corp_id: String::new(),
+            corp_secret: String::new(),
+            agent_id: 0,
+            callback_token: String::new(),
+            encoding_aes_key: String::new(),
+            allow_users: Vec::new(),
+        }
+    }
+}
+
 fn default_skill_auto_match() -> bool {
     true
 }
@@ -1714,6 +1762,8 @@ pub struct Settings {
     #[serde(default)]
     pub im_gateway: ImGatewayConfig,
     #[serde(default)]
+    pub wecom: ImGatewayWecomConfig,
+    #[serde(default)]
     pub remote_bridge: RemoteBridgeConfig,
     #[serde(default)]
     pub document_processing: DocumentProcessingConfig,
@@ -1895,6 +1945,7 @@ impl Default for Settings {
             theme: "system".to_string(),
             theme_color: default_theme_color(),
             im_gateway: ImGatewayConfig::default(),
+            wecom: ImGatewayWecomConfig::default(),
             remote_bridge: RemoteBridgeConfig::default(),
             translucent_sidebar: false,
             ui_font_scale: default_ui_font_scale(),
@@ -2637,6 +2688,34 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
                 || settings.im_gateway.qq_official.client_secret.is_empty());
         if settings.im_gateway.ws_url.is_empty() || missing_creds {
             settings.im_gateway.enabled = false;
+        }
+    }
+
+    // 企业微信：全部字段 trim；开了但凭据/中继不齐、AgentId 非法、AESKey 长度不对的直接关。
+    {
+        let w = &mut settings.wecom;
+        w.relay_url = w.relay_url.trim().trim_end_matches('/').to_string();
+        w.relay_token = w.relay_token.trim().to_string();
+        w.corp_id = w.corp_id.trim().to_string();
+        w.corp_secret = w.corp_secret.trim().to_string();
+        w.callback_token = w.callback_token.trim().to_string();
+        w.encoding_aes_key = w.encoding_aes_key.trim().to_string();
+        w.allow_users = w
+            .allow_users
+            .iter()
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty())
+            .collect();
+        if w.enabled
+            && (w.relay_url.is_empty()
+                || w.relay_token.is_empty()
+                || w.corp_id.is_empty()
+                || w.corp_secret.is_empty()
+                || w.callback_token.is_empty()
+                || w.encoding_aes_key.len() != 43
+                || w.agent_id <= 0)
+        {
+            w.enabled = false;
         }
     }
 

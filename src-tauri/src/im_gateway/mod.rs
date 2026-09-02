@@ -21,6 +21,7 @@
 //! 按拒绝处理（interaction.rs 的 fail-closed）——设置页有提示文案。
 
 pub mod qq_official;
+pub mod wecom;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -56,6 +57,8 @@ const SPLIT_INTERVAL_MS: u64 = 350;
 pub(crate) enum UserKey {
     Onebot(i64),
     C2c(String),
+    /// 企业微信成员 UserID。
+    Wecom(String),
 }
 
 impl UserKey {
@@ -64,6 +67,7 @@ impl UserKey {
         match self {
             UserKey::Onebot(qq) => format!("qq:{qq}"),
             UserKey::C2c(openid) => format!("c2c:{openid}"),
+            UserKey::Wecom(userid) => format!("wecom:{userid}"),
         }
     }
 }
@@ -105,6 +109,8 @@ struct StatusInfo {
     bot_name: String,
     /// 正在执行的轮数（跨用户合计）。
     active_turns: usize,
+    /// 企微通道连接状态（独立于 classic provider）。
+    wecom_connected: bool,
 }
 
 static STATUS: OnceLock<Mutex<StatusInfo>> = OnceLock::new();
@@ -128,6 +134,7 @@ pub(crate) fn im_gateway_status() -> Value {
         "wsUrl": guard.ws_url,
         "botName": guard.bot_name,
         "activeTurns": guard.active_turns,
+        "wecomConnected": guard.wecom_connected,
     })
 }
 
@@ -330,8 +337,12 @@ struct Gateway {
     user_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// 每用户等待数（排队上限）。
     user_waiting: Mutex<HashMap<String, Arc<AtomicUsize>>>,
-    /// 当前连接的出站通道（断线时为 None）。
+    /// 当前连接的出站通道（断线时为 None）。classic provider（onebot / qq_official）共用此槽。
     outbound: Mutex<Option<OutboundChannel>>,
+    /// 企微通道（与 classic 并行独立运行，互不挤占）。
+    wecom_outbound: Mutex<Option<Arc<wecom::WecomOutbound>>>,
+    /// 企微白名单（成员 UserID 列表）；None = 允许所有。
+    wecom_allow_users: Mutex<Option<Vec<String>>>,
 }
 
 impl Gateway {
@@ -341,6 +352,8 @@ impl Gateway {
             user_locks: Mutex::new(HashMap::new()),
             user_waiting: Mutex::new(HashMap::new()),
             outbound: Mutex::new(None),
+            wecom_outbound: Mutex::new(None),
+            wecom_allow_users: Mutex::new(None),
             app,
         }
     }
@@ -376,8 +389,20 @@ impl Gateway {
             .take();
     }
 
-    /// 统一回发入口：按当前 provider 把文本发给指定用户。
+    /// 统一回发入口：按用户类型分派到对应通道。
     async fn send_user(&self, user: &UserKey, text: &str) -> Result<(), String> {
+        if let UserKey::Wecom(userid) = user {
+            let outbound = self
+                .wecom_outbound
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let Some(outbound) = outbound else {
+                return Err("wecom gateway not connected".to_string());
+            };
+            return outbound.send_text(userid, text).await;
+        }
+
         let channel = self
             .outbound
             .lock()
@@ -410,6 +435,11 @@ impl Gateway {
             Some(OutboundChannel::QqOfficial(_))
         )
     }
+
+    /// 企微通道是否连接（企微 text 有 2048 字节上限，分段更短）。
+    fn is_wecom(&self, user: &UserKey) -> bool {
+        matches!(user, UserKey::Wecom(_))
+    }
 }
 
 fn channel_kind(channel: &OutboundChannel) -> &'static str {
@@ -432,6 +462,15 @@ enum ServeStop {
 
 pub async fn run(app: AppHandle) {
     let gateway = Arc::new(Gateway::new(app.clone()));
+    // classic（onebot / qq_official）与企微两条通道并行常驻，各自按设置热生效。
+    tokio::join!(
+        run_classic(app.clone(), gateway.clone()),
+        run_wecom(app.clone(), gateway.clone()),
+    );
+    eprintln!("[im-gateway] supervisors exited");
+}
+
+async fn run_classic(app: AppHandle, gateway: Arc<Gateway>) {
     let mut shutdown = shutdown_rx();
     let mut backoff_secs: u64 = 1;
 
@@ -497,7 +536,56 @@ pub async fn run(app: AppHandle) {
         gateway.clear_outbound();
         update_status(|s| s.connected = false);
     }
-    eprintln!("[im-gateway] supervisor exited");
+    eprintln!("[im-gateway] classic supervisor exited");
+}
+
+async fn run_wecom(app: AppHandle, gateway: Arc<Gateway>) {
+    let mut shutdown = shutdown_rx();
+    let mut backoff_secs: u64 = 1;
+
+    loop {
+        if is_shutdown_requested() {
+            break;
+        }
+        let enabled = app
+            .try_state::<AppState>()
+            .map(|state| state.settings_read().im_gateway.wecom.enabled)
+            .unwrap_or(false);
+        if !enabled {
+            update_status(|s| s.wecom_connected = false);
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                _ = shutdown.changed() => break,
+            }
+            backoff_secs = 1;
+            continue;
+        }
+
+        eprintln!("[im-gateway] connecting WeCom relay ...");
+        let stop = wecom::serve_wecom(&app, &gateway, &mut shutdown).await;
+        update_status(|s| s.wecom_connected = false);
+
+        match stop {
+            ServeStop::Shutdown => break,
+            ServeStop::Disabled => {
+                eprintln!("[im-gateway/wecom] disabled by settings; standing by");
+                backoff_secs = 1;
+            }
+            ServeStop::SettingsChanged => {
+                eprintln!("[im-gateway/wecom] settings changed; reconnecting");
+                backoff_secs = 1;
+            }
+            ServeStop::Disconnected => {
+                eprintln!("[im-gateway/wecom] disconnected; retry in {backoff_secs}s");
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                    _ = shutdown.changed() => break,
+                }
+                backoff_secs = (backoff_secs * 2).min(30);
+            }
+        }
+    }
+    eprintln!("[im-gateway] wecom supervisor exited");
 }
 
 /* ========================================================================== */
@@ -868,6 +956,12 @@ async fn run_turn_for_user(gateway: &Arc<Gateway>, user: &UserKey, session_key: 
         .try_state::<AppState>()
         .map(|state| state.settings_read().im_gateway.split_length)
         .unwrap_or(3800);
+    // 企微应用消息单条 text ≤ 2048 字节，分段收紧到安全字符数。
+    let split_length = if gateway.is_wecom(user) {
+        split_length.min(wecom::WECOM_MAX_TEXT_CHARS)
+    } else {
+        split_length
+    };
 
     match outcome {
         TurnOutcome::Success { reply } => {

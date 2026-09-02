@@ -236,10 +236,10 @@ async fn serve_device(
     let (mut sink, mut stream) = ws.split();
 
     // writer 任务独占 sink；读循环和各长任务通过 mpsc 投递回复。
-    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<String>(64);
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<Message>(64);
     let writer = tokio::spawn(async move {
-        while let Some(text) = out_rx.recv().await {
-            if sink.send(Message::Text(text.into())).await.is_err() {
+        while let Some(frame) = out_rx.recv().await {
+            if sink.send(frame).await.is_err() {
                 break;
             }
         }
@@ -248,15 +248,25 @@ async fn serve_device(
     let stop = loop {
         tokio::select! {
             _ = shutdown.changed() => {
-                out_tx.send(json!({"type":"bye"}).to_string()).ok();
+                out_tx.send(Message::Text(json!({"type":"bye"}).to_string().into())).ok();
                 break ServeStop::Shutdown;
             }
             frame = stream.next() => {
                 match frame {
                     Some(Ok(msg)) => {
-                        let tokio_tungstenite::tungstenite::Message::Text(text) = msg else { continue };
-                        handle_frame(app, &text, &out_tx).await;
-                        *LAST_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner()) = now_ms();
+                        match msg {
+                            tokio_tungstenite::tungstenite::Message::Text(text) => {
+                                handle_frame(app, &text, &out_tx).await;
+                                *LAST_ACTIVITY.lock().unwrap_or_else(|e| e.into_inner()) = now_ms();
+                            }
+                            // 中继 30s 心跳：必须回 pong，否则会被服务端踢掉。
+                            tokio_tungstenite::tungstenite::Message::Ping(payload) => {
+                                out_tx
+                                    .try_send(tokio_tungstenite::tungstenite::Message::Pong(payload))
+                                    .ok();
+                            }
+                            _ => {}
+                        }
                     }
                     _ => break ServeStop::Disconnected,
                 }
@@ -268,14 +278,15 @@ async fn serve_device(
     stop
 }
 
-async fn handle_frame(app: &AppHandle, text: &str, out_tx: &tokio::sync::mpsc::Sender<String>) {
+async fn handle_frame(app: &AppHandle, text: &str, out_tx: &tokio::sync::mpsc::Sender<Message>) {
+    use tokio_tungstenite::tungstenite::Message;
     let Ok(frame) = serde_json::from_str::<Value>(text) else { return };
     let Some(kind) = frame.get("type").and_then(Value::as_str) else { return };
     let reply_of = |mut v: Value| {
         if let Some(req) = frame.get("req_id") {
             v["req_id"] = req.clone();
         }
-        v.to_string()
+        Message::Text(v.to_string().into())
     };
 
     match kind {
@@ -312,7 +323,7 @@ async fn handle_frame(app: &AppHandle, text: &str, out_tx: &tokio::sync::mpsc::S
                 .to_string();
             tokio::spawn(async move {
                 let result = run_send(&app, conversation_id, content, out_tx).await;
-                out_tx.try_send(result.to_string()).ok();
+                out_tx.try_send(Message::Text(result.to_string().into())).ok();
             });
         }
         "stop" => {
@@ -400,8 +411,9 @@ async fn run_send(
     app: &AppHandle,
     conversation_id: Option<String>,
     content: String,
-    out_tx: &tokio::sync::mpsc::Sender<String>,
+    out_tx: &tokio::sync::mpsc::Sender<Message>,
 ) -> Value {
+    use tokio_tungstenite::tungstenite::Message;
     if content.trim().is_empty() {
         return json!({"type":"turn_error","error":"消息为空"});
     }
@@ -410,7 +422,9 @@ async fn run_send(
     };
     // 先广播 turn_started，手机端据此进入「生成中」并可随时停止。
     out_tx
-        .try_send(json!({"type":"turn_started","conversation_id":conv_id}).to_string())
+        .try_send(Message::Text(
+            json!({"type":"turn_started","conversation_id":conv_id}).to_string().into(),
+        ))
         .ok();
 
     let send = chat_send_message(

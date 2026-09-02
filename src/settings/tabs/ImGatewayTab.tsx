@@ -1,13 +1,15 @@
+import { useEffect, useRef, useState } from 'react'
 import { MessageCircle } from 'lucide-react'
-import type { ImGatewayConfig } from '../../api/tauri'
+import type { ImGatewayConfig, ImGatewayStatusInfo, RemotePairingStatus } from '../../api/tauri'
+import { api } from '../../api/tauri'
 import type { Lang } from '../i18n'
 import { Input, Select, SettingsGroup, SettingRow, TextArea, Toggle } from '../components'
 
 /**
- * IM 网关设置：IM 私聊 ↔ Kivio 会话。两种接入方式：
- * - QQ 官方机器人（q.qq.com 开放平台，WebSocket）：填 AppID/Secret，无需本机任何额外程序；
- * - OneBot11（本机 NapCat/Lagrange 正向 WebSocket）。
- * 改动无需重启——后端监督循环每 2s 重读设置。
+ * IM 网关设置：IM 私聊 ↔ Kivio 会话。通道构成：
+ * - QQ 侧（provider 二选一）：QQ 官方机器人（q.qq.com，WebSocket）/ OneBot11（NapCat）；
+ * - 企业微信自建应用（独立开关，可与 QQ 同时启用）：回调 → 自建中继 → 桌面端。
+ * 改动无需重启——后端监督循环按设置热生效。
  */
 export function ImGatewayTab({ lang, config, onChange }: {
   lang: Lang
@@ -16,18 +18,91 @@ export function ImGatewayTab({ lang, config, onChange }: {
 }) {
   const zh = lang === 'zh'
   const official = config.provider === 'qq_official'
+  const wecom = config.wecom
+
+  const [wecomPairing, setWecomPairing] = useState(false)
+  const [wecomPairError, setWecomPairError] = useState('')
+  const [gatewayStatus, setGatewayStatus] = useState<ImGatewayStatusInfo | null>(null)
+  const pollRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    const tick = async () => {
+      try {
+        const s = await api.imGatewayStatus()
+        if (alive) setGatewayStatus(s)
+      } catch { /* 旧版本无此命令时静默 */ }
+    }
+    tick()
+    const id = window.setInterval(tick, 3000)
+    return () => { alive = false; window.clearInterval(id) }
+  }, [])
+
+  useEffect(() => {
+    if (!wecomPairing) return
+    let alive = true
+    const poll = async () => {
+      try {
+        const s: RemotePairingStatus = await api.remoteBridgePairingStatus()
+        if (!alive) return
+        if (s.status === 'paired' && s.device_token) {
+          setWecomPairing(false)
+          setWecomPairError('')
+          onChange({ ...config, wecom: { ...wecom, relayToken: s.device_token } })
+        } else if (s.status === 'failed') {
+          setWecomPairing(false)
+          setWecomPairError(s.error || (zh ? '配对失败' : 'Pairing failed'))
+        }
+      } catch { /* ignore */ }
+    }
+    poll()
+    pollRef.current = window.setInterval(poll, 1000)
+    return () => {
+      alive = false
+      if (pollRef.current) window.clearInterval(pollRef.current)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [wecomPairing])
+
+  const startWecomPairing = async () => {
+    const relayUrl = wecom.relayUrl.trim()
+    if (!relayUrl) {
+      setWecomPairError(zh ? '请先填写中继服务器地址' : 'Enter the relay server URL first')
+      return
+    }
+    setWecomPairError('')
+    try {
+      await api.remoteBridgeStartPairing(relayUrl)
+      setWecomPairing(true)
+    } catch (err) {
+      setWecomPairError(String(err))
+    }
+  }
+
+  const updateWecom = (wecom: ImGatewayConfig['wecom']) => onChange({ ...config, wecom })
 
   return (
     <>
       <SettingsGroup title={zh ? '启用' : 'Enable'}>
         <SettingRow
-          label={zh ? 'IM 网关' : 'IM Gateway'}
+          label={zh ? 'IM 网关（QQ）' : 'IM Gateway (QQ)'}
           description={zh
             ? '开启后，白名单内的 IM 用户私聊机器人，消息会进入 Kivio 会话执行，结果自动回发。'
             : 'Whitelisted IM users chat with the bot; messages run in Kivio conversations and results are sent back.'}
         >
           <Toggle checked={config.enabled} onChange={(enabled) => onChange({ ...config, enabled })} />
         </SettingRow>
+        {gatewayStatus && (
+          <SettingRow
+            label={zh ? 'QQ 通道状态' : 'QQ channel'}
+            description={
+              connectedLabel(zh, gatewayStatus.connected) +
+              (config.enabled ? '' : zh ? '（QQ 通道未启用）' : ' (QQ disabled)')
+            }
+          >
+            <span className={`inline-block h-2.5 w-2.5 rounded-full ${gatewayStatus.connected ? 'bg-emerald-500' : config.enabled ? 'bg-amber-500' : 'bg-neutral-400'}`} />
+          </SettingRow>
+        )}
       </SettingsGroup>
 
       <SettingsGroup title={zh ? '接入方式' : 'Provider'}>
@@ -176,6 +251,147 @@ export function ImGatewayTab({ lang, config, onChange }: {
           </SettingsGroup>
         </>
       )}
+
+      {/* ===== 企业微信（独立通道，可与 QQ 同时启用） ===== */}
+      <SettingsGroup title={zh ? '企业微信（WeCom 自建应用）' : 'WeCom (self-built app)'}>
+        <SettingRow
+          label={zh ? '启用企业微信' : 'Enable WeCom'}
+          description={zh
+            ? '与 QQ 通道互相独立、可同时开启。微信里通过「微工作台」与 Kivio 对话。'
+            : 'Independent of the QQ channel; both can run at once. Chat with Kivio via the WeCom micro-workbench inside WeChat.'}
+        >
+          <Toggle checked={wecom.enabled} onChange={(enabled) => updateWecom({ ...wecom, enabled })} />
+        </SettingRow>
+        {gatewayStatus && config.wecom.enabled && (
+          <SettingRow
+            label={zh ? '企微通道状态' : 'WeCom channel'}
+            description={connectedLabel(zh, gatewayStatus.wecomConnected ?? false)}
+          >
+            <span className={`inline-block h-2.5 w-2.5 rounded-full ${gatewayStatus.wecomConnected ? 'bg-emerald-500' : 'bg-amber-500'}`} />
+          </SettingRow>
+        )}
+        <SettingRow
+          label={zh ? '中继服务器地址' : 'Relay server URL'}
+          description={zh
+            ? '你的自建中继（remote-bridge），需已更新到含 /wecom/callback 的版本。企微凭据只保存在本机，中继仅透传密文。'
+            : 'Your self-hosted relay (remote-bridge), updated to a build with /wecom/callback. WeCom credentials stay local; the relay only forwards ciphertext.'}
+          stack
+        >
+          <Input
+            value={wecom.relayUrl}
+            onChange={(relayUrl) => updateWecom({ ...wecom, relayUrl })}
+            placeholder="https://relay.example.com"
+            mono
+          />
+        </SettingRow>
+        <SettingRow
+          label={zh ? '中继凭据' : 'Relay credentials'}
+          description={zh
+            ? wecom.relayToken
+              ? '已连接过中继（凭据已保存）。更换中继或重置 data.json 后需重新连接。'
+              : '点击「连接中继」自动获取（无需手机扫码）。'
+            : wecom.relayToken
+              ? 'Saved from a previous pairing. Re-pair after switching relays or resetting data.json.'
+              : 'Click "Connect relay" to obtain automatically (no phone scan needed).'}
+          stack
+        >
+          {wecomPairing ? (
+            <button
+              type="button"
+              onClick={async () => { try { await api.remoteBridgeCancelPairing() } catch { /* ignore */ } setWecomPairing(false) }}
+              className="rounded-md border border-neutral-300 px-3 py-1.5 text-sm dark:border-neutral-700"
+            >
+              {zh ? '取消' : 'Cancel'}
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={startWecomPairing}
+              className="rounded-md bg-neutral-900 px-3 py-1.5 text-sm text-white dark:bg-neutral-100 dark:text-neutral-900"
+            >
+              {zh ? '连接中继' : 'Connect relay'}
+            </button>
+          )}
+        </SettingRow>
+        {wecomPairError && (
+          <p className="kv-row-desc px-1 text-red-500">{wecomPairError}</p>
+        )}
+        <SettingRow
+          label="CorpID"
+          description={zh ? '企业微信管理后台「我的企业 → 企业信息」的 企业ID。' : 'CorpID from the admin console (My Company → Company Info).'}
+          stack
+        >
+          <Input value={wecom.corpId} onChange={(corpId) => updateWecom({ ...wecom, corpId })} placeholder="ww…" mono />
+        </SettingRow>
+        <SettingRow
+          label={zh ? '应用 Secret' : 'App Secret'}
+          description={zh ? '自建应用详情页的 Secret。' : 'Secret from the self-built app detail page.'}
+          stack
+        >
+          <Input value={wecom.corpSecret} onChange={(corpSecret) => updateWecom({ ...wecom, corpSecret })} mono />
+        </SettingRow>
+        <SettingRow
+          label="AgentId"
+          description={zh ? '自建应用详情页的 AgentId（纯数字）。' : 'Numeric AgentId from the app detail page.'}
+          stack
+        >
+          <Input
+            value={wecom.agentId ? String(wecom.agentId) : ''}
+            onChange={(raw) => updateWecom({ ...wecom, agentId: Number.parseInt(raw, 10) || 0 })}
+            placeholder="1000002"
+            mono
+          />
+        </SettingRow>
+        <SettingRow
+          label={zh ? '回调 Token' : 'Callback Token'}
+          description={zh ? '企微后台「接收消息 → 设置API接收」页生成的 Token。' : 'Token generated in the admin console (Receive Messages → API).'}
+          stack
+        >
+          <Input value={wecom.callbackToken} onChange={(callbackToken) => updateWecom({ ...wecom, callbackToken })} mono />
+        </SettingRow>
+        <SettingRow
+          label="EncodingAESKey"
+          description={zh ? '同一页生成的 EncodingAESKey（43 字符）。' : 'EncodingAESKey from the same page (43 chars).'}
+          stack
+        >
+          <Input value={wecom.encodingAesKey} onChange={(encodingAesKey) => updateWecom({ ...wecom, encodingAesKey })} mono />
+        </SettingRow>
+        <SettingRow
+          label={zh ? '允许的成员 UserID' : 'Allowed member UserIDs'}
+          description={zh
+            ? '留空 = 允许应用可见范围内所有成员。收到的成员 UserID 会打印到应用日志，可回填到这里。'
+            : 'Empty = allow all members in the app scope. Received UserIDs are logged for copy-back.'}
+          stack
+        >
+          <TextArea
+            value={wecom.allowUsers.join('\n')}
+            onChange={(raw) => updateWecom({
+              ...wecom,
+              allowUsers: raw.split('\n').map((line) => line.trim()).filter(Boolean),
+            })}
+            placeholder="userid..."
+            rows={3}
+            mono
+          />
+        </SettingRow>
+      </SettingsGroup>
+
+      <SettingsGroup title={zh ? '企业微信说明' : 'WeCom notes'}>
+        <div className="flex items-start gap-2.5 px-1 py-2">
+          <MessageCircle size={15} className="mt-0.5 shrink-0 text-neutral-400 dark:text-neutral-500" strokeWidth={1.8} />
+          <p className="kv-row-desc max-w-[560px]">
+            {zh
+              ? `配置顺序：注册企业微信并创建自建应用 → 填上方凭据 → 点「连接中继」→ 把企微后台「接收消息」的 URL 设为 ${'https://你的中继'}/wecom/callback?t=<中继凭据>（Token/AESKey 与上方一致）。应用消息无 4 条/60 分钟限制；长回复按 ~600 字自动分段。微信端使用「微工作台」收发。`
+              : 'Setup: register WeCom and create a self-built app → fill credentials above → click "Connect relay" → set the callback URL to https://your-relay/wecom/callback?t=<token> (Token/AESKey must match). No 4-message/60-min passive limits; long replies split at ~600 chars. Use the WeCom micro-workbench inside WeChat.'}
+          </p>
+        </div>
+      </SettingsGroup>
     </>
   )
+}
+
+function connectedLabel(zh: boolean, connected: boolean): string {
+  return zh
+    ? (connected ? '已连接' : '未连接')
+    : (connected ? 'connected' : 'disconnected')
 }
