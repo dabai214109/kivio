@@ -295,7 +295,7 @@ async fn handle_frame(app: &AppHandle, text: &str, out_tx: &tokio::sync::mpsc::S
         }
         "conv_list" => {
             let result = list_conversations(app).await;
-            out_tx.send(reply_of(result)).ok();
+            let _ = out_tx.send(reply_of(result)).await;
         }
         "conv_history" => {
             let id = frame
@@ -304,7 +304,7 @@ async fn handle_frame(app: &AppHandle, text: &str, out_tx: &tokio::sync::mpsc::S
                 .unwrap_or_default()
                 .to_string();
             let result = conversation_history(app, &id).await;
-            out_tx.send(reply_of(result)).ok();
+            let _ = out_tx.send(reply_of(result)).await;
         }
         "send" => {
             // 长任务：spawn 执行，读循环继续收（stop 才能生效）。
@@ -321,7 +321,7 @@ async fn handle_frame(app: &AppHandle, text: &str, out_tx: &tokio::sync::mpsc::S
                 .unwrap_or_default()
                 .to_string();
             tokio::spawn(async move {
-                let result = run_send(&app, conversation_id, content, out_tx).await;
+                let result = run_send(&app, conversation_id, content, &out_tx).await;
                 out_tx.try_send(Message::Text(result.to_string().into())).ok();
             });
         }
@@ -332,10 +332,10 @@ async fn handle_frame(app: &AppHandle, text: &str, out_tx: &tokio::sync::mpsc::S
                 .unwrap_or_default()
                 .to_string();
             cancel_generation(app, &id);
-            out_tx.send(reply_of(json!({"type":"stop_ack"}))).ok();
+            let _ = out_tx.send(reply_of(json!({"type":"stop_ack"}))).await;
         }
         "ping" => {
-            out_tx.send(reply_of(json!({"type":"pong"}))).ok();
+            let _ = out_tx.send(reply_of(json!({"type":"pong"}))).await;
         }
         _ => {}
     }
