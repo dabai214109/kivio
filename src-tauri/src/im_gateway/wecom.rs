@@ -284,30 +284,8 @@ impl WecomOutbound {
 
     /// 发送文本；token 过期（42001/40014）自动刷新重试一次。
     pub async fn send_text(&self, user: &str, content: &str) -> Result<(), String> {
-        let send = |token: String, content: &str| {
-            let http = &self.http;
-            let agent_id = self.agent_id;
-            async move {
-                http.post(format!(
-                    "{WECOM_API_BASE}/message/send?access_token={}",
-                    urlencoding_minimal(&token)
-                ))
-                .json(&json!({
-                    "touser": user,
-                    "msgtype": "text",
-                    "agentid": agent_id,
-                    "text": { "content": content },
-                }))
-                .send()
-                .await
-            }
-        };
-
         let mut token = self.get_token().await?;
-        let resp = send(token.clone(), content)
-            .await
-            .map_err(|e| format!("发送企微消息失败: {e}"))?;
-        let value: Value = resp.json().await.map_err(|e| format!("解析发送响应失败: {e}"))?;
+        let mut value = self.post_send(&token, user, content).await?;
         let errcode = value.get("errcode").and_then(Value::as_i64).unwrap_or(0);
         if errcode == 42001 || errcode == 40014 {
             // token 失效：强制刷新重试一次。
@@ -316,16 +294,29 @@ impl WecomOutbound {
                 state.access_token.clear();
             }
             token = self.get_token().await?;
-            let resp = send(token, content)
-                .await
-                .map_err(|e| format!("重试发送企微消息失败: {e}"))?;
-            let value: Value = resp
-                .json()
-                .await
-                .map_err(|e| format!("解析重试响应失败: {e}"))?;
-            return wecom_send_result(value);
+            value = self.post_send(&token, user, content).await?;
         }
         wecom_send_result(value)
+    }
+
+    async fn post_send(&self, token: &str, user: &str, content: &str) -> Result<Value, String> {
+        self.http
+            .post(format!(
+                "{WECOM_API_BASE}/message/send?access_token={}",
+                urlencoding_minimal(token)
+            ))
+            .json(&json!({
+                "touser": user,
+                "msgtype": "text",
+                "agentid": self.agent_id,
+                "text": { "content": content },
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("发送企微消息失败: {e}"))?
+            .json::<Value>()
+            .await
+            .map_err(|e| format!("解析发送响应失败: {e}"))
     }
 }
 
