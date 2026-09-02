@@ -39,6 +39,17 @@ pub struct CompactionBoundaryRecord {
     pub created_at: i64,
 }
 
+/// Timeline marker for a manual context clear. Messages through
+/// `source_until_message_id` stay visible in the UI but are dropped from the
+/// model replay window and from later compaction.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContextClearBoundaryRecord {
+    pub id: String,
+    /// Last UI message discarded from the live model context (inclusive).
+    pub source_until_message_id: String,
+    pub created_at: i64,
+}
+
 /// Deterministic, machine-tracked record of files read/modified by tool calls
 /// in the summarized history. Rendered under the LLM summary as a factual floor
 /// so compaction can't silently forget which files an agent touched.
@@ -109,6 +120,10 @@ pub struct ConversationContextState {
     pub summary: Option<ConversationContextSummary>,
     #[serde(default)]
     pub compaction_boundaries: Vec<CompactionBoundaryRecord>,
+    /// Manual clear cutoffs, oldest → newest. The last entry is the live floor:
+    /// replay and compaction start after it. Earlier entries stay as timeline markers.
+    #[serde(default)]
+    pub clear_boundaries: Vec<ContextClearBoundaryRecord>,
     #[serde(default)]
     pub warning: Option<String>,
     /// `kivio_builtin` or `external_cli`.
@@ -429,10 +444,6 @@ impl AgentRuntimeConfig {
     pub fn is_chat(&self) -> bool {
         self.kind == AgentRuntimeKind::Chat
     }
-
-    pub fn is_builtin_agent(&self) -> bool {
-        self.kind == AgentRuntimeKind::Builtin
-    }
 }
 
 /// 会话级联网搜索模式（任务 07-23）。
@@ -514,6 +525,11 @@ pub struct Conversation {
     /// 强制检索：开启后系统提示要求模型回答前必须先调用 `knowledge_search`。默认关。
     #[serde(default)]
     pub force_knowledge_search: bool,
+    /// Folders this conversation may read/write besides the project working
+    /// directory. Does not change which 项目 the conversation belongs to, and
+    /// does not change the working directory used to import/resume a native session.
+    #[serde(default)]
+    pub additional_directories: Vec<AdditionalDirectory>,
     /// 每对话「思考等级」：`"off"|"low"|"medium"|"high"`，`None` = 跟随全局思考开关。
     #[serde(default)]
     pub thinking_level: Option<String>,
@@ -532,6 +548,46 @@ pub struct Conversation {
     /// serde default ⇒ 旧对话 JSON 缺字段正常反序列化。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked_from: Option<ForkOrigin>,
+}
+
+impl Conversation {
+    /// Inclusive index of the last message discarded by the latest context clear.
+    ///
+    /// If the cutoff message was deleted but later messages remain, fall back to
+    /// the last remaining message at or before the clear timestamp. If the user
+    /// rewound past the clear (cutoff gone and no later messages), returns `None`
+    /// so those restored messages re-enter the live context.
+    pub(crate) fn context_clear_until_index(&self) -> Option<usize> {
+        let last = self.context_state.clear_boundaries.last()?;
+        if let Some(idx) = self
+            .messages
+            .iter()
+            .position(|message| message.id == last.source_until_message_id)
+        {
+            return Some(idx);
+        }
+        let has_later = self
+            .messages
+            .iter()
+            .any(|message| message.timestamp > last.created_at);
+        if !has_later {
+            return None;
+        }
+        self.messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| message.timestamp <= last.created_at)
+            .map(|(idx, _)| idx)
+            .last()
+    }
+
+    /// First message index that still belongs to the live model context after a clear.
+    /// Equal to `len` when the cutoff is the last message (empty live window).
+    pub(crate) fn context_clear_start_index(&self) -> usize {
+        self.context_clear_until_index()
+            .map(|idx| idx + 1)
+            .unwrap_or(0)
+    }
 }
 
 /// 一次回答所用的 (provider, model) 引用。多模型一问多答的会话级模型集元素。
@@ -611,6 +667,34 @@ pub struct ConversationSearchHit {
 pub struct ConversationIndex {
     pub conversations: Vec<ConversationListItem>,
 }
+
+/// A folder attached to one conversation in addition to the project working directory.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdditionalDirectory {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl AdditionalDirectory {
+    pub fn display_name(&self) -> &str {
+        if let Some(name) = self
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return name;
+        }
+        std::path::Path::new(&self.path)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(self.path.as_str())
+    }
+}
+
+pub const MAX_ADDITIONAL_DIRECTORIES: usize = 8;
 
 /// Chat 项目。`folder` 保留用于旧对话兼容，真实项目归属使用 `project_id`。
 #[derive(Debug, Clone, Serialize, Deserialize)]

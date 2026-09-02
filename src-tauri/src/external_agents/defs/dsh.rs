@@ -4,7 +4,8 @@
 //!
 //! dsh 确实有 ACP 服务端（`@deepseek-ai/dsh-acp`），但它的 README 与本机实测都指向同一个
 //! 结论：那是 automation-only 的桥，**只发 committed 的 `agent_message_chunk`**。实测
-//! （0.1.0-rc.6）确认它没有 token 级 delta、没有 reasoning、没有 tool call，
+//! （0.1.0-rc.6；rc.8 的 ACP 包仍是同一条 automation 桥）确认它没有 token 级 delta、
+//! 没有 reasoning、没有 tool call，
 //! `session/load` 直接回 `-32601 Method not found`。接进 Kivio 的话工具卡与思考块永远是空的，
 //! 等于把一个 agent harness 退化成问答框。
 //!
@@ -18,7 +19,8 @@
 //!
 //! dsh 没有「一条命令直接出流式 JSON」的模式，它**只能 boot profile**。所以启动参数是
 //! `--profile <kivio profile>`，而那个 profile 由 `dsh_profile.rs` 生成并维护（Kivio 自己的
-//! 目录，绝不改用户的 `profiles/web` 或家目录 `cordis.patch.yml`）。
+//! 目录，绝不改用户的 `profiles/web` 或家目录 `cordis.patch.yml`）。进程 cwd、`initialize.cwd`
+//! 与 Host Workspace 挂载都指向 Kivio 项目根；不只是提示词里写一条路径。
 //!
 //! 模型 / 推理档位不是启动 flag，而是 `initialize` 的 RPC 参数（模型）与 Kivio profile
 //! `cordis.patch.yml` 中的 `llm-deepseek.reasoningEffort`（档位）—— 见 `dsh_profile.rs`。
@@ -44,6 +46,11 @@ const DSH_SLASH_COMMANDS: &[(&str, &str, Option<&str>)] = &[
         "set or view the goal for a long-running task",
         Some("[<objective>|clear|edit <objective>|pause|resume]"),
     ),
+    (
+        "plan",
+        "enter plan mode or submit a planning message",
+        Some("[off|<message>]"),
+    ),
 ];
 
 pub fn builtin_slash_commands() -> Vec<ExternalCliSlashCommand> {
@@ -58,21 +65,31 @@ pub fn builtin_slash_commands() -> Vec<ExternalCliSlashCommand> {
         .collect()
 }
 
-/// dsh 自带 DeepSeek 适配器（`deepseek-official` 路由）的两个模型。真实列表由
+/// dsh 自带 DeepSeek 适配器（`deepseek-official` 路由）的三个模型。真实列表由
 /// `detection::read_dsh_settings_models` 从 `~/.dsh/settings.yaml` 读出（含用户在
 /// `llm-pi-ai.providers` 里配的中转路由）；这张表只是读不到时的兜底，前端标「默认列表」。
+///
+/// `deepseek-v4-flash-vision-exp` 是 0.1.1 起的多模态目录项（`inputModalities: [text, image]`）。
+/// 能力写在 dsh 自己的 catalog 里，Kivio 不往 `llm-deepseek` 补这份声明——Flash / Pro
+/// 仍是纯文本，硬开 `inputModalities` 会 400。
 const FALLBACK_MODELS: &[(&str, &str)] = &[
     ("default", "Default"),
     ("deepseek-v4-flash", "DeepSeek-V4-Flash"),
     ("deepseek-v4-pro", "DeepSeek-V4-Pro"),
+    (
+        "deepseek-v4-flash-vision-exp",
+        "DeepSeek-V4-Flash-Vision-Exp",
+    ),
 ];
 
-/// 官方 DeepSeek 路由的兜底档位：`off | high | max`。第三方 `llm-pi-ai` 模型
+/// 官方 DeepSeek 路由的兜底档位：`off | low | high | max`（rc.7 起有 `low`）。
+/// 第三方 `llm-pi-ai` 模型
 /// 的可选档位由 `detection::parse_dsh_settings_models` 按 `reasoningEfforts` 填
 /// `reasoning_by_model`；选中后写进 profile 的 `llm-pi-ai.providers.<route>.reasoning`。
 const REASONING: &[(&str, &str)] = &[
     ("default", "Default"),
     ("off", "Off"),
+    ("low", "Low"),
     ("high", "High"),
     ("max", "Max"),
 ];
@@ -125,8 +142,10 @@ pub const DSH_AGENT_DEF: RuntimeAgentDef = RuntimeAgentDef {
     // `session/prompt` 的官方 image 块是 `{type:"image", attachment:{attachmentId,…}}`。
     // Kivio 先发 base64，bridge 经 `ctx.attachments.saveImage` 落库后再改写成引用。
     supports_native_image: true,
-    // Bridge 暴露 cancel/resume，但没有追加输入的 `steer` RPC。
-    supports_steering: false,
+    // Bridge 补 `session/steer` → `agent.steer()`（next-step inbox，当前轮下一步）。
+    // 官方 `session/prompt` → `agent.followup()`（下一轮 FIFO）。两套都接。
+    supports_steering: true,
+    supports_follow_up: true,
     image_mime_whitelist: &["image/jpeg", "image/png", "image/gif", "image/webp"],
     build_args: build_dsh_args,
 };
@@ -185,7 +204,8 @@ mod tests {
             StreamFormat::DshJsonRpc
         ));
         assert!(matches!(DSH_AGENT_DEF.slash_strategy, SlashStrategy::Dsh));
-        assert!(!DSH_AGENT_DEF.supports_steering);
+        assert!(DSH_AGENT_DEF.supports_steering);
+        assert!(DSH_AGENT_DEF.supports_follow_up);
         assert!(DSH_AGENT_DEF.supports_native_image);
         assert_eq!(
             DSH_AGENT_DEF.image_mime_whitelist,
@@ -199,8 +219,13 @@ mod tests {
     #[test]
     fn lists_the_official_slash_menu() {
         let commands = builtin_slash_commands();
-        let names: Vec<&str> = commands.iter().map(|command| command.name.as_str()).collect();
-        assert_eq!(names, ["compact", "feedback", "goal"]);
-        assert!(commands.iter().all(|command| command.slash.starts_with('/')));
+        let names: Vec<&str> = commands
+            .iter()
+            .map(|command| command.name.as_str())
+            .collect();
+        assert_eq!(names, ["compact", "feedback", "goal", "plan"]);
+        assert!(commands
+            .iter()
+            .all(|command| command.slash.starts_with('/')));
     }
 }

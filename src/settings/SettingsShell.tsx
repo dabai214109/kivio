@@ -27,14 +27,17 @@ import {
   peekSettings,
   refreshSettings,
   saveSettingsCached,
+  subscribeSettings,
 } from '../api/settingsCache'
+import { rebaseDraftAgainstCache } from './rebaseSettingsDraft'
 import { i18n } from './i18n'
 import {
   GeneralIcon, HotkeysIcon, TranslateIcon, LensIcon, ChatIcon, MemoryIcon, MixerIcon,
-  AgentIcon, WebSearchIcon, ConnectorsIcon, PluginsIcon, UsageIcon, ProvidersIcon, AboutIcon, HooksIcon, ImGatewayIcon, RemoteIcon,
+  AgentIcon, WebSearchIcon, ConnectorsIcon, PluginsIcon, SessionsIcon, UsageIcon, ProvidersIcon, AboutIcon, HooksIcon, ImGatewayIcon, RemoteIcon,
 } from './NavIcons'
 import { PluginCenter } from '../chat/PluginCenter'
-import { buildHotkey, formatHotkeyError, getPlatform, isProviderEnabled, stableStringify } from './utils'
+import { SessionCenter, type SessionCenterProps } from '../chat/SessionCenter'
+import { buildHotkey, formatHotkeyError, getPlatform, isProviderEnabled, resolveSettingsSaveEcho, stableStringify } from './utils'
 import { type ProviderPreset } from './providerPresets'
 import { ProviderModelsPicker } from './ProviderModelsPicker'
 import { ScreenshotTranslationSettings } from './ScreenshotTranslationSettings'
@@ -59,6 +62,7 @@ import { ModelDetailDrawer } from '../components/ModelDetailDrawer'
 import { ProviderModelTestModal } from '../components/ProviderModelTestModal'
 import { Button } from '../components/Button'
 import { resolveModelInfo } from '../data/modelMatching'
+import { loadLastModel, resolvePreferredChatModel } from '../chat/lastModel'
 import { useWindowInteractionFocus } from '../utils/windowFocus'
 import { hasEnabledNativeBuiltinTool, hasEnabledSkillRuntime } from '../utils/chatTools'
 import { normalizeThemeColorId } from '../themeColors'
@@ -71,7 +75,7 @@ import { ConnectorsPanel } from './ConnectorsPanel'
 import { WebSearchPanel } from './WebSearchPanel'
 import { defaultChatTools } from './chatToolsShared'
 
-export type SettingsTab = 'general' | 'hotkeys' | 'translate' | 'lens' | 'chat' | 'memory' | 'mixer' | 'externalAgents' | 'hooks' | 'imGateway' | 'remote' | 'webSearch' | 'connectors' | 'plugins' | 'usage' | 'providers' | 'about'
+export type SettingsTab = 'general' | 'hotkeys' | 'translate' | 'lens' | 'chat' | 'memory' | 'mixer' | 'externalAgents' | 'hooks' | 'imGateway' | 'remote' | 'webSearch' | 'connectors' | 'plugins' | 'sessions' | 'usage' | 'providers' | 'about'
 
 type SettingsData = SettingsType
 // UI 字号：以 px 展示、以整体缩放（zoom）实现。CSS 全是 px 硬编码，做不了真正的 rem 基准字号，
@@ -88,8 +92,17 @@ export interface SettingsShellProps {
   initialTab?: SettingsTab
   /** embedded 单页模式：隐藏左侧设置导航，只显示 initialTab 对应页（如从扩展点「知识库」进入） */
   hideNav?: boolean
-  /** 插件页「让 AI 安装」：由 Chat 宿主开新对话并发送 install brief */
+  /** 插件页「让 AI 代装」：由 Chat 宿主开新对话并发送 install brief */
   onRequestPluginAiInstall?: (pluginId: string) => void | Promise<void>
+  /** 对话库（原扩展中心页）嵌在设置里，选中一条对话时由 Chat 宿主切回去 */
+  sessionLibrary?: {
+    currentConversationId?: string
+    generatingConversationIds?: ReadonlySet<string>
+    onSelectConversation: SessionCenterProps['onSelectConversation']
+    onConversationDeleted?: SessionCenterProps['onConversationDeleted']
+    onForceDropConversation?: SessionCenterProps['onForceDropConversation']
+    onConversationsChanged?: SessionCenterProps['onConversationsChanged']
+  }
 }
 
 export interface SettingsShellHandle {
@@ -111,9 +124,10 @@ function defaultChatConfig(): NonNullable<SettingsData['chat']> {
   return {
     streamEnabled: true,
     thinkingEnabled: true,
-    maxOutputTokens: 8192,
+    maxOutputTokens: 16384,
     defaultLanguage: '',
     systemPrompt: '',
+    promptOptimizePrompt: '',
     userDisplayName: '',
     userAvatar: '',
     defaultAgentRuntime: {
@@ -141,17 +155,18 @@ function defaultChatMemory(): ChatMemoryConfig {
 }
 
 function resolveEffectiveChatModel(settings: SettingsData): { provider?: ModelProvider, model: string } {
-  const configuredChat = settings.defaultModels.chat.providerId
-    ? settings.defaultModels.chat
-    : settings.chatProviderId
-      ? { providerId: settings.chatProviderId, model: settings.chatModel }
-      : settings.lens?.providerId
-        ? { providerId: settings.lens.providerId, model: settings.lens.model || '' }
-        : { providerId: settings.translatorProviderId, model: settings.translatorModel }
+  const selected = resolvePreferredChatModel({
+    providers: settings.providers,
+    last: loadLastModel(),
+    storedChat: settings.defaultModels.chat,
+    legacyChat: { providerId: settings.chatProviderId, model: settings.chatModel },
+    lens: { providerId: settings.lens?.providerId || '', model: settings.lens?.model || '' },
+    translator: { providerId: settings.translatorProviderId, model: settings.translatorModel },
+  })
 
   return {
-    provider: settings.providers.find((provider) => provider.id === configuredChat.providerId),
-    model: configuredChat.model || '',
+    provider: settings.providers.find((provider) => provider.id === selected.providerId),
+    model: selected.model || '',
   }
 }
 
@@ -176,6 +191,7 @@ function defaultDefaultModels(chatProviderId = '', chatModel = ''): SettingsData
     titleSummary: { providerId: '', model: '' },
     compression: { providerId: '', model: '' },
     imageGeneration: { providerId: '', model: '' },
+    promptOptimize: { providerId: '', model: '' },
     advisor: { providerId: '', model: '' },
   }
 }
@@ -198,6 +214,9 @@ function clearDefaultModelProvider(
     imageGeneration: defaultModels.imageGeneration.providerId === providerId
       ? { providerId: '', model: '' }
       : defaultModels.imageGeneration,
+    promptOptimize: defaultModels.promptOptimize.providerId === providerId
+      ? { providerId: '', model: '' }
+      : defaultModels.promptOptimize,
     advisor: defaultModels.advisor.providerId === providerId
       ? { providerId: '', model: '' }
       : defaultModels.advisor,
@@ -225,6 +244,9 @@ function resolveDefaultModelsAfterModelRemoval(
     imageGeneration: defaultModels.imageGeneration.providerId === providerId
       ? { ...defaultModels.imageGeneration, model: resolveAfterRemoval(defaultModels.imageGeneration.model) }
       : defaultModels.imageGeneration,
+    promptOptimize: defaultModels.promptOptimize.providerId === providerId
+      ? { ...defaultModels.promptOptimize, model: resolveAfterRemoval(defaultModels.promptOptimize.model) }
+      : defaultModels.promptOptimize,
     advisor: defaultModels.advisor.providerId === providerId
       ? { ...defaultModels.advisor, model: resolveAfterRemoval(defaultModels.advisor.model) }
       : defaultModels.advisor,
@@ -236,7 +258,7 @@ function resolveDefaultModelsAfterModelRemoval(
  * 设置面板主组件（standalone / embedded 双宿主）
  */
 export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>(function SettingsShell(
-  { variant, onClose, onSettingsChange, onReady, reserveTrafficLightSpace = false, initialTab, hideNav = false, onRequestPluginAiInstall },
+  { variant, onClose, onSettingsChange, onReady, reserveTrafficLightSpace = false, initialTab, hideNav = false, onRequestPluginAiInstall, sessionLibrary },
   ref,
 ) {
   const [settings, setSettings] = useState<SettingsData | null>(null)
@@ -275,7 +297,8 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
   // 更新检查状态：'idle' / 'checking' / 'up-to-date' / 'available' / 'check-failed'
   const [updateStatus, setUpdateStatus] = useState<'idle' | 'checking' | 'up-to-date' | 'available' | 'check-failed'>('idle')
   const [updateInfo, setUpdateInfo] = useState<UpdateInfo | null>(null)
-  // 下载/安装两段式状态机:idle → downloading(进度条) → downloaded(显示安装按钮) → 用户点击 → 应用退出
+  // 下载后立刻静默安装:idle → downloading → (downloaded 一闪) → installer 拉起并退出
+  // 安装失败才停在 downloaded / failed，让用户点「安装并重启」或重试。
   // failed 时显示错误 + 重试 + 跳 GitHub 兜底
   const [downloadState, setDownloadState] = useState<'idle' | 'downloading' | 'downloaded' | 'failed'>('idle')
   const [downloadPercent, setDownloadPercent] = useState(0)
@@ -303,6 +326,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
   const readyEmittedRef = useRef(false)
   // 镜像当前草稿的序列化快照，供后台 SWR 校准回调判断“用户是否已改动”而无需闭包捕获最新 state。
   const currentSettingsSnapshotRef = useRef('')
+  const initialSettingsSnapshotRef = useRef('')
   // 自动保存：最新草稿 + 防抖定时器 + 在飞请求（避免并发写互相覆盖）
   const settingsRef = useRef<SettingsData | null>(null)
   const autosaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -324,6 +348,23 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     currentSettingsSnapshotRef.current = snapshot
     settingsRef.current = settings
   }, [settings])
+
+  useEffect(() => {
+    initialSettingsSnapshotRef.current = initialSettingsSnapshot
+  }, [initialSettingsSnapshot])
+
+  // 设置页 keep-alive：其它面（插件开关、MCP、收藏、语言、聊天模型）会写 settings，
+  // 草稿必须按字段跟缓存对齐，否则整份自动保存会把那些改动盖回去。
+  useEffect(() => {
+    return subscribeSettings((fresh) => {
+      setSettings((prev) => {
+        if (!prev) return prev
+        const next = rebaseDraftAgainstCache(initialSettingsSnapshotRef.current, prev, fresh)
+        if (next === prev || stableStringify(next) === stableStringify(prev)) return prev
+        return next
+      })
+    })
+  }, [])
 
   // 客户端热键冲突检测:在保存前发现"两个启用功能用了同一个组合"。
   // OS 层面的冲突(Spotlight 占用 Cmd+Space 等)仍需保存后从后端拿到结果。
@@ -567,7 +608,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     }
   }, [updateInfo])
 
-  /** 下载新版安装包到 temp dir,期间监听 update-download-progress 事件刷新进度条 */
+  /** 下载安装包后立刻静默安装并退出。Windows 走 NSIS `/S /UPDATE /R`，装完会自己拉起。 */
   const handleDownloadAndInstall = useCallback(async () => {
     if (!updateInfo?.version) return
     setDownloadState('downloading')
@@ -581,8 +622,9 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
       const path = await api.downloadUpdate(updateInfo.version)
       setDownloadedPath(path)
       setDownloadState('downloaded')
+      await api.installUpdate(path)
     } catch (err) {
-      console.error('Download update failed:', err)
+      console.error('Download or install update failed:', err)
       setDownloadError(typeof err === 'string' ? err : (err instanceof Error ? err.message : String(err)))
       setDownloadState('failed')
     } finally {
@@ -590,7 +632,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     }
   }, [updateInfo])
 
-  /** 启动 installer 并退出当前应用。Rust 端会在 macOS 上 cp 新 .app + open,在 Windows spawn NSIS exe */
+  /** 已下载的安装包再装一次（下载成功但拉起 installer 失败时用）。 */
   const handleInstall = useCallback(async () => {
     if (!downloadedPath) return
     try {
@@ -752,7 +794,11 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
   const persistSettingsNow = useCallback(async () => {
     const draft = settingsRef.current
     if (!draft) return false
-    const draftSnapshot = stableStringify(draft)
+    const toSave = rebaseDraftAgainstCache(initialSettingsSnapshot, draft, peekSettings())
+    if (toSave !== draft) {
+      settingsRef.current = toSave
+    }
+    const draftSnapshot = stableStringify(toSave)
     if (draftSnapshot === initialSettingsSnapshot) return true
 
     if (saveInFlightRef.current) {
@@ -765,18 +811,18 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     try {
       setSaveError('')
       // 不主动清 saveWarning：热键警告来自独立事件，成功保存后可能紧接着到达
-      const savedSettings = await saveSettingsCached(draft)
+      const savedSettings = await saveSettingsCached(toSave)
       const savedSnapshot = stableStringify(savedSettings)
       const latestSnapshot = settingsRef.current ? stableStringify(settingsRef.current) : ''
-      // 用户在请求飞行中继续改了 → 只推进“已落盘基线”，别用服务端回包盖掉本地草稿
-      if (latestSnapshot === draftSnapshot) {
+      const echo = resolveSettingsSaveEcho(draftSnapshot, savedSnapshot, latestSnapshot)
+      // sanitize 可能丢掉尚未填完的占位行。回包与草稿不同时保留屏幕上的草稿，
+      // 否则「添加 Key / 请求头 / CLI 模型」刚出现的输入框会被盖没。
+      if (echo.applySaved) {
         setSettings(savedSettings)
-        setInitialSettingsSnapshot(savedSnapshot)
         settingsRef.current = savedSettings
         currentSettingsSnapshotRef.current = savedSnapshot
-      } else {
-        setInitialSettingsSnapshot(savedSnapshot)
       }
+      setInitialSettingsSnapshot(echo.baselineSnapshot)
       onSettingsChange()
       return true
     } catch (err) {
@@ -796,21 +842,10 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
   }, [initialSettingsSnapshot, lang, onSettingsChange])
 
   // 草稿相对已落盘基线有 diff → 防抖自动保存（开关/输入共用，避免每个按键打盘）
+  // 占位空行会照常送去保存；sanitize 丢掉它们之后由 resolveSettingsSaveEcho 决定
+  // 不把回包盖回草稿，所以这里不再按字段拦自动保存。
   useEffect(() => {
     if (!hasUnsavedChanges) return
-    // 自定义请求头的新行会先以空值占位。后端存盘归一化会丢掉这种不完整的行，如果此时发起自动保存，回包会把输入框立刻恢复成消失。等用户填完后再保存。
-    const hasIncompleteCustomHeader = settings?.providers.some((provider) =>
-      (provider.request?.customHeaders ?? []).some((header) =>
-        header.key.trim() === '' || header.value.trim() === '',
-      ),
-    )
-    if (hasIncompleteCustomHeader) return
-    // 同理：本地 CLI 的「添加模型」也是先插一行空的再填。sanitize_external_cli_agents 会
-    // retain 掉 id 为空的条目，回包盖回草稿 → 那一行刚出现就消失（表现为「点添加冒一下就没了」）。
-    const hasIncompleteCliModel = Object.values(settings?.chat?.externalCliAgents ?? {}).some(
-      (config) => (config.customModels ?? []).some((model) => model.id.trim() === ''),
-    )
-    if (hasIncompleteCliModel) return
     if (autosaveTimerRef.current) {
       clearTimeout(autosaveTimerRef.current)
       autosaveTimerRef.current = null
@@ -860,16 +895,10 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
       clearTimeout(autosaveTimerRef.current)
       autosaveTimerRef.current = null
     }
-    if (hasUnsavedChanges) {
-      // 先 flush 再关闭：onClose 会切回聊天视图并重挂会话面板，若不等落盘完成，
-      // 面板挂载时读到的还是保存回包前的旧缓存（新配的模型"消失"，要重开窗口才出现）。
-      // flush 是本地 IPC 写盘（毫秒级），await 不产生可感知延迟；失败也照关（错误已
-      // toast + console，与旧行为一致，不把用户困在设置页）。
-      void persistSettingsNow().finally(() => onClose())
-      return
-    }
-    onClose()
-  }, [hasUnsavedChanges, onClose, persistSettingsNow, recordingTarget])
+    // 即使草稿看起来 pristine，也要走 persist：插件开关可能已写进缓存，
+    // persist 会采用那份 plugin MCP，避免把关闭盖回去。
+    void persistSettingsNow().finally(() => onClose())
+  }, [onClose, persistSettingsNow, recordingTarget])
 
   useImperativeHandle(ref, () => ({ requestClose: handleCloseRequest }), [handleCloseRequest])
 
@@ -1382,6 +1411,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
           id: currentProvider.id,
           baseUrl: currentProvider.baseUrl,
           apiKeys: currentProvider.apiKeys,
+          activeKeyIndex: currentProvider.activeKeyIndex,
           apiFormat: currentProvider.apiFormat,
           // 草稿可能尚未落盘，这里必须带上编辑中的请求配置，
           // 否则拉列表用的头和真实聊天不一致。
@@ -1400,12 +1430,8 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
 
   const openModelPicker = (providerId: string) => {
     if (!settings) return
-    const provider = settings.providers.find((p) => p.id === providerId)
-    if (!provider) return
+    if (!settings.providers.some((p) => p.id === providerId)) return
     setModelPickerProviderId(providerId)
-    if (provider.availableModels.length === 0 && fetchingProviderId !== providerId) {
-      void fetchModels(providerId)
-    }
   }
 
   /**
@@ -1599,7 +1625,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
   const chatRuntimeDefaults = defaultPrompts?.chatRuntimePrompt
   const chatConfig = settings?.chat || defaultChatConfig()
   const chatMemory = settings?.chatMemory || defaultChatMemory()
-  const chatFallbackMaxOutputTokens = chatConfig.maxOutputTokens ?? 8192
+  const chatFallbackMaxOutputTokens = chatConfig.maxOutputTokens ?? 16384
   const effectiveChatMaxOutput = settings
     ? resolveEffectiveChatMaxOutput(settings, chatFallbackMaxOutputTokens)
     : { maxOutput: chatFallbackMaxOutputTokens, source: 'fallback' as const, model: '', provider: undefined }
@@ -1712,6 +1738,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     { id: 'remote' as const, label: lang === 'zh' ? '远程连接' : 'Remote', icon: RemoteIcon },
     { id: 'connectors' as const, label: t.tabConnectors, icon: ConnectorsIcon },
     { id: 'plugins' as const, label: t.tabPlugins, icon: PluginsIcon },
+    { id: 'sessions' as const, label: t.tabSessions, icon: SessionsIcon },
     { id: 'webSearch' as const, label: t.tabWebSearch, icon: WebSearchIcon },
     { id: 'usage' as const, label: lang === 'zh' ? '用量统计' : 'Usage', icon: UsageIcon },
     // 关于固定在分类列表最末
@@ -1783,8 +1810,12 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     plugins: {
       title: t.tabPlugins,
       subtitle: lang === 'zh'
-        ? '检测本机能力插件（如 officecli）；启用后自动注入 Skill / MCP。'
-        : 'Detect local capability plugins (e.g. officecli); enable to inject Skills / MCP.',
+        ? '检测本机能力插件（OfficeCLI / Cua Driver / ego lite）；启用后自动注入 Skill / MCP。'
+        : 'Detect local capability plugins (OfficeCLI / Cua Driver / ego lite); enable to inject Skills / MCP.',
+    },
+    sessions: {
+      title: t.tabSessions,
+      subtitle: t.chatSessionSubtitle,
     },
     webSearch: {
       title: t.tabWebSearch,
@@ -1875,7 +1906,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     )
 
   const settingsMain = (
-        <main className={`kv-content ${variant === 'embedded' ? 'settings-embedded-main' : ''}`}>
+        <main className={`kv-content ${variant === 'embedded' ? 'settings-embedded-main' : ''}${activeTab === 'sessions' ? ' kv-content--wide' : ''}`}>
           <header
             className={`kv-page-header ${variant === 'embedded' ? 'settings-embedded-header' : ''}`}
             onMouseDown={handleSettingsDragMouseDown}
@@ -1889,7 +1920,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
 
           <div
             key={activeTab}
-            className={`kv-scroll settings-section-enter ${variant === 'embedded' ? 'settings-embedded-scroll' : ''}`}
+            className={`kv-scroll settings-section-enter ${variant === 'embedded' ? 'settings-embedded-scroll' : ''}${activeTab === 'sessions' ? ' kv-scroll--fill' : ''}`}
           >
             {/* ===== 基础设置标签页 ===== */}
             {activeTab === 'general' && (
@@ -2049,7 +2080,6 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
                 chatMemory={chatMemory}
                 chatDefaults={chatDefaults}
                 chatRuntimeDefaults={chatRuntimeDefaults}
-                chatFallbackMaxOutputTokens={chatFallbackMaxOutputTokens}
                 effectiveChatMaxOutput={effectiveChatMaxOutput}
                 chatMaxOutputSourceLabel={chatMaxOutputSourceLabel}
                 chatMaxOutputModelLabel={chatMaxOutputModelLabel}
@@ -2092,8 +2122,10 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
                 lang={lang}
                 chatTools={chatTools}
                 hasChatProvider={Boolean(chatProvider)}
+                defaultPromptOptimize={defaultPrompts?.promptOptimizePrompts?.[lang] ?? ''}
                 onUpdateDefaultModel={updateDefaultModel}
                 onUpdateChatTools={updateChatTools}
+                onUpdateChat={updateChat}
               />
             )}
 
@@ -2139,8 +2171,6 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
                 updateChatTools={updateChatTools}
                 obsidianVaultPath={settings?.obsidianVaultPath ?? ''}
                 onObsidianVaultPathChange={(path) => updateSettings({ obsidianVaultPath: path })}
-                emailAccounts={settings?.emailAccounts ?? []}
-                onEmailAccountsChange={(accounts) => updateSettings({ emailAccounts: accounts })}
                 lang={lang}
                 testServer={async (server) => {
                   try {
@@ -2160,8 +2190,20 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
             {/* ===== 插件标签页（原扩展 → 插件） ===== */}
             {activeTab === 'plugins' && (
               <PluginCenter
-                variant="settings"
                 onRequestAiInstall={onRequestPluginAiInstall}
+              />
+            )}
+
+            {activeTab === 'sessions' && sessionLibrary && (
+              <SessionCenter
+                lang={lang}
+                embedded
+                currentConversationId={sessionLibrary.currentConversationId}
+                generatingConversationIds={sessionLibrary.generatingConversationIds}
+                onSelectConversation={sessionLibrary.onSelectConversation}
+                onConversationDeleted={sessionLibrary.onConversationDeleted}
+                onForceDropConversation={sessionLibrary.onForceDropConversation}
+                onConversationsChanged={sessionLibrary.onConversationsChanged}
               />
             )}
 
@@ -2217,7 +2259,6 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
                 selectedProvider={selectedProvider}
                 revealedKeys={revealedKeys}
                 gzipInfoOpen={gzipInfoOpen}
-                fetchingProviderId={fetchingProviderId}
                 onSelectProvider={setSelectedProviderId}
                 onReorderProviders={reorderProviders}
                 onAddProvider={addProvider}
@@ -2302,7 +2343,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
             fetching: t.fetching,
             addModel: t.addModel,
             manualAddModel: t.manualAddModel,
-            noModels: lang === 'zh' ? '尚未获取模型，请点击上方按钮拉取。' : 'No models yet. Click the button above to fetch.',
+            noModels: lang === 'zh' ? '没有可用模型。点刷新重试，或手动添加。' : 'No models yet. Refresh or add one manually.',
             noSearchResults: lang === 'zh' ? '没有匹配的模型' : 'No matching models',
             enabled: lang === 'zh' ? '已启用' : 'On',
             addAllModels: lang === 'zh' ? '添加当前列表中的全部模型' : 'Add all models in the current list',
@@ -2338,6 +2379,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
             providerId={p.id}
             baseUrl={p.baseUrl}
             apiKeys={p.apiKeys}
+            activeKeyIndex={p.activeKeyIndex}
             apiFormat={p.apiFormat}
             request={p.request}
             models={p.enabledModels}

@@ -1,7 +1,8 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { describe, expect, it, vi, beforeEach } from 'vitest'
 import { ExternalAgentsSettings } from './ExternalAgentsSettings'
-import { chatApi } from '../chat/api'
+import { chatApi, onExternalCliInstallLog } from '../chat/api'
+import { resetCliInstallJobsForTests } from './cliInstallJobs'
 import type { Settings as SettingsData } from '../api/tauri'
 
 vi.mock('../chat/api', () => ({
@@ -18,7 +19,6 @@ vi.mock('../chat/api', () => ({
       configDir: '/home/u/.claude',
     }),
     externalCliInstall: vi.fn(),
-    externalCliOpenConfigDir: vi.fn(),
     externalCliProviderCleanup: vi.fn(),
     externalCliScanCcSwitch: vi.fn().mockResolvedValue({ providers: [], skipped: 0 }),
     externalCliFetchRelayModels: vi.fn().mockResolvedValue([]),
@@ -30,6 +30,33 @@ vi.mock('../chat/api', () => ({
     dshOfficialCredentialSave: vi.fn(),
     dshNativeProviderGet: vi.fn(),
     dshNativeProviderDelete: vi.fn(),
+    piExtensionsInventory: vi.fn().mockResolvedValue({
+      agentDir: '/home/u/.pi/agent',
+      extensionsDir: '/home/u/.pi/agent/extensions',
+      packages: [],
+      localExtensions: [],
+    }),
+    piExtensionSetEnabled: vi.fn(),
+    piExtensionInstall: vi.fn(),
+    piExtensionUpdate: vi.fn(),
+    piExtensionRemove: vi.fn(),
+    piExtensionOpen: vi.fn(),
+    piExtensionsOpenDir: vi.fn(),
+    piSkillsInventory: vi.fn().mockResolvedValue({
+      agentDir: '/home/u/.pi/agent',
+      piSkillsDir: '/home/u/.pi/agent/skills',
+      agentsSkillsDir: '/home/u/.agents/skills',
+      skillCommandsEnabled: true,
+      configuredPaths: [],
+      skills: [],
+    }),
+    piSkillSetEnabled: vi.fn(),
+    piSkillCommandsSetEnabled: vi.fn(),
+    piSkillAddPath: vi.fn(),
+    piSkillRemovePath: vi.fn(),
+    piSkillRemove: vi.fn(),
+    piSkillOpen: vi.fn(),
+    piSkillsOpenDir: vi.fn(),
   },
   onExternalCliInstallLog: vi.fn().mockResolvedValue(() => {}),
   onExternalAgentsUpdated: vi.fn().mockResolvedValue(() => {}),
@@ -40,6 +67,7 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({ open: vi.fn() }))
 const mockDetect = vi.mocked(chatApi.detectExternalAgents)
 const mockInstallInfo = vi.mocked(chatApi.externalCliInstallInfo)
 const mockInstall = vi.mocked(chatApi.externalCliInstall)
+const mockOnInstallLog = vi.mocked(onExternalCliInstallLog)
 const mockOfficialKeyStatus = vi.mocked(chatApi.dshOfficialCredentialStatus)
 const mockOfficialKeySave = vi.mocked(chatApi.dshOfficialCredentialSave)
 const mockNativeGet = vi.mocked(chatApi.dshNativeProviderGet)
@@ -63,9 +91,11 @@ function renderPanel(
 
 describe('ExternalAgentsSettings', () => {
   beforeEach(() => {
+    resetCliInstallJobsForTests()
     mockDetect.mockReset()
     mockInstallInfo.mockReset()
     mockInstall.mockReset()
+    mockOnInstallLog.mockReset()
     mockOfficialKeyStatus.mockReset()
     mockOfficialKeySave.mockReset()
     mockNativeGet.mockReset()
@@ -100,6 +130,7 @@ describe('ExternalAgentsSettings', () => {
       configDir: '/home/u/.claude',
     })
     mockInstall.mockResolvedValue()
+    mockOnInstallLog.mockResolvedValue(() => {})
   })
 
   it('groups agents by install state and selects the first available one', async () => {
@@ -139,7 +170,156 @@ describe('ExternalAgentsSettings', () => {
       expect(mockDetect).toHaveBeenCalledWith(true)
     })
     expect(screen.getByRole('status')).toHaveTextContent('安装完成')
+    expect(screen.getByRole('status')).not.toHaveTextContent('DeepSeek')
     expect(screen.queryByText('安装日志')).not.toBeInTheDocument()
+  })
+
+  it('keeps an in-flight update visible after switching CLIs and coming back', async () => {
+    let finishInstall: () => void = () => {}
+    mockInstall.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finishInstall = resolve
+        }),
+    )
+    let emit:
+      | ((event: {
+          agentId: string
+          line: string | null
+          done: boolean
+          success: boolean
+        }) => void)
+      | undefined
+    mockOnInstallLog.mockImplementation(async (handler) => {
+      emit = handler
+      return () => {}
+    })
+
+    renderPanel()
+    fireEvent.click(await screen.findByRole('button', { name: '更新' }))
+    await waitFor(() => {
+      expect(screen.getByRole('status')).toHaveTextContent('执行中')
+    })
+    expect(screen.getByLabelText('执行中…')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('Codex'))
+    await waitFor(() => {
+      expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    })
+    expect(screen.getByLabelText('执行中…')).toBeInTheDocument()
+
+    emit?.({
+      agentId: 'claude',
+      line: '$ npm install -g @anthropic-ai/claude-code@latest',
+      done: false,
+      success: false,
+    })
+
+    fireEvent.click(screen.getByText('Claude Code'))
+    await waitFor(() => {
+      expect(screen.getByRole('status')).toHaveTextContent('执行中')
+    })
+    expect(
+      screen.getByText('$ npm install -g @anthropic-ai/claude-code@latest'),
+    ).toBeInTheDocument()
+
+    finishInstall()
+    await waitFor(() => {
+      expect(screen.getByRole('status')).toHaveTextContent('安装完成')
+    })
+    expect(screen.getByRole('status')).not.toHaveTextContent('DeepSeek')
+  })
+
+  it('reminds about the DeepSeek key only after a dsh install finishes', async () => {
+    mockDetect.mockResolvedValue([
+      {
+        id: 'dsh',
+        name: 'DeepSeek Harness',
+        available: true,
+        path: 'C:\\npm\\dsh.cmd',
+        version: '0.1.0-rc.6',
+        models: [],
+        authStatus: 'ok',
+      },
+    ])
+    mockInstallInfo.mockResolvedValue({
+      agentId: 'dsh',
+      localVersion: '0.1.0-rc.6',
+      latestVersion: '0.1.0-rc.7',
+      updateAvailable: true,
+      command: 'npm install -g @deepseek-ai/dsh@latest',
+      docsUrl: 'https://github.com/deepseek-ai/deepseek-harness',
+      configDir: 'C:\\Users\\u\\.dsh',
+    })
+
+    renderPanel()
+    fireEvent.click(await screen.findByRole('button', { name: '更新' }))
+    await waitFor(() => {
+      expect(screen.getByRole('status')).toHaveTextContent('DeepSeek')
+    })
+  })
+
+  it('shows the prerelease suffix and offers an update from rc.6 to rc.7', async () => {
+    mockDetect.mockResolvedValue([
+      {
+        id: 'dsh',
+        name: 'DeepSeek Harness',
+        available: true,
+        path: 'C:\\npm\\dsh.cmd',
+        version: '0.1.0-rc.6',
+        models: [],
+        authStatus: 'ok',
+      },
+    ])
+    mockInstallInfo.mockResolvedValue({
+      agentId: 'dsh',
+      localVersion: '0.1.0-rc.6',
+      latestVersion: '0.1.0-rc.7',
+      updateAvailable: true,
+      command: 'npm install -g @deepseek-ai/dsh@latest',
+      docsUrl: 'https://github.com/deepseek-ai/deepseek-harness',
+      configDir: 'C:\\Users\\u\\.dsh',
+    })
+
+    renderPanel()
+
+    await waitFor(() => {
+      expect(screen.getByText('0.1.0-rc.6')).toBeInTheDocument()
+    })
+    expect(screen.getByText('可更新到 0.1.0-rc.7')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '更新' })).toBeInTheDocument()
+    expect(screen.queryByText('已是最新')).not.toBeInTheDocument()
+  })
+
+  it('keeps a matching prerelease as up to date', async () => {
+    mockDetect.mockResolvedValue([
+      {
+        id: 'dsh',
+        name: 'DeepSeek Harness',
+        available: true,
+        path: 'C:\\npm\\dsh.cmd',
+        version: '0.1.0-rc.7',
+        models: [],
+        authStatus: 'ok',
+      },
+    ])
+    mockInstallInfo.mockResolvedValue({
+      agentId: 'dsh',
+      localVersion: '0.1.0-rc.7',
+      latestVersion: '0.1.0-rc.7',
+      updateAvailable: false,
+      command: 'npm install -g @deepseek-ai/dsh@latest',
+      docsUrl: 'https://github.com/deepseek-ai/deepseek-harness',
+      configDir: 'C:\\Users\\u\\.dsh',
+    })
+
+    renderPanel()
+
+    await waitFor(() => {
+      expect(screen.getByText('0.1.0-rc.7')).toBeInTheDocument()
+    })
+    expect(screen.getByText('已是最新')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '更新' })).not.toBeInTheDocument()
   })
 
   it('shows up-to-date status without an update action', async () => {
@@ -264,6 +444,70 @@ describe('ExternalAgentsSettings', () => {
     )
   })
 
+  it('keeps Pi providers independent while allowing one default', async () => {
+    mockDetect.mockResolvedValue([
+      {
+        id: 'pi',
+        name: 'Pi',
+        available: true,
+        path: '/usr/local/bin/pi',
+        version: '0.50.2',
+        models: [],
+        authStatus: 'ok',
+      },
+    ])
+    mockInstallInfo.mockResolvedValue({
+      agentId: 'pi',
+      localVersion: '0.50.2',
+      latestVersion: '0.50.2',
+      updateAvailable: false,
+      command: 'npm install -g @mariozechner/pi-coding-agent@latest',
+      docsUrl: 'https://github.com/badlogic/pi-mono',
+      configDir: '/home/u/.pi/agent',
+    })
+
+    const { updateChat } = renderPanel({
+      externalCliAgents: {
+        pi: {
+          currentProvider: 'relay-1',
+          providers: [
+            { id: 'relay-1', name: 'Relay One' },
+            { id: 'relay-2', name: 'Relay Two' },
+          ],
+        },
+      },
+    })
+
+    const first = (await screen.findByText('Relay One')).closest<HTMLElement>('.kv-row')!
+    const second = screen.getByText('Relay Two').closest<HTMLElement>('.kv-row')!
+    expect(within(first).getByText('默认')).toBeInTheDocument()
+    expect(within(second).getByText('已并存')).toBeInTheDocument()
+    expect(within(first).getByRole('switch')).toHaveAttribute('aria-checked', 'true')
+
+    fireEvent.click(within(first).getByRole('switch'))
+    expect(updateChat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        externalCliAgents: expect.objectContaining({
+          pi: expect.objectContaining({
+            currentProvider: '',
+            providers: expect.arrayContaining([
+              expect.objectContaining({ id: 'relay-1', disabled: true }),
+            ]),
+          }),
+        }),
+      }),
+    )
+    updateChat.mockClear()
+    fireEvent.click(within(second).getByRole('button', { name: '设为默认' }))
+    expect(updateChat).toHaveBeenCalledWith(
+      expect.objectContaining({
+        externalCliAgents: expect.objectContaining({
+          pi: expect.objectContaining({ currentProvider: 'relay-2' }),
+        }),
+      }),
+    )
+  })
+
   it('shows the empty state when no provider is configured', async () => {
     renderPanel()
     await waitFor(() => {
@@ -299,7 +543,7 @@ describe('ExternalAgentsSettings', () => {
       expect(screen.getByText('DeepSeek')).toBeInTheDocument()
     })
     expect(screen.getByText('官方提供方 · 2 个模型')).toBeInTheDocument()
-    expect(screen.getByText('使用中')).toBeInTheDocument()
+    expect(screen.getByText('默认')).toBeInTheDocument()
     expect(screen.queryByText('使用 CLI 自身配置')).not.toBeInTheDocument()
     expect(screen.queryByText('暂无供应商，点击上方「添加」创建一个。')).not.toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '编辑供应商' })).not.toBeInTheDocument()
@@ -467,6 +711,76 @@ describe('ExternalAgentsSettings', () => {
     fireEvent.click(screen.getByRole('button', { name: /返回/ }))
     expect(screen.queryByRole('tab', { name: '插件配置' })).not.toBeInTheDocument()
     expect(screen.getByText('所有供应商')).toBeInTheDocument()
+  })
+
+  it('opens Pi extension management as a full secondary page', async () => {
+    mockDetect.mockResolvedValue([
+      {
+        id: 'pi',
+        name: 'Pi',
+        available: true,
+        path: '/usr/local/bin/pi',
+        version: '0.50.2',
+        models: [],
+        authStatus: 'ok',
+      },
+    ])
+    mockInstallInfo.mockResolvedValue({
+      agentId: 'pi',
+      localVersion: '0.50.2',
+      latestVersion: '0.50.2',
+      updateAvailable: false,
+      command: 'npm install -g @earendil-works/pi-coding-agent@latest',
+      docsUrl: 'https://github.com/badlogic/pi-mono',
+      configDir: '/home/u/.pi/agent',
+    })
+
+    renderPanel()
+    const entry = await screen.findByText('扩展管理')
+    fireEvent.click(entry.closest('button')!)
+
+    expect(await screen.findByText('Pi Package')).toBeInTheDocument()
+    expect(screen.queryByPlaceholderText('搜索 CLI')).not.toBeInTheDocument()
+    expect(screen.queryByText('自定义路径')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /返回/ }))
+    expect(await screen.findByPlaceholderText('搜索 CLI')).toBeInTheDocument()
+    expect(screen.getByText('自定义路径')).toBeInTheDocument()
+  })
+
+  it('opens Pi Skill management as a full secondary page', async () => {
+    mockDetect.mockResolvedValue([
+      {
+        id: 'pi',
+        name: 'Pi',
+        available: true,
+        path: '/usr/local/bin/pi',
+        version: '0.50.2',
+        models: [],
+        authStatus: 'ok',
+      },
+    ])
+    mockInstallInfo.mockResolvedValue({
+      agentId: 'pi',
+      localVersion: '0.50.2',
+      latestVersion: '0.50.2',
+      updateAvailable: false,
+      command: 'npm install -g @earendil-works/pi-coding-agent@latest',
+      docsUrl: 'https://github.com/badlogic/pi-mono',
+      configDir: '/home/u/.pi/agent',
+    })
+
+    renderPanel()
+    const entry = await screen.findByText('Skill 管理')
+    fireEvent.click(entry.closest('button')!)
+
+    expect(await screen.findByText('注册 /skill:name 命令')).toBeInTheDocument()
+    expect(screen.queryByPlaceholderText('搜索 CLI')).not.toBeInTheDocument()
+    expect(screen.queryByText('自定义路径')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /返回/ }))
+    expect(await screen.findByPlaceholderText('搜索 CLI')).toBeInTheDocument()
+    expect(screen.getByText('自定义路径')).toBeInTheDocument()
   })
 
   it('saves the official DeepSeek API key on the dsh page', async () => {

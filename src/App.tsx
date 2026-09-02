@@ -18,12 +18,14 @@ import {
   restoreChatWindowGeometry,
   snapshotChatWindowGeometry,
 } from './chat/persistence'
+import { isChatPopoutPath } from './chat/popout/popoutRoutes'
 import { ChatErrorBoundary } from './chat/ChatErrorBoundary'
 import { normalizeThemeColorId } from './themeColors'
 import './index.css'
 
 const Lens = lazy(() => import('./Lens'))
 const Chat = lazy(() => import('./chat/Chat'))
+const ChatPopout = lazy(() => import('./chat/popout/ChatPopout'))
 
 /**
  * 翻译器主组件
@@ -222,6 +224,10 @@ function App() {
     const hash = window.location.hash.replace('#', '')
     const path = urlParams.get('mode') || hash.split('?')[0] || ''
 
+    // 弹出窗必须走独立瘦壳，不能落入主窗 Chat.tsx（会把侧栏/设置/中心页一起打进来）。
+    if (isChatPopoutPath(path)) {
+      return 'chat-popout'
+    }
     // 支持 #chat 或 #chat/conversation-id
     if (isChatPath(path)) {
       return 'chat'
@@ -239,6 +245,9 @@ function App() {
   useEffect(() => {
     const path = hashPath()
     if (path === 'chat') {
+      // 窗口以 `#chat` 创建说明 Rust 侧没有已存路由（有的话会直接烤进 URL，见
+      // windows.rs::ensure_chat_window）。getRememberedChatRoute() 会自动迁移
+      // localStorage 遗留值（如果有的话），无需显式调用 adoptLegacyRememberedChatRoute。
       const rememberedRoute = getRememberedChatRoute()
       if (rememberedRoute && rememberedRoute !== window.location.hash) {
         window.location.hash = rememberedRoute
@@ -246,6 +255,7 @@ function App() {
       }
       return
     }
+
     if (isChatPath(path)) {
       rememberCurrentChatRoute()
     }
@@ -356,6 +366,7 @@ function App() {
 
   const persistChatWindowGeometry = useCallback(async () => {
     if (!isTauriRuntime()) return
+    if (isChatPopoutPath(hashPath())) return
     try {
       const win = (await import('@tauri-apps/api/window')).getCurrentWindow()
       const geometry = await snapshotChatWindowGeometry(win)
@@ -377,7 +388,9 @@ function App() {
         if (minimized) {
           await win.unminimize()
         }
-        await restoreChatWindowGeometry(win)
+        if (!isChatPopoutPath(hashPath())) {
+          await restoreChatWindowGeometry(win)
+        }
         await api.showWindow()
         await api.focusWindow()
       }
@@ -402,7 +415,7 @@ function App() {
   }, [revealChatWindow])
 
   useLayoutEffect(() => {
-    if (mode !== 'chat') return
+    if (mode !== 'chat' && mode !== 'chat-popout') return
     if (!isTauriRuntime()) return
     // 不变量：chat 是专用窗口，其 hash 恒为 #chat（含子路由），mode 一旦为 'chat' 便不再变。
     // 本兜底据此成立——若未来 chat 窗允许 mode 离开 'chat'，cleanup 会清掉未触发的兜底 timer
@@ -505,16 +518,26 @@ function App() {
       </Suspense>
     )
   }
+  const chatSuspenseFallback = (
+    <div className="flex h-full w-full items-center justify-center bg-transparent">
+      <div className="h-6 w-6 animate-spin rounded-full border-2 border-neutral-300 border-t-neutral-800 dark:border-neutral-700 dark:border-t-neutral-200" />
+    </div>
+  )
+  if (mode === 'chat-popout') {
+    return (
+      <ChatWindowHost translucentSidebar={translucentSidebar}>
+        <Suspense fallback={chatSuspenseFallback}>
+          <ChatErrorBoundary>
+            <ChatPopout onContentReady={revealChatWindowNow} />
+          </ChatErrorBoundary>
+        </Suspense>
+      </ChatWindowHost>
+    )
+  }
   if (mode === 'chat') {
     return (
       <ChatWindowHost translucentSidebar={translucentSidebar}>
-        <Suspense
-          fallback={
-            <div className="flex h-full w-full items-center justify-center bg-transparent">
-              <div className="h-6 w-6 animate-spin rounded-full border-2 border-neutral-300 border-t-neutral-800 dark:border-neutral-700 dark:border-t-neutral-200" />
-            </div>
-          }
-        >
+        <Suspense fallback={chatSuspenseFallback}>
           <ChatErrorBoundary>
             <Chat onSettingsChange={applyTheme} onContentReady={revealChatWindowNow} />
           </ChatErrorBoundary>

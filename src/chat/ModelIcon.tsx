@@ -11,6 +11,8 @@ import Gemma from '@lobehub/icons/es/Gemma/components/Color'
 import DeepSeek from '@lobehub/icons/es/DeepSeek/components/Color'
 import Qwen from '@lobehub/icons/es/Qwen/components/Color'
 import ChatGLM from '@lobehub/icons/es/ChatGLM/components/Color'
+import Zhipu from '@lobehub/icons/es/Zhipu/components/Color'
+import Kimi from '@lobehub/icons/es/Kimi/components/Color'
 import Mistral from '@lobehub/icons/es/Mistral/components/Color'
 import Meta from '@lobehub/icons/es/Meta/components/Color'
 import Yi from '@lobehub/icons/es/Yi/components/Color'
@@ -53,11 +55,64 @@ import AiHubMix from '@lobehub/icons/es/AiHubMix/components/Color'
 import SenseNova from '@lobehub/icons/es/SenseNova/components/Color'
 import Jina from '@lobehub/icons/es/Jina/components/Mono'
 import Voyage from '@lobehub/icons/es/Voyage/components/Color'
+import OpenCode from '@lobehub/icons/es/OpenCode/components/Mono'
 
 // lobehub leaf icons declare `size?: string | number`; widen via a loose cast so the
 // map stays typed without fighting their prop types.
 type Glyph = ComponentType<{ size?: number; style?: CSSProperties }>
 const G = (icon: unknown) => icon as Glyph
+
+/** lobehub 的 XiaomiMiMo Mono 是整段字标，18px 格子里会糊成「XIAOMI MIMO」字。橙色 Mi 标在格子里才认得出。 */
+function XiaomiMiMoMark({ size = 16, style }: { size?: number; style?: CSSProperties }) {
+  return (
+    <span
+      style={{
+        width: size,
+        height: size,
+        borderRadius: Math.max(3, Math.round(size * 0.22)),
+        background: '#FF6900',
+        color: '#fff',
+        display: 'inline-flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        fontSize: Math.max(7, Math.round(size * 0.42)),
+        fontWeight: 700,
+        lineHeight: 1,
+        letterSpacing: '-0.05em',
+        flexShrink: 0,
+        ...style,
+      }}
+      aria-hidden
+    >
+      Mi
+    </span>
+  )
+}
+
+/** 合租巴士 / Hezubus 没有 lobehub 标，用品牌黄橙巴士缩成格子图标。 */
+function HezubusMark({ size = 16, style }: { size?: number; style?: CSSProperties }) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      style={{ flexShrink: 0, display: 'block', ...style }}
+      aria-hidden
+    >
+      <rect x="3.2" y="3.6" width="17.6" height="13.6" rx="3.2" fill="#F5C400" />
+      <rect x="6.2" y="5" width="11.6" height="2.1" rx="0.6" fill="#3B3B3B" />
+      <rect x="8.4" y="5.4" width="3.6" height="1.3" rx="0.3" fill="#fff" />
+      <rect x="5.6" y="7.8" width="12.8" height="5.1" rx="1.1" fill="#8EC8F0" />
+      <path d="M3.2 13.4h17.6v2.6c0 1.5-1.2 2.6-2.7 2.6H5.9c-1.5 0-2.7-1.1-2.7-2.6z" fill="#F26A21" />
+      <circle cx="7.4" cy="15.7" r="1.05" fill="#fff" />
+      <circle cx="16.6" cy="15.7" r="1.05" fill="#fff" />
+      <rect x="1.5" y="8.2" width="2" height="2.5" rx="0.55" fill="#3B3B3B" />
+      <rect x="20.5" y="8.2" width="2" height="2.5" rx="0.55" fill="#3B3B3B" />
+      <rect x="5.4" y="18.6" width="3.4" height="2.2" rx="0.7" fill="#3B3B3B" />
+      <rect x="15.2" y="18.6" width="3.4" height="2.2" rx="0.7" fill="#3B3B3B" />
+    </svg>
+  )
+}
 
 // First match wins; tested case-insensitively against the model id.
 const MODEL_ICON_MAP: Array<[RegExp, Glyph]> = [
@@ -68,14 +123,17 @@ const MODEL_ICON_MAP: Array<[RegExp, Glyph]> = [
   [/deepseek/, G(DeepSeek)],
   [/qwen|qwq|qvq|tongyi|wanx/, G(Qwen)],
   [/grok/, G(Grok)],
-  [/kimi|moonshot/, G(Moonshot)],
-  [/glm|chatglm|zhipu/, G(ChatGLM)],
+  [/kimi/, G(Kimi)],
+  [/moonshot/, G(Moonshot)],
+  [/glm|chatglm|zhipu|ox-alpha/, G(Zhipu)],
   [/mistral|mixtral|codestral|pixtral|ministral|magistral|devstral/, G(Mistral)],
   [/llama|llava/, G(Meta)],
   [/(?:^|[-/])yi-/, G(Yi)],
-  [/doubao/, G(Doubao)],
+  [/doubao|seedream|(?:^|[-/])seed-[12]/, G(Doubao)],
   [/ernie|wenxin/, G(Wenxin)],
   [/minimax|abab/, G(Minimax)],
+  [/(?:^|[-/])hy[0-9]|(?:^|[-/])hy-|(?:^|[-/])hunyuan|混元/, G(Hunyuan)],
+  [/mimo/, XiaomiMiMoMark],
   [/cohere|command/, G(Cohere)],
   [/(?:^|[-/])phi-|wizardlm/, G(Microsoft)],
   [/(?:^|[-/])step-/, G(Stepfun)],
@@ -128,7 +186,9 @@ export const PROVIDER_BRANDS: Record<string, Glyph> = {
   Google: G(Google),
   DeepSeek: G(DeepSeek),
   Qwen: G(Qwen),
+  Zhipu: G(Zhipu),
   ChatGLM: G(ChatGLM),
+  Kimi: G(Kimi),
   Moonshot: G(Moonshot),
   Grok: G(Grok),
   Mistral: G(Mistral),
@@ -172,16 +232,84 @@ export const PROVIDER_BRANDS: Record<string, Glyph> = {
   SenseNova: G(SenseNova),
   Jina: G(Jina),
   Voyage: G(Voyage),
+  XiaomiMiMo: XiaomiMiMoMark,
+  OpenCode: G(OpenCode),
+  Hezubus: HezubusMark,
 }
+
+/** 图标选择器顺序：Coding 套餐靠前，ChatGLM 旧标不展示，魔搭/GitHub 沉底。ChatGLM 仍留在 PROVIDER_BRANDS 里，旧的手选记录还能显示。 */
+// eslint-disable-next-line react-refresh/only-export-components -- 选择器顺序与图标表同源
+export const PROVIDER_PICKER_KEYS: string[] = [
+  'Kimi',
+  'Zhipu',
+  'XiaomiMiMo',
+  'Minimax',
+  'OpenCode',
+  'Hezubus',
+  'DeepSeek',
+  'OpenAI',
+  'Claude',
+  'Gemini',
+  'Google',
+  'Qwen',
+  'Moonshot',
+  'Doubao',
+  'SiliconCloud',
+  'OpenRouter',
+  'Grok',
+  'Groq',
+  'Stepfun',
+  'Ai302',
+  'Volcengine',
+  'Bailian',
+  'Wenxin',
+  'Hunyuan',
+  'Spark',
+  'Baichuan',
+  'Yi',
+  'SenseNova',
+  'Mistral',
+  'Meta',
+  'Cohere',
+  'Together',
+  'Fireworks',
+  'Perplexity',
+  'Azure',
+  'Nvidia',
+  'Ollama',
+  'LmStudio',
+  'Vllm',
+  'Xinference',
+  'Cerebras',
+  'Hyperbolic',
+  'DeepInfra',
+  'Novita',
+  'PPIO',
+  'Infinigence',
+  'AiHubMix',
+  'Gemma',
+  'Microsoft',
+  'Jina',
+  'Voyage',
+  'ModelScope',
+  'GiteeAI',
+  'Github',
+]
 
 // 自动匹配：先按 baseUrl 的域名，再按名字。用户改名成「小白」也能靠域名认出来。
 const PROVIDER_ICON_MAP: Array<[RegExp, string]> = [
   [/openrouter/, 'OpenRouter'],
+  [/hezubus|合租巴士/, 'Hezubus'],
+  [/opencode/, 'OpenCode'],
+  [/xiaomi|xiaomimimo|mimo\.mi|token-plan/, 'XiaomiMiMo'],
   [/siliconflow|siliconcloud|硅基/, 'SiliconCloud'],
   [/ollama/, 'Ollama'],
-  [/bigmodel|zhipu|glm|智谱/, 'ChatGLM'],
+  [/bigmodel|zhipu|glm|智谱/, 'Zhipu'],
   [/deepseek/, 'DeepSeek'],
-  [/moonshot|kimi/, 'Moonshot'],
+  [/kimi/, 'Kimi'],
+  [/moonshot/, 'Moonshot'],
+  [/qwen/, 'Qwen'],
+  [/doubao|豆包/, 'Doubao'],
   [/anthropic|claude/, 'Claude'],
   [/generativelanguage|googleapis|aistudio|\bgoogle\b|gemini/, 'Google'],
   [/nvidia|英伟达/, 'Nvidia'],
@@ -190,10 +318,10 @@ const PROVIDER_ICON_MAP: Array<[RegExp, string]> = [
   [/fireworks/, 'Fireworks'],
   [/perplexity/, 'Perplexity'],
   [/azure/, 'Azure'],
-  [/volces|volcengine|ark\.cn|doubao|火山|豆包/, 'Volcengine'],
-  [/dashscope|aliyun|bailian|百炼|通义|qwen/, 'Bailian'],
+  [/volces|volcengine|ark\.cn|火山/, 'Volcengine'],
+  [/dashscope|aliyun|bailian|百炼|通义/, 'Bailian'],
   [/baichuan|百川/, 'Baichuan'],
-  [/hunyuan|混元|tencent/, 'Hunyuan'],
+  [/hunyuan|混元|tencent|tokenhub/, 'Hunyuan'],
   [/xf-yun|iflytek|spark|讯飞|星火/, 'Spark'],
   [/modelscope|魔搭/, 'ModelScope'],
   [/gitee/, 'GiteeAI'],

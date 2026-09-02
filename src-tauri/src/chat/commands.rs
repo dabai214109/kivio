@@ -16,7 +16,9 @@ pub(crate) mod context;
 
 pub(crate) mod interaction;
 
-mod title;
+pub(crate) mod title;
+
+pub(crate) mod prompt_optimize;
 
 mod tooling;
 
@@ -36,10 +38,13 @@ pub(crate) mod reasoning;
 use reasoning::resolve_thinking;
 
 mod vision_compat;
-pub(crate) use vision_compat::{attach_image_artifacts_for_model, read_image_as_tool_result};
+pub(crate) use vision_compat::{
+    attach_image_artifacts_for_model, read_image_as_tool_result, read_images_as_tool_result,
+};
 
 mod reply;
 use reply::{agent_run_entry_label, complete_assistant_reply, complete_assistant_reply_inner};
+use reply_runtime::ReplyArm;
 
 mod direct_image;
 
@@ -54,9 +59,9 @@ pub(crate) use interaction::{emit_chat_stream_delta, emit_chat_tool_record};
 pub(crate) use messages::push_assistant_message;
 use tooling::{
     append_agent_ask_user_tools, append_agent_todo_tools, apply_agent_plan_tool_filter,
-    apply_chat_mode_tool_filter, apply_inline_code_request_tool_filter, list_tools_for_chat,
-    resolve_forced_skill_id,
+    apply_inline_code_request_tool_filter, list_tools_for_chat, resolve_forced_skill_id,
 };
+pub(crate) use tooling::apply_chat_mode_tool_filter;
 
 #[cfg(test)]
 mod tests;

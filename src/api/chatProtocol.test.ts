@@ -4,15 +4,22 @@ import type {
   ChatRunSnapshot,
 } from '../generated/chatProtocol'
 import {
-  acceptChatPythonPayload,
   chatProtocolTesting,
+  configureChatProtocolFilter,
+  setExclusiveConversationIds,
   subscribeChatProtocolIssues,
   syncChatProtocol,
 } from './chatProtocol'
 
 const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }))
-vi.mock('@tauri-apps/api/core', () => ({ invoke: invokeMock }))
-vi.mock('@tauri-apps/api/event', () => ({ listen: async () => () => {} }))
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: invokeMock,
+  // 生产代码经 Channel 订阅实时事件;测试用 chatProtocolTesting.ingest 直灌,
+  // 这里只要一个能被 new 的空壳。
+  Channel: class {
+    onmessage: ((payload: unknown) => void) | null = null
+  },
+}))
 
 function event(seq: number, type: ChatRunEventEnvelope['type'] = 'run_started') {
   const common = {
@@ -29,6 +36,15 @@ function event(seq: number, type: ChatRunEventEnvelope['type'] = 'run_started') 
   }
   if (type === 'run_completed') {
     return { ...common, type, full: 'done', conversationRevision: 2 } as ChatRunEventEnvelope
+  }
+  if (type === 'hook_failed') {
+    return {
+      ...common,
+      type,
+      hookName: 'after',
+      event: 'agent_end',
+      message: 'boom',
+    } as ChatRunEventEnvelope
   }
   return { ...common, type: 'run_started', recovery: null } as ChatRunEventEnvelope
 }
@@ -53,7 +69,6 @@ function snapshot(overrides: Partial<ChatRunSnapshot> = {}): ChatRunSnapshot {
     todoState: null,
     planState: null,
     pendingInteractions: [],
-    pendingPythonRequests: [],
     warnings: [],
     statusNote: null,
     terminal: null,
@@ -90,6 +105,38 @@ describe('chat protocol sequencing', () => {
     expect(seen).toEqual([1, 2, 3])
   })
 
+  it('does not sync exclusive-skipped frames on the All subscriber', async () => {
+    setExclusiveConversationIds(['conversation'])
+    const seen: Array<{ seq: number; type: string }> = []
+    chatProtocolTesting.subscribe((item) => {
+      if (item.scope === 'run') seen.push({ seq: item.seq, type: item.type })
+    })
+    chatProtocolTesting.ingest(event(1))
+    chatProtocolTesting.ingest(event(80, 'run_completed'))
+    await flushSync()
+    expect(seen).toEqual([
+      { seq: 1, type: 'run_started' },
+      { seq: 80, type: 'run_completed' },
+    ])
+    expect(invokeMock.mock.calls.some((call) => call[0] === 'chat_sync_state')).toBe(false)
+  })
+
+  it('still syncs a content gap on the All subscriber even for popped conversations', async () => {
+    setExclusiveConversationIds(['conversation'])
+    chatProtocolTesting.ingest(event(1))
+    chatProtocolTesting.ingest(event(5, 'text_delta'))
+    await flushSync()
+    expect(invokeMock.mock.calls.some((call) => call[0] === 'chat_sync_state')).toBe(true)
+  })
+
+  it('still syncs a lifecycle gap on a Conversation subscriber', async () => {
+    configureChatProtocolFilter('conversation')
+    chatProtocolTesting.ingest(event(1))
+    chatProtocolTesting.ingest(event(80, 'run_completed'))
+    await flushSync()
+    expect(invokeMock.mock.calls.some((call) => call[0] === 'chat_sync_state')).toBe(true)
+  })
+
   it('rejects late nonduplicate events after a continuous terminal', () => {
     const seen: number[] = []
     chatProtocolTesting.subscribe((item) => {
@@ -99,6 +146,19 @@ describe('chat protocol sequencing', () => {
     chatProtocolTesting.ingest(event(2, 'run_completed'))
     chatProtocolTesting.ingest(event(3, 'text_delta'))
     expect(seen).toEqual([1, 2])
+  })
+
+  it('still delivers hook_failed after the run is terminal', () => {
+    const seen: string[] = []
+    chatProtocolTesting.subscribe((item) => {
+      if (item.scope === 'run') seen.push(item.type)
+    })
+    chatProtocolTesting.ingest(event(1))
+    chatProtocolTesting.ingest(event(2, 'run_completed'))
+    chatProtocolTesting.ingest(event(3, 'hook_failed'))
+    chatProtocolTesting.ingest(event(0, 'hook_failed'))
+    chatProtocolTesting.ingest(event(4, 'text_delta'))
+    expect(seen).toEqual(['run_started', 'run_completed', 'hook_failed', 'hook_failed'])
   })
 
   it('commits a buffered terminal only after the sequence gap closes', async () => {
@@ -267,21 +327,6 @@ describe('chat protocol sequencing', () => {
     })).toBe(false)
   })
 
-  it('deduplicates Python requests by stable runId', () => {
-    const request = {
-      protocolVersion: 1,
-      runId: 'python-run',
-      parentConversationId: 'conversation',
-      parentRunId: 'run',
-      parentMessageId: 'message',
-      code: '1 + 1',
-      timeoutMs: 1000,
-      files: [],
-    }
-    expect(acceptChatPythonPayload(request)).not.toBeNull()
-    expect(acceptChatPythonPayload(request)).toBeNull()
-  })
-
   it('restores the complete segment timeline from a run snapshot', () => {
     const seen: ChatRunEventEnvelope[] = []
     chatProtocolTesting.subscribe((item) => {
@@ -343,25 +388,6 @@ describe('chat protocol sequencing', () => {
     expect(errors).toEqual(['provider disconnected'])
   })
 
-  it('replays a pending Python snapshot request once per JS lifecycle', () => {
-    const requests: string[] = []
-    chatProtocolTesting.subscribePython((request) => requests.push(request.runId))
-    const request = {
-      protocolVersion: 1 as const,
-      runId: 'python-pending',
-      parentConversationId: 'conversation',
-      parentRunId: 'run',
-      parentMessageId: 'message',
-      code: 'print(1)',
-      timeoutMs: 1000,
-      files: [],
-    }
-    const pending = snapshot({ pendingPythonRequests: [request] })
-    chatProtocolTesting.applySnapshot(pending)
-    chatProtocolTesting.applySnapshot(pending)
-    expect(requests).toEqual(['python-pending'])
-  })
-
   it('validates the complete sync result and rejects extra fields', () => {
     const valid = {
       protocolVersion: 1,
@@ -382,9 +408,10 @@ describe('chat protocol sync', () => {
     missingRunIds: [],
     runs: [],
   })
-  const sentCursors = (call: number) => (
-    invokeMock.mock.calls[call][1] as { request: { cursors: unknown } }
-  ).request.cursors
+  const sentCursors = (call: number) => {
+    const syncCalls = invokeMock.mock.calls.filter((item) => item[0] === 'chat_sync_state')
+    return (syncCalls[call][1] as { request: { cursors: unknown } }).request.cursors
+  }
 
   beforeEach(() => {
     chatProtocolTesting.reset()
@@ -418,5 +445,23 @@ describe('chat protocol sync', () => {
     chatProtocolTesting.ingest(event(2, 'run_completed'))
     await syncChatProtocol('conversation')
     expect(sentCursors(1)).toEqual([{ runId: 'live-run', lastSeq: 1 }])
+  })
+
+  it('subscribes with the configured conversation filter', async () => {
+    chatProtocolTesting.resetNativeListener()
+    configureChatProtocolFilter('conv_popout')
+    invokeMock.mockResolvedValue(syncResult())
+    await syncChatProtocol('conv_popout')
+    expect(invokeMock).toHaveBeenCalledWith(
+      'chat_protocol_subscribe',
+      expect.objectContaining({ conversationId: 'conv_popout' }),
+    )
+  })
+
+  it('resyncs only in-flight All runs that actually received a stream', () => {
+    chatProtocolTesting.ingest(event(1))
+    chatProtocolTesting.ingest({ ...event(1), runId: 'live-run', conversationId: 'other' } as ChatRunEventEnvelope)
+    chatProtocolTesting.ingest({ ...event(2, 'text_delta'), runId: 'live-run', conversationId: 'other' } as ChatRunEventEnvelope)
+    expect(chatProtocolTesting.conversationIdsToResync()).toEqual(['other'])
   })
 })

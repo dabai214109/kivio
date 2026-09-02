@@ -1,4 +1,5 @@
 import type { Settings } from '../api/tauri'
+import { isWebSearchConfigured } from '../settings/webSearch'
 
 export function providerHasUsableConfig(settings: Settings): boolean {
   return settings.providers.some((provider) =>
@@ -42,12 +43,6 @@ export function validateProviderStep(settings: Settings): { ok: boolean; reason?
     return { ok: false, reason: 'missing_lens_model' }
   }
 
-  const chatProviderId = settings.defaultModels.chat.providerId.trim()
-  const chatModel = settings.defaultModels.chat.model.trim()
-  if (!isProviderModelBindingUsable(settings, chatProviderId, chatModel)) {
-    return { ok: false, reason: 'missing_chat_model' }
-  }
-
   return { ok: true }
 }
 
@@ -56,10 +51,5 @@ export function canCompleteOnboarding(settings: Settings): boolean {
 }
 
 export function webSearchConfigured(settings: Settings): boolean {
-  const webSearch = settings.lens?.webSearch
-  if (!webSearch) return false
-  if (webSearch.provider === 'exa') {
-    return webSearch.exaApiKey.trim() !== ''
-  }
-  return webSearch.tavilyApiKey.trim() !== ''
+  return isWebSearchConfigured(settings.lens?.webSearch)
 }

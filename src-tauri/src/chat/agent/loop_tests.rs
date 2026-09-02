@@ -12,7 +12,7 @@ use crate::chat::agent::SteeringMessage;
 use crate::chat::model::{StreamPart, StreamSink as _};
 use crate::chat::types::ToolCallStatus;
 use crate::mcp::types::{
-    native_read_file_tool, native_run_python_tool, native_web_fetch_tool, native_write_file_tool,
+    native_read_file_tool, native_run_command_tool, native_web_fetch_tool, native_write_file_tool,
     McpToolCallResult,
 };
 use crate::settings::{ChatToolsConfig, ModelProvider};
@@ -45,6 +45,8 @@ struct TestHost {
     /// 待注入的用户插话（steering），按「批」排队：`take_steering_messages` 每调一次弹出
     /// 一批——模拟真实信箱「取一次清一次、之后新到的下次才取到」的时序。
     steering: Mutex<std::collections::VecDeque<Vec<SteeringMessage>>>,
+    /// 原生 follow-up 信箱，同样按批。只在终答边界被 `take_follow_up_messages` 取走。
+    follow_up: Mutex<std::collections::VecDeque<Vec<SteeringMessage>>>,
 }
 
 impl TestHost {
@@ -87,6 +89,13 @@ impl TestHost {
     fn with_steering_batches(batches: Vec<Vec<SteeringMessage>>) -> Self {
         Self {
             steering: Mutex::new(batches.into()),
+            ..Self::default()
+        }
+    }
+
+    fn with_follow_up_batches(batches: Vec<Vec<SteeringMessage>>) -> Self {
+        Self {
+            follow_up: Mutex::new(batches.into()),
             ..Self::default()
         }
     }
@@ -221,6 +230,14 @@ impl AgentHost for TestHost {
 
     fn take_steering_messages(&self, _conversation_id: &str) -> Vec<SteeringMessage> {
         self.steering
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .pop_front()
+            .unwrap_or_default()
+    }
+
+    fn take_follow_up_messages(&self, _conversation_id: &str) -> Vec<SteeringMessage> {
+        self.follow_up
             .lock()
             .unwrap_or_else(|err| err.into_inner())
             .pop_front()
@@ -507,8 +524,7 @@ fn test_app_state() -> AppState {
         #[cfg(target_os = "macos")]
         crate::macos_ocr::MacOcrClient::disabled(),
         offline_models.clone(),
-        crate::rapidocr::RapidOcrClient::new(offline_models.clone()),
-        crate::inpainting::InpaintingClient::new(offline_models),
+        crate::rapidocr::RapidOcrClient::new(offline_models),
     )
 }
 
@@ -526,14 +542,11 @@ fn test_provider(base_url: &str) -> ModelProvider {
         model_overrides: std::collections::HashMap::new(),
         compress_request_body: false,
         request: Default::default(),
+        active_key_index: 0,
     }
 }
 
-fn test_run_config<'a>(
-    state: &'a AppState,
-    base_url: &str,
-    stream_enabled: bool,
-) -> AgentRunConfig<'a> {
+fn test_run_config<'a>(state: &'a AppState, base_url: &str) -> AgentRunConfig<'a> {
     AgentRunConfig {
         state,
         conversation_id: "conversation".to_string(),
@@ -559,13 +572,13 @@ fn test_run_config<'a>(
         thinking_enabled: false,
         thinking_level: None,
         web_search_mode: crate::chat::types::WebSearchMode::Off,
-        stream_enabled,
         max_output_tokens: 1024,
         retry_attempts: 1,
         assistant_snapshot: None,
         provider_tools_fallback_system_prompt: String::new(),
         initial_anchor_total_tokens: None,
         initial_anchor_trailing_estimate: 0,
+        skill_project_cwd: None,
     }
 }
 
@@ -595,10 +608,8 @@ fn planning_tool_call_sse_events() -> Vec<String> {
 /// 把一份非流式 chat-completion JSON 固件转成等价的 SSE 事件序列。
 ///
 /// 「要完整结果」的模型调用现在**一律走流式线**（`generate_via_stream_collect`，理由见
-/// planning.rs 上 `call_chat_completion_output_with_usage` 的注释）—— 包括
-/// `stream_enabled=false` 这个模式：那个开关现在只决定「是否往 host 发增量事件」，
-/// 不再决定线格式。固件用非流式 JSON 写着更好读，所以在这里做一次机械转换，
-/// 而不是把每个测试都手抄成 SSE。
+/// planning.rs 上 `call_chat_completion_output_with_usage` 的注释）。
+/// 固件用非流式 JSON 写着更好读，所以在这里做一次机械转换，而不是把每个测试都手抄成 SSE。
 fn sse_from_completion_json(body: &str) -> Vec<String> {
     let parsed: Value = serde_json::from_str(body).expect("mock body must be valid JSON");
     let message = &parsed["choices"][0]["message"];
@@ -670,7 +681,7 @@ fn test_tool_arguments(function_name: &str) -> Value {
     match function_name.to_ascii_lowercase().as_str() {
         "read" => serde_json::json!({ "path": "/tmp/kivio-test.txt" }),
         "web_fetch" => serde_json::json!({ "url": "https://example.com" }),
-        "run_python" => serde_json::json!({ "code": "print(1)" }),
+        "bash" | "run_command" => serde_json::json!({ "command": "echo 1" }),
         "ask_user" => serde_json::json!({
             "questions": [
                 {
@@ -690,10 +701,10 @@ fn test_tool_arguments(function_name: &str) -> Value {
 #[test]
 fn visible_tool_segment_calls_skip_hidden_disabled_builtin_feedback() {
     let tools = vec![native_read_file_tool()];
-    let blocked = vec![native_run_python_tool()];
+    let blocked = vec![native_run_command_tool()];
     let calls = vec![
         pending_tool_call("call_read", "read"),
-        pending_tool_call("call_blocked", "run_python"),
+        pending_tool_call("call_blocked", "bash"),
         pending_tool_call("call_hidden_disabled", "web_search"),
         pending_tool_call("call_unknown", "mcp__server__tool"),
     ];
@@ -1141,7 +1152,7 @@ async fn tool_round_records_plan_blocked_tool_as_skipped() {
     let executor = RecordingExecutor::default();
     let settings = Settings::default();
     let tools = vec![native_read_file_tool()];
-    let blocked = vec![native_run_python_tool()];
+    let blocked = vec![native_run_command_tool()];
     let mut skill_cache = skills::SkillRunCache::default();
 
     let result = execute_tool_round(
@@ -1151,7 +1162,7 @@ async fn tool_round_records_plan_blocked_tool_as_skipped() {
         test_round_context(),
         &tools,
         &blocked,
-        vec![pending_tool_call("call_py", "run_python")],
+        vec![pending_tool_call("call_bash", "bash")],
         &mut skill_cache,
     )
     .await;
@@ -1165,8 +1176,8 @@ async fn tool_round_records_plan_blocked_tool_as_skipped() {
         .contains("blocked in Plan mode"));
     assert_eq!(result.tool_records.len(), 1);
     let record = &result.tool_records[0];
-    assert_eq!(record.id, "call_py");
-    assert_eq!(record.name, "run_python");
+    assert_eq!(record.id, "call_bash");
+    assert_eq!(record.name, "bash");
     assert!(matches!(record.status, ToolCallStatus::Skipped));
     assert!(record
         .error
@@ -1174,7 +1185,7 @@ async fn tool_round_records_plan_blocked_tool_as_skipped() {
         .unwrap_or_default()
         .contains("blocked in Plan mode"));
     assert_eq!(record.trace_id.as_deref(), Some("run"));
-    assert_eq!(record.span_id.as_deref(), Some("tool_round_1_call_py"));
+    assert_eq!(record.span_id.as_deref(), Some("tool_round_1_call_bash"));
 }
 
 #[tokio::test]
@@ -1182,7 +1193,7 @@ async fn tool_round_cancels_unstarted_calls_after_running_tool_is_cancelled() {
     let host = TestHost::cancelling_after(Duration::from_millis(5));
     let executor = RecordingExecutor::default();
     let settings = Settings::default();
-    let tools = vec![native_read_file_tool(), native_run_python_tool()];
+    let tools = vec![native_read_file_tool(), native_run_command_tool()];
     let mut skill_cache = skills::SkillRunCache::default();
 
     let result = execute_tool_round(
@@ -1194,7 +1205,7 @@ async fn tool_round_cancels_unstarted_calls_after_running_tool_is_cancelled() {
         &[],
         vec![
             pending_tool_call("call_read", "read"),
-            pending_tool_call("call_py", "run_python"),
+            pending_tool_call("call_bash", "bash"),
         ],
         &mut skill_cache,
     )
@@ -1203,7 +1214,7 @@ async fn tool_round_cancels_unstarted_calls_after_running_tool_is_cancelled() {
     assert!(result.cancelled);
     assert_eq!(
         tool_call_ids(&result.response_messages),
-        vec!["call_read", "call_py"]
+        vec!["call_read", "call_bash"]
     );
     assert_eq!(
         result
@@ -1211,7 +1222,7 @@ async fn tool_round_cancels_unstarted_calls_after_running_tool_is_cancelled() {
             .iter()
             .map(|record| record.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["call_read", "call_py"]
+        vec!["call_read", "call_bash"]
     );
     assert!(result
         .tool_records
@@ -1323,7 +1334,7 @@ async fn tool_round_keeps_serial_only_tools_non_overlapping() {
     let host = TestHost::default();
     let executor = RecordingExecutor::default();
     let settings = Settings::default();
-    let tools = vec![native_run_python_tool()];
+    let tools = vec![native_run_command_tool()];
     let mut skill_cache = skills::SkillRunCache::default();
 
     let result = execute_tool_round(
@@ -1334,8 +1345,8 @@ async fn tool_round_keeps_serial_only_tools_non_overlapping() {
         &tools,
         &[],
         vec![
-            pending_tool_call("call_py_1", "run_python"),
-            pending_tool_call("call_py_2", "run_python"),
+            pending_tool_call("call_bash_1", "bash"),
+            pending_tool_call("call_bash_2", "bash"),
         ],
         &mut skill_cache,
     )
@@ -1344,25 +1355,20 @@ async fn tool_round_keeps_serial_only_tools_non_overlapping() {
     assert_eq!(executor.max_active(), 1);
     assert_eq!(
         executor.events(),
-        vec![
-            "start:run_python",
-            "finish:run_python",
-            "start:run_python",
-            "finish:run_python"
-        ]
+        vec!["start:bash", "finish:bash", "start:bash", "finish:bash"]
     );
     assert_eq!(result.response_messages.len(), 2);
     assert_eq!(
         result.response_messages[0]
             .get("tool_call_id")
             .and_then(Value::as_str),
-        Some("call_py_1")
+        Some("call_bash_1")
     );
     assert_eq!(
         result.response_messages[1]
             .get("tool_call_id")
             .and_then(Value::as_str),
-        Some("call_py_2")
+        Some("call_bash_2")
     );
 }
 
@@ -1404,7 +1410,7 @@ fn fallback_responses_are_bilingual() {
 #[test]
 fn tool_planning_failed_run_result_marks_drafts_error_and_emits_fallback() {
     let state = test_app_state();
-    let config = test_run_config(&state, "http://127.0.0.1:9/v1", true);
+    let config = test_run_config(&state, "http://127.0.0.1:9/v1");
     let host = TestHost::default();
 
     let mut segment_builder = SegmentBuilder::new();
@@ -1528,7 +1534,7 @@ async fn run_loop_stream_planning_interrupt_after_tool_draft_returns_error_resul
                 .to_string(),
         ])]);
     let state = test_app_state();
-    let config = test_run_config(&state, &server.base_url, true);
+    let config = test_run_config(&state, &server.base_url);
     let host = TestHost::default();
     let executor = RecordingExecutor::default();
 
@@ -1567,7 +1573,7 @@ async fn run_loop_stream_synthesis_failure_preserves_tool_records_with_fallback(
         MockResponse::Status(400, r#"{"error":"mock synthesis failure"}"#.to_string()),
     ]);
     let state = test_app_state();
-    let config = test_run_config(&state, &server.base_url, true);
+    let config = test_run_config(&state, &server.base_url);
     let host = TestHost::default();
     let executor = RecordingExecutor::default();
 
@@ -1631,7 +1637,7 @@ async fn run_loop_stream_synthesis_cancelled_returns_cancelled_with_stopped_cont
         MockResponse::SseThenHang(Vec::new()),
     ]);
     let state = test_app_state();
-    let config = test_run_config(&state, &server.base_url, true);
+    let config = test_run_config(&state, &server.base_url);
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let host = TestHost::with_cancel_flag(cancel_flag.clone());
     let executor = CancelAfterToolExecutor { cancel_flag };
@@ -1673,7 +1679,7 @@ async fn run_loop_stream_synthesis_cancelled_keeps_partial_content() {
         ]),
     ]);
     let state = test_app_state();
-    let config = test_run_config(&state, &server.base_url, true);
+    let config = test_run_config(&state, &server.base_url);
     let host = TestHost::cancelling_on_first_text_delta();
     let executor = RecordingExecutor::default();
 
@@ -1708,7 +1714,7 @@ async fn run_loop_planning_top_cancelled_preserves_gathered_tool_records() {
         MockResponse::Sse(planning_tool_call_sse_events()),
     ]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, false);
+    let mut config = test_run_config(&state, &server.base_url);
     // Allow a second round so cancellation lands at the loop top rather than
     // the round limit.
     config.effective_chat_tools.max_tool_rounds = Some(2);
@@ -1751,7 +1757,7 @@ async fn run_loop_stream_planning_cancelled_keeps_partial_text() {
         r#"{"choices":[{"delta":{"content":"这是已经生成的部分回答内容"}}]}"#.to_string(),
     ])]);
     let state = test_app_state();
-    let config = test_run_config(&state, &server.base_url, true);
+    let config = test_run_config(&state, &server.base_url);
     let host = TestHost::cancelling_on_first_text_delta();
     let executor = RecordingExecutor::default();
 
@@ -1783,7 +1789,7 @@ async fn run_loop_stream_planning_cancelled_orders_reasoning_before_text() {
             r#"{"choices":[{"delta":{"reasoning_content":"先构思一下整体结构","content":"这是已经生成的部分回答内容"}}]}"#.to_string(),
         ])]);
     let state = test_app_state();
-    let config = test_run_config(&state, &server.base_url, true);
+    let config = test_run_config(&state, &server.base_url);
     let host = TestHost::cancelling_on_first_text_delta();
     let executor = RecordingExecutor::default();
 
@@ -1820,7 +1826,7 @@ async fn run_loop_stream_planning_cancelled_orders_reasoning_before_text() {
 async fn run_loop_stream_planning_cancelled_with_no_text_returns_cancelled() {
     let server = MockModelServer::start(vec![MockResponse::SseThenHang(Vec::new())]);
     let state = test_app_state();
-    let config = test_run_config(&state, &server.base_url, true);
+    let config = test_run_config(&state, &server.base_url);
     let host = TestHost::cancelling_after(Duration::from_millis(20));
     let executor = RecordingExecutor::default();
 
@@ -1841,7 +1847,7 @@ async fn run_loop_stream_plain_synthesis_cancelled_keeps_partial_text() {
         r#"{"choices":[{"delta":{"content":"部分回答"}}]}"#.to_string(),
     ])]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     config.tools = Vec::new();
     let host = TestHost::cancelling_on_first_text_delta();
     let executor = RecordingExecutor::default();
@@ -1910,7 +1916,7 @@ async fn run_loop_l2_compacts_old_history_keeps_current_round_raw() {
         ]),
     ]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     // 600 token 窗口（预算 510）：旧工具输出先经 microcompact，再由大段非工具历史确保
     // 发送视图仍超预算，稳定进入 Layer2 摘要。
     config.provider.model_overrides.insert(
@@ -2017,7 +2023,7 @@ async fn run_loop_usage_anchor_triggers_compaction_when_estimate_below_budget() 
         ]),
     ]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     config.provider.model_overrides.insert(
         "test-model".to_string(),
         crate::settings::ModelInfo {
@@ -2065,7 +2071,7 @@ async fn run_loop_no_anchor_skips_compaction_when_estimate_below_budget() {
         ]),
     ]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     config.provider.model_overrides.insert(
         "test-model".to_string(),
         crate::settings::ModelInfo {
@@ -2118,7 +2124,7 @@ async fn run_loop_reports_live_context_usage_each_round() {
         ]),
     ]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     config.provider.model_overrides.insert(
         "test-model".to_string(),
         crate::settings::ModelInfo {
@@ -2174,7 +2180,7 @@ async fn run_loop_persists_partial_assistant_after_completed_tool_round() {
         ]),
     ]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     config.effective_chat_tools.max_tool_rounds = Some(2);
     let host = TestHost::default();
     let executor = RecordingExecutor::default();
@@ -2222,7 +2228,7 @@ async fn run_loop_steering_injects_user_message_and_emits_card() {
         ]),
     ]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     config.effective_chat_tools.max_tool_rounds = Some(3);
     let host = TestHost::with_steering("steer-1", "别用 grep，改用 rg");
     let executor = RecordingExecutor::default();
@@ -2308,7 +2314,7 @@ async fn run_loop_steering_delivers_one_message_per_round() {
         ]),
     ]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     config.effective_chat_tools.max_tool_rounds = Some(3);
     let host = TestHost::with_steering_batches(vec![vec![
         SteeringMessage::new("steer-a".into(), "第一条：先跑测试").expect("non-blank"),
@@ -2365,7 +2371,7 @@ async fn run_loop_final_answer_with_pending_steering_continues() {
         ]),
     ]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     config.effective_chat_tools.max_tool_rounds = Some(3);
     // 时序：轮首取信箱时是空的（批 1），插话在终答流式期间到达（批 2 在
     // FinalAnswer 边界的 steering_pending 检查被取到）。
@@ -2416,6 +2422,111 @@ async fn run_loop_final_answer_with_pending_steering_continues() {
     assert_eq!(result.stream_outcome, "completed");
 }
 
+/// 内置循环的原生 follow-up：终答时信箱有下一轮消息 ⇒ 吸收终答、注入 `user_follow_up`
+/// 卡、同一 run 续跑。不是 `user_steer`（那会在轮首打断工具循环）。
+#[tokio::test]
+async fn run_loop_final_answer_with_pending_follow_up_continues() {
+    let server = MockModelServer::start(vec![
+        MockResponse::Sse(vec![
+            r#"{"choices":[{"delta":{"content":"先答一版。"}}]}"#.to_string(),
+            "[DONE]".to_string(),
+        ]),
+        MockResponse::Sse(vec![
+            r#"{"choices":[{"delta":{"content":"补充完毕。"}}]}"#.to_string(),
+            "[DONE]".to_string(),
+        ]),
+    ]);
+    let state = test_app_state();
+    let mut config = test_run_config(&state, &server.base_url);
+    config.effective_chat_tools.max_tool_rounds = Some(3);
+    let host = TestHost::with_follow_up_batches(vec![vec![SteeringMessage::new(
+        "follow-late".into(),
+        "顺便把 README 也更新",
+    )
+    .expect("non-blank")]]);
+    let executor = RecordingExecutor::default();
+
+    let result = run_agent_loop(config, &host, &executor)
+        .await
+        .expect("run continues past the pending follow-up final answer");
+
+    let bodies = server.captured_bodies();
+    assert_eq!(bodies.len(), 2, "final answer + one continuation round");
+    assert!(
+        bodies[1].contains("先答一版"),
+        "absorbed assistant answer replays"
+    );
+    assert!(
+        bodies[1].contains("README"),
+        "the follow-up message reaches the model"
+    );
+    assert_eq!(result.content, "补充完毕。");
+    assert!(result
+        .tool_records
+        .iter()
+        .any(|record| record.name == crate::chat::agent::FOLLOW_UP_TOOL_NAME));
+    assert!(result
+        .tool_records
+        .iter()
+        .all(|record| record.name != crate::chat::agent::STEER_TOOL_NAME));
+    assert_eq!(result.stream_outcome, "completed");
+}
+
+/// follow-up 不能在工具循环的轮首注入：工具轮的请求里没有它，终答之后才进下一轮。
+#[tokio::test]
+async fn run_loop_follow_up_waits_until_final_answer() {
+    let server = MockModelServer::start(vec![
+        MockResponse::Sse(planning_tool_call_sse_events()),
+        MockResponse::Sse(vec![
+            r#"{"choices":[{"delta":{"content":"文件看过了。"}}]}"#.to_string(),
+            "[DONE]".to_string(),
+        ]),
+        MockResponse::Sse(vec![
+            r#"{"choices":[{"delta":{"content":"README 也改了。"}}]}"#.to_string(),
+            "[DONE]".to_string(),
+        ]),
+    ]);
+    let state = test_app_state();
+    let mut config = test_run_config(&state, &server.base_url);
+    config.effective_chat_tools.max_tool_rounds = Some(4);
+    let host = TestHost::with_follow_up_batches(vec![vec![SteeringMessage::new(
+        "follow-after-tools".into(),
+        "再改 README",
+    )
+    .expect("non-blank")]]);
+    let executor = RecordingExecutor::default();
+
+    let result = run_agent_loop(config, &host, &executor)
+        .await
+        .expect("follow-up after tools completes");
+
+    let bodies = server.captured_bodies();
+    assert_eq!(
+        bodies.len(),
+        3,
+        "tool round + final answer + follow-up round"
+    );
+    assert!(
+        !bodies[0].contains("README"),
+        "follow-up must not enter the tool-call round: {}",
+        bodies[0]
+    );
+    assert!(
+        !bodies[1].contains("README"),
+        "follow-up must not enter the pre-final tool-result round: {}",
+        bodies[1]
+    );
+    assert!(
+        bodies[2].contains("README"),
+        "follow-up reaches the continuation round"
+    );
+    assert!(result
+        .tool_records
+        .iter()
+        .any(|record| record.name == crate::chat::agent::FOLLOW_UP_TOOL_NAME));
+    assert_eq!(result.stream_outcome, "completed");
+}
+
 /// 对齐 pi failToolCallsFromTruncatedMessage：finish_reason=="length" 时整批工具调用作废
 /// ——salvage 收尾可能产出「JSON 合法但语义残缺」的参数，一个都不执行，让模型重发。
 #[tokio::test]
@@ -2435,7 +2546,7 @@ async fn run_loop_length_truncated_tool_calls_fail_whole_batch() {
         ]),
     ]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     config.effective_chat_tools.max_tool_rounds = Some(3);
     let host = TestHost::default();
     let executor = RecordingExecutor::default();
@@ -2491,7 +2602,7 @@ async fn run_loop_layer2_replaces_old_history_with_summary() {
         ]),
     ]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     // 600 token 窗口（预算 510）：即使旧工具结果先被 microcompact，大段非工具历史仍
     // 保持超预算，必然升级 Layer2。
     config.provider.model_overrides.insert(
@@ -2585,7 +2696,7 @@ async fn run_loop_compaction_summary_streams_on_streaming_only_provider() {
         ]),
     ]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     config.provider.model_overrides.insert(
         "test-model".to_string(),
         crate::settings::ModelInfo {
@@ -2676,7 +2787,7 @@ async fn run_loop_compaction_thrash_degrades_with_gathered_results() {
         overflow_400(),
     ]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     // Small window so the pre-filled ordinary history remains over budget even
     // after the huge tool output is microcompacted, forcing a summary attempt at
     // the top of every planning round.
@@ -2754,7 +2865,7 @@ async fn run_loop_under_budget_sends_messages_untouched() {
         ]),
     ]);
     let state = test_app_state();
-    let config = test_run_config(&state, &server.base_url, true);
+    let config = test_run_config(&state, &server.base_url);
     let host = TestHost::default();
     // 默认窗口（test-model 无覆盖 → 200k fallback），小输出远不达 0.85。
     let executor = HugeResultExecutor { chars: 600 };
@@ -2783,7 +2894,7 @@ async fn run_loop_stream_synthesis_empty_output_uses_fallback_and_completes() {
         MockResponse::Sse(vec!["[DONE]".to_string()]),
     ]);
     let state = test_app_state();
-    let config = test_run_config(&state, &server.base_url, true);
+    let config = test_run_config(&state, &server.base_url);
     let host = TestHost::default();
     let executor = RecordingExecutor::default();
 
@@ -2829,7 +2940,7 @@ async fn run_loop_nonstream_synthesis_failure_preserves_tool_records_with_fallba
         MockResponse::Status(400, r#"{"error":"mock synthesis failure"}"#.to_string()),
     ]);
     let state = test_app_state();
-    let config = test_run_config(&state, &server.base_url, false);
+    let config = test_run_config(&state, &server.base_url);
     let host = TestHost::default();
     let executor = RecordingExecutor::default();
 
@@ -2892,7 +3003,7 @@ async fn run_loop_overflow_recovery_compacts_and_retries_success() {
         MockResponse::Sse(sse_from_completion_json(&retry_answer)),
     ]);
     let state = test_app_state();
-    let config = test_run_config(&state, &server.base_url, false);
+    let config = test_run_config(&state, &server.base_url);
     let host = TestHost::default();
     let executor = RecordingExecutor::default();
 
@@ -2945,7 +3056,7 @@ async fn run_loop_empty_response_at_context_window_recovers_as_silent_overflow()
         MockResponse::Sse(sse_from_completion_json(&retry_answer)),
     ]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, false);
+    let mut config = test_run_config(&state, &server.base_url);
     config.provider.model_overrides.insert(
         "test-model".to_string(),
         crate::settings::ModelInfo {
@@ -3013,7 +3124,7 @@ async fn run_loop_overflow_recovery_retries_once_then_degrades() {
         overflow_400,
     ]);
     let state = test_app_state();
-    let config = test_run_config(&state, &server.base_url, false);
+    let config = test_run_config(&state, &server.base_url);
     let host = TestHost::default();
     let executor = RecordingExecutor::default();
 
@@ -3054,7 +3165,7 @@ async fn run_loop_nonstream_synthesis_empty_output_uses_fallback() {
         MockResponse::Sse(sse_from_completion_json(&empty_synthesis)),
     ]);
     let state = test_app_state();
-    let config = test_run_config(&state, &server.base_url, false);
+    let config = test_run_config(&state, &server.base_url);
     let host = TestHost::default();
     let executor = RecordingExecutor::default();
 
@@ -3121,7 +3232,7 @@ fn web_search_card_segments(result: &AgentRunResult) -> Vec<&ChatMessageSegment>
 async fn run_loop_stream_builtin_web_search_card_precedes_answer_single_card() {
     let server = MockModelServer::start(vec![MockResponse::Sse(responses_web_search_sse_events())]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     // Responses provider（支持内置搜索）+ 会话内置模式。
     config.provider.api_format = "openai_responses".to_string();
     config.web_search_mode = crate::chat::types::WebSearchMode::Builtin;
@@ -3167,53 +3278,6 @@ async fn run_loop_stream_builtin_web_search_card_precedes_answer_single_card() {
     );
 }
 
-/// 集成（非流式答案路径）：内置模式 + Responses provider。`stream_enabled=false` 现在只表示
-/// 「不往 host 发增量」，线格式仍是流式（见 `sse_from_completion_json` 的注释），所以固件是
-/// SSE；引用在拿到完整答案后合成，走 `emit_builtin_web_search_card(order=预留槽)`
-/// —— 同样落在答案之前、单卡。
-#[tokio::test]
-async fn run_loop_nonstream_builtin_web_search_card_uses_reserved_slot() {
-    let server = MockModelServer::start(vec![MockResponse::Sse(responses_web_search_sse_events())]);
-    let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, false);
-    config.provider.api_format = "openai_responses".to_string();
-    config.web_search_mode = crate::chat::types::WebSearchMode::Builtin;
-    let host = TestHost::default();
-    let executor = RecordingExecutor::default();
-
-    let result = run_agent_loop(config, &host, &executor)
-        .await
-        .expect("non-stream builtin web search run completes");
-
-    assert_eq!(result.stream_outcome, "completed");
-    assert_eq!(result.content, "Kivio 最新版本信息。");
-
-    let web_records: Vec<_> = result
-        .tool_records
-        .iter()
-        .filter(|record| record.name == "web_search")
-        .collect();
-    assert_eq!(web_records.len(), 1);
-    assert!(matches!(web_records[0].status, ToolCallStatus::Success));
-
-    let cards = web_search_card_segments(&result);
-    assert_eq!(cards.len(), 1, "single card");
-    let answer = result
-        .segments
-        .iter()
-        .find(|segment| {
-            segment.kind == ChatMessageSegmentKind::Text
-                && segment.text.as_deref() == Some("Kivio 最新版本信息。")
-        })
-        .expect("answer text segment persisted");
-    assert!(
-        cards[0].order < answer.order,
-        "reserved-slot card (order {}) must precede answer (order {})",
-        cards[0].order,
-        answer.order,
-    );
-}
-
 /// Gemini 原生出图（任务 07-24）：模型在流式答案里返回 inlineData 图片 →
 /// `GenerateOutput.images` → 循环跨阶段累积进 `RunState.generated_images` →
 /// `attach_usage` 挂到 `AgentRunResult.images`。reply 侧据此落成 assistant 消息级
@@ -3226,7 +3290,7 @@ async fn run_loop_gemini_native_image_lands_in_run_result_images() {
         r#"{"candidates":[{"finishReason":"STOP"}]}"#.to_string(),
     ])]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     config.provider.api_format = "gemini".to_string();
     // 出图模型不调工具：给纯文本任务，模型直接以「文本 + 图片」作答（无 tool call）→ FinalAnswer。
     config.tools = Vec::new();
@@ -3428,7 +3492,7 @@ async fn hook_events_pair_up_on_the_tool_round_path() {
         ]),
     ]);
     let state = test_app_state();
-    let config = test_run_config(&state, &server.base_url, true);
+    let config = test_run_config(&state, &server.base_url);
     let host = HookedHost::new(TestHost::default());
     let executor = RecordingExecutor::default();
 
@@ -3452,7 +3516,7 @@ async fn hook_events_pair_up_on_the_no_tools_path() {
         "[DONE]".to_string(),
     ])]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     config.tools = Vec::new();
     let host = HookedHost::new(TestHost::default());
     let executor = RecordingExecutor::default();
@@ -3477,7 +3541,7 @@ async fn hook_events_pair_up_when_cancelled() {
         MockResponse::Sse(planning_tool_call_sse_events()),
     ]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     // 必须放行第二轮：默认 max_tool_rounds=Some(1) 会让第一轮后直接撞 RoundLimit
     // break，`cancelling_on_persist` 翻的旗子根本没有循环顶部再去读它 —— 这条测试
     // 就会挂着「when_cancelled」的名字实际走正常路径。
@@ -3514,7 +3578,7 @@ async fn cancelling_during_synthesis_still_cancels_hooks() {
         ]),
     ]);
     let state = test_app_state();
-    let config = test_run_config(&state, &server.base_url, true);
+    let config = test_run_config(&state, &server.base_url);
     let host = HookedHost::new(TestHost::cancelling_on_first_text_delta());
     let executor = RecordingExecutor::default();
 
@@ -3542,7 +3606,7 @@ async fn a_successful_run_never_cancels_hooks() {
         ]),
     ]);
     let state = test_app_state();
-    let config = test_run_config(&state, &server.base_url, true);
+    let config = test_run_config(&state, &server.base_url);
     let host = HookedHost::new(TestHost::default());
     let executor = RecordingExecutor::default();
 
@@ -3570,7 +3634,7 @@ async fn run_loop_smoke_plain_answer_completes() {
         "[DONE]".to_string(),
     ])]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     config.tools = Vec::new();
     let host = TestHost::default();
     let executor = RecordingExecutor::default();
@@ -3596,7 +3660,7 @@ async fn run_loop_smoke_tool_then_final_answer_round_trips() {
         ]),
     ]);
     let state = test_app_state();
-    let mut config = test_run_config(&state, &server.base_url, true);
+    let mut config = test_run_config(&state, &server.base_url);
     config.effective_chat_tools.max_tool_rounds = Some(2);
     let host = TestHost::default();
     let executor = RecordingExecutor::default();

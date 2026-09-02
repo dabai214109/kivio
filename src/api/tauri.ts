@@ -9,7 +9,6 @@ import { normalizeThemeColorId } from '../themeColors'
 import {
   subscribeChatProtocol,
   subscribeChatProtocolIssues,
-  subscribeChatPython,
   syncChatProtocol,
   type ChatProtocolDelivery,
   type ChatProtocolIssue,
@@ -18,8 +17,8 @@ import type {
   ChatProtocolEvent,
   ChatRunEventEnvelope,
   ChatSegmentPayload as GeneratedChatSegmentPayload,
-  ChatRunPythonPayload as GeneratedChatRunPythonPayload,
 } from '../generated/chatProtocol'
+import type { Automation, AutomationChangedEvent, AutomationMeta, AutomationRunEvent, AutomationRunStarted, AutomationRunSummary } from '../chat/automation/types'
 
 // ========== 类型定义 ==========
 
@@ -420,14 +419,12 @@ export type ChatNativeToolsConfig = {
   writeFile?: boolean
   editFile?: boolean
   runCommand?: boolean
-  runPython?: boolean
   knowledgeSearch?: boolean
+  automation?: boolean
   workingDirectory?: string
   /** Legacy settings compatibility only. */
   workspaceRoots?: string[]
 }
-
-export type ChatRunPythonPayload = GeneratedChatRunPythonPayload
 
 export type ChatPastedImageResult = {
   success: boolean
@@ -454,8 +451,8 @@ export function defaultNativeTools(): ChatNativeToolsConfig {
     writeFile: true,
     editFile: true,
     runCommand: true,
-    runPython: true,
     knowledgeSearch: true,
+    automation: true,
     workingDirectory: '',
     workspaceRoots: [],
   }
@@ -555,6 +552,8 @@ export type ChatConfig = {
   maxOutputTokens?: number
   defaultLanguage?: string
   systemPrompt?: string
+  /** 输入框问题优化的自定义系统提示词；空则用内置。 */
+  promptOptimizePrompt?: string
   userDisplayName?: string
   userAvatar?: string
   defaultAgentRuntime?: AgentRuntimeConfig
@@ -572,7 +571,7 @@ export type ExternalCliAgentConfig = {
   customModels?: Array<{ id: string; label: string }>
   /** 该 CLI 的第三方供应商（中转站）列表。 */
   providers?: ExternalCliProvider[]
-  /** 当前生效的供应商 id；空 = 用 CLI 自己的配置。 */
+  /** 当前默认供应商 id；Pi / OpenCode / dsh 的 providers 会全部并存。空 = 用 CLI 自己的默认配置。 */
   currentProvider?: string
 }
 
@@ -588,6 +587,8 @@ export type ExternalCliAgentConfig = {
 export type ExternalCliProvider = {
   id: string
   name: string
+  /** Disabled providers stay saved but are not materialized or injected. */
+  disabled?: boolean
   remark?: string
   env?: Array<{ key: string; value: string }>
   configToml?: string
@@ -771,7 +772,7 @@ export type LensReplaceStreamPayload = {
   groups: LensReplaceGroup[]
   slots: LensReplaceRenderSlot[]
   cleanedImage?: string | null
-  // 硬失败（整张替换翻译不可用）才带 error；局部降级（如修复回退、个别区域回退原文）只带 warning。
+  // 硬失败（整张替换翻译不可用）才带 error；局部降级（如个别区域缺少译文回退原文）只带 warning。
   error?: string | null
   warning?: string | null
 }
@@ -947,8 +948,8 @@ export type ModelInfo = {
 }
 
 // AI 模型提供商配置
-// apiKeys 支持多 key failover：第一个为主 key，其余为备用 key；
-// 当某个 key 触发限流/配额/鉴权失败时后端会自动切下一个。
+// apiKeys 是密钥池；activeKeyIndex 是用户点选的当前 Key。
+// 鉴权/配额失败时后端仍会自动切到池里其它 Key。
 export type ProviderRequestConfig = {
   /** 附加到该供应商所有请求上的自定义头。同名时覆盖 CLI 身份预设。 */
   customHeaders?: { key: string; value: string }[]
@@ -974,6 +975,8 @@ export type ModelProvider = {
   id: string
   name: string
   apiKeys: string[]
+  /** 用户点选的当前 Key 下标。缺省 / 越界按 0。 */
+  activeKeyIndex?: number
   baseUrl: string
   availableModels: string[]
   enabledModels: string[]
@@ -992,6 +995,8 @@ export type ProviderConnectionInput = {
   id?: string
   baseUrl: string
   apiKeys: string[]
+  /** 测试 / 拉模型时用这条；不传则后端回落已保存的点选下标。 */
+  activeKeyIndex?: number
   model?: string
   apiFormat?: string
   /** 编辑中（可能尚未保存）的请求配置。不传则后端回落已保存的那份。 */
@@ -1009,6 +1014,7 @@ export type DefaultModelsConfig = {
   titleSummary: DefaultModelSelection
   compression: DefaultModelSelection
   imageGeneration: DefaultModelSelection
+  promptOptimize: DefaultModelSelection
   advisor: DefaultModelSelection
 }
 
@@ -1061,6 +1067,63 @@ export type KnowledgeBaseConfig = {
   minScore: number
 }
 
+export type WebSearchProviderId =
+  | 'tavily'
+  | 'exa'
+  | 'exa_mcp'
+  | 'ollama'
+  | 'grok'
+  | 'deepseek'
+  | 'brave'
+  | 'serper'
+  | 'bocha'
+  | 'zhipu'
+  | 'tinyfish'
+  | 'tinyfish_mcp'
+  | 'searxng'
+  | 'kimi'
+
+export type WebSearchMcpAuth = NonNullable<ChatMcpServer['auth']>
+
+export type WebSearchConfig = {
+  enabled: boolean
+  provider: WebSearchProviderId
+  /** Independent `web_fetch` provider. Omit/`null` follows `provider`. */
+  fetchProvider?: WebSearchProviderId | null
+  tavilyApiKey: string
+  tavilyBaseUrl?: string
+  exaApiKey: string
+  exaBaseUrl?: string
+  exaMcpUrl?: string
+  ollamaApiKey?: string
+  ollamaBaseUrl?: string
+  grokApiKey?: string
+  grokModel?: string
+  grokBaseUrl?: string
+  grokSystemPrompt?: string
+  deepseekApiKey?: string
+  deepseekModel?: string
+  deepseekBaseUrl?: string
+  deepseekSystemPrompt?: string
+  braveApiKey?: string
+  braveBaseUrl?: string
+  serperApiKey?: string
+  serperBaseUrl?: string
+  bochaApiKey?: string
+  bochaBaseUrl?: string
+  zhipuApiKey?: string
+  zhipuBaseUrl?: string
+  tinyfishApiKey?: string
+  tinyfishBaseUrl?: string
+  tinyfishMcpUrl?: string
+  tinyfishMcpAuth?: WebSearchMcpAuth | null
+  searxngBaseUrl?: string
+  kimiApiKey?: string
+  kimiBaseUrl?: string
+  maxResults: number
+  searchDepth: 'ultra-fast' | 'fast' | 'basic' | 'advanced'
+}
+
 export type Settings = {
   hotkey: string
   chatHotkey: string
@@ -1077,6 +1140,8 @@ export type Settings = {
   launchAtStartup: boolean
   /** 启动后不打开聊天窗口，进程留在托盘（适合开机自启后后台常驻） */
   launchMinimizedToTray: boolean
+  /** 关闭聊天窗口时隐藏复用（默认 false = 销毁）。下次打开无需重新加载，占用更多内存。 */
+  keepChatWindowAlive?: boolean
   translatorProviderId: string
   translatorModel: string
   chatProviderId: string
@@ -1156,23 +1221,7 @@ export type Settings = {
     /** 进入截图选择态时是否显示顶部提示（默认 true） */
     showCaptureHint?: boolean
     /** Lens 联网搜索配置 */
-    webSearch?: {
-      enabled: boolean
-      provider: 'tavily' | 'exa' | 'exa_mcp' | 'ollama' | 'grok'
-      tavilyApiKey: string
-      tavilyBaseUrl?: string
-      exaApiKey: string
-      exaBaseUrl?: string
-      exaMcpUrl?: string
-      ollamaApiKey?: string
-      ollamaBaseUrl?: string
-      grokApiKey?: string
-      grokModel?: string
-      grokBaseUrl?: string
-      grokSystemPrompt?: string
-      maxResults: number
-      searchDepth: 'ultra-fast' | 'fast' | 'basic' | 'advanced'
-    }
+    webSearch?: WebSearchConfig
   }
   settingsLanguage?: 'zh' | 'en'
   /** 首次使用引导：`pending` | `completed` | `skipped` */
@@ -1187,45 +1236,6 @@ export type Settings = {
   obsidianVaultPath?: string
   /** 收藏并置顶的模型键（"providerId:model"）；顺序即置顶顺序。chat 模型选择器用。 */
   favoriteModels?: string[]
-  /** Himalaya IMAP/SMTP 邮箱账户 */
-  emailAccounts?: EmailAccountConfig[]
-}
-
-export type EmailAccountConfig = {
-  id: string
-  email: string
-  displayName: string
-  password: string
-  imapHost: string
-  imapPort: number
-  imapEncryption: string
-  smtpHost: string
-  smtpPort: number
-  smtpEncryption: string
-  isDefault: boolean
-}
-
-export type EmailProviderPreset = {
-  id: string
-  label: string
-  imapHost: string
-  imapPort: number
-  imapEncryption: string
-  smtpHost: string
-  smtpPort: number
-  smtpEncryption: string
-}
-
-export type HimalayaStatus = {
-  installed: boolean
-  version: string | null
-  path: string | null
-}
-
-export type HimalayaInstallResult = {
-  ok: boolean
-  alreadyInstalled: boolean
-  message: string
 }
 
 /** 能力插件（领域 CLI 等）状态 —— 设置 → 插件 */
@@ -1257,6 +1267,8 @@ export type PluginStatus = {
   /** 启用后 MCP 是否已写入 settings 且 enabled */
   mcpActive: boolean
   mcpServerId: string | null
+  /** 当前系统是否可自动安装（安装命令不回传前端） */
+  canInstall?: boolean
 }
 
 export type PluginActionResult = {
@@ -1517,9 +1529,11 @@ export type OfflineModelProgress = {
 }
 
 function normalizeProvider(provider: ModelProvider): ModelProvider {
+  const apiKeys = Array.isArray(provider.apiKeys) ? provider.apiKeys : []
   return {
     ...provider,
-    apiKeys: Array.isArray(provider.apiKeys) ? provider.apiKeys : [],
+    apiKeys,
+    activeKeyIndex: clampedActiveKeyIndex(apiKeys, provider.activeKeyIndex),
     availableModels: Array.isArray(provider.availableModels) ? provider.availableModels : [],
     enabledModels: Array.isArray(provider.enabledModels) ? provider.enabledModels : [],
     enabled: provider.enabled !== false,
@@ -1538,6 +1552,21 @@ function normalizeProvider(provider: ModelProvider): ModelProvider {
   }
 }
 
+/** 把点选下标夹到密钥池范围内；空池为 0。 */
+export function clampedActiveKeyIndex(apiKeys: string[], index?: number): number {
+  if (apiKeys.length <= 0) return 0
+  if (!Number.isFinite(index) || (index ?? 0) < 0) return 0
+  return Math.min(Math.floor(index ?? 0), apiKeys.length - 1)
+}
+
+/** 删掉一条 Key 后，当前点选下标怎么跟着挪。 */
+export function activeKeyIndexAfterRemove(current: number, removedIdx: number, remaining: number): number {
+  if (remaining <= 0) return 0
+  if (removedIdx < current) return Math.max(0, current - 1)
+  if (removedIdx === current) return Math.min(current, remaining - 1)
+  return Math.min(current, remaining - 1)
+}
+
 export function normalizeProviderApiFormat(apiFormat?: string): string {
   if (apiFormat === 'anthropic' || apiFormat === 'anthropic_messages') return 'anthropic_messages'
   if (apiFormat === 'openai_responses' || apiFormat === 'responses') return 'openai_responses'
@@ -1548,10 +1577,35 @@ export function normalizeProviderApiFormat(apiFormat?: string): string {
 
 /**
  * 当前 provider 是否支持模型原生内置联网搜索（任务 07-23）。
- * OpenAI Responses / Gemini / Anthropic Messages 支持；Chat Completions 不支持
- * （gpt-5 在其上开 web_search 会 400）。前端据此把「内置」选项置灰。
+ * OpenAI Responses / Gemini / Anthropic Messages 支持；Chat Completions 一般不支持
+ * （gpt-5 在其上开 web_search 会 400）。例外：官方 DeepSeek API（api.deepseek.com）
+ * 即使协议仍是 Chat Completions，也可以开内置（请求改走 Responses 的服务端 web_search）。
  * 与 Rust 侧 `model_metadata::builtin_web_search_supported` 保持一致。
  */
+export function isOfficialDeepSeekApi(baseUrl?: string): boolean {
+  const raw = (baseUrl ?? '').trim()
+  if (!raw) return false
+  try {
+    const host = new URL(raw.includes('://') ? raw : `https://${raw}`).hostname.toLowerCase()
+    return host === 'api.deepseek.com'
+  } catch {
+    return false
+  }
+}
+
+export function builtinWebSearchSupported(apiFormat?: string, baseUrl?: string): boolean {
+  const kind = normalizeProviderApiFormat(apiFormat)
+  if (
+    kind === 'openai_responses' ||
+    kind === 'xai_responses' ||
+    kind === 'gemini' ||
+    kind === 'anthropic_messages'
+  ) {
+    return true
+  }
+  return kind === 'openai_chat' && isOfficialDeepSeekApi(baseUrl)
+}
+
 export type PromptCacheRetention = 'none' | 'short' | 'long'
 
 /**
@@ -1579,16 +1633,6 @@ export function promptCachingSupported(apiFormat?: string): boolean {
 /** 当前策略是否会发客户端缓存字段。 */
 export function promptCachingEnabled(request?: ProviderRequestConfig | null): boolean {
   return resolvePromptCacheRetention(request) !== 'none'
-}
-
-export function builtinWebSearchSupported(apiFormat?: string): boolean {
-  const kind = normalizeProviderApiFormat(apiFormat)
-  return (
-    kind === 'openai_responses' ||
-    kind === 'xai_responses' ||
-    kind === 'gemini' ||
-    kind === 'anthropic_messages'
-  )
 }
 
 const CHAT_TOOL_MIN_ROUNDS = 1
@@ -1687,6 +1731,7 @@ function normalizeDefaultModels(
     titleSummary: normalizeDefaultModelSelection(config?.titleSummary),
     compression: normalizeDefaultModelSelection(config?.compression),
     imageGeneration: normalizeDefaultModelSelection(config?.imageGeneration),
+    promptOptimize: normalizeDefaultModelSelection(config?.promptOptimize),
     advisor: normalizeDefaultModelSelection(config?.advisor),
   }
 }
@@ -1759,6 +1804,7 @@ export function normalizeSettings(settings: Settings): Settings {
     autoPaste: current.autoPaste ?? true,
     launchAtStartup: current.launchAtStartup ?? false,
     launchMinimizedToTray: current.launchMinimizedToTray ?? false,
+    keepChatWindowAlive: current.keepChatWindowAlive ?? false,
     translatorProviderId: current.translatorProviderId ?? '',
     translatorModel: current.translatorModel ?? '',
     chatProviderId: effectiveChatModel.providerId,
@@ -1767,9 +1813,10 @@ export function normalizeSettings(settings: Settings): Settings {
     chat: {
       streamEnabled: current.chat?.streamEnabled ?? current.lens?.streamEnabled ?? true,
       thinkingEnabled: current.chat?.thinkingEnabled ?? current.lens?.thinkingEnabled ?? true,
-      maxOutputTokens: current.chat?.maxOutputTokens ?? 8192,
+      maxOutputTokens: current.chat?.maxOutputTokens ?? 16384,
       defaultLanguage: current.chat?.defaultLanguage ?? '',
       systemPrompt: current.chat?.systemPrompt ?? '',
+      promptOptimizePrompt: current.chat?.promptOptimizePrompt ?? '',
       userDisplayName: current.chat?.userDisplayName ?? '',
       userAvatar: current.chat?.userAvatar ?? '',
       // 本地 CLI 覆盖（供应商列表 / 路径 / 停用）与默认运行时：之前重建 chat 时丢掉了，
@@ -1844,6 +1891,26 @@ export function normalizeSettings(settings: Settings): Settings {
         grokBaseUrl: current.lens?.webSearch?.grokBaseUrl ?? 'https://api.x.ai/v1',
         grokSystemPrompt: current.lens?.webSearch?.grokSystemPrompt
           ?? "You are a helpful search assistant. Search the web to find accurate and up-to-date information for the user's query. Provide a comprehensive answer with citations.",
+        deepseekApiKey: current.lens?.webSearch?.deepseekApiKey ?? '',
+        deepseekModel: current.lens?.webSearch?.deepseekModel ?? 'deepseek-v4-flash',
+        deepseekBaseUrl: current.lens?.webSearch?.deepseekBaseUrl ?? 'https://api.deepseek.com',
+        deepseekSystemPrompt: current.lens?.webSearch?.deepseekSystemPrompt
+          ?? "You are a helpful search assistant. Search the web to find accurate and up-to-date information for the user's query. Provide a comprehensive answer with citations.",
+        braveApiKey: current.lens?.webSearch?.braveApiKey ?? '',
+        braveBaseUrl: current.lens?.webSearch?.braveBaseUrl ?? 'https://api.search.brave.com',
+        serperApiKey: current.lens?.webSearch?.serperApiKey ?? '',
+        serperBaseUrl: current.lens?.webSearch?.serperBaseUrl ?? 'https://google.serper.dev',
+        bochaApiKey: current.lens?.webSearch?.bochaApiKey ?? '',
+        bochaBaseUrl: current.lens?.webSearch?.bochaBaseUrl ?? 'https://api.bochaai.com',
+        zhipuApiKey: current.lens?.webSearch?.zhipuApiKey ?? '',
+        zhipuBaseUrl: current.lens?.webSearch?.zhipuBaseUrl ?? 'https://open.bigmodel.cn/api/paas/v4',
+        tinyfishApiKey: current.lens?.webSearch?.tinyfishApiKey ?? '',
+        tinyfishBaseUrl: current.lens?.webSearch?.tinyfishBaseUrl ?? 'https://api.search.tinyfish.ai',
+        tinyfishMcpUrl: current.lens?.webSearch?.tinyfishMcpUrl ?? 'https://agent.tinyfish.ai/mcp',
+        tinyfishMcpAuth: current.lens?.webSearch?.tinyfishMcpAuth ?? null,
+        searxngBaseUrl: current.lens?.webSearch?.searxngBaseUrl ?? '',
+        kimiApiKey: current.lens?.webSearch?.kimiApiKey ?? '',
+        kimiBaseUrl: current.lens?.webSearch?.kimiBaseUrl ?? 'https://api.kimi.com/coding/v1/search',
         maxResults: current.lens?.webSearch?.maxResults ?? 5,
         searchDepth: current.lens?.webSearch?.searchDepth ?? 'basic',
       },
@@ -1855,7 +1922,6 @@ export function normalizeSettings(settings: Settings): Settings {
     imageArchivePath: current.imageArchivePath ?? '',
     obsidianVaultPath: current.obsidianVaultPath ?? '',
     favoriteModels: current.favoriteModels ?? [],
-    emailAccounts: current.emailAccounts ?? [],
   }
 }
 
@@ -1875,6 +1941,10 @@ export type DefaultPromptTemplates = {
   }
   /** Built-in Kivio Chat runtime prompt (exact string injected when chatMode.systemPrompt is empty). */
   chatRuntimePrompt?: string
+  promptOptimizePrompts?: {
+    zh: string
+    en: string
+  }
 }
 
 // macOS 权限状态
@@ -1987,19 +2057,15 @@ export const api = {
   listObsidianVaults: () =>
     invoke<{ name: string; path: string }[]>('list_obsidian_vaults_cmd'),
 
-  listEmailProviderPresets: () =>
-    invoke<EmailProviderPreset[]>('list_email_provider_presets'),
-
-  himalayaStatus: () => invoke<HimalayaStatus>('himalaya_status_cmd'),
-
-  himalayaInstall: () => invoke<HimalayaInstallResult>('himalaya_install_cmd'),
-
   /** 能力插件列表（目录 + 安装/启用状态） */
   pluginsList: () => invoke<PluginStatus[]>('plugins_list'),
   // Cached (no-spawn) status for instant first paint; follow with pluginsList to refine.
   pluginsListCached: () => invoke<PluginStatus[]>('plugins_list_cached'),
-  /** 取「让 AI 安装」任务 brief（含标准化安装文档） */
+  /** 取可选「让 AI 代装」任务 brief（含标准化安装文档） */
   pluginsInstallBrief: (id: string) => invoke<PluginInstallBrief>('plugins_install_brief', { id }),
+  /** 运行当前系统对应的 GitHub README 安装命令 */
+  pluginsRunOfficialInstall: (id: string) =>
+    invoke<PluginActionResult>('plugins_run_official_install', { id }),
   pluginsSetEnabled: (id: string, enabled: boolean) =>
     invoke<PluginActionResult>('plugins_set_enabled', { id, enabled }),
   pluginsUninstall: (id: string) => invoke<PluginActionResult>('plugins_uninstall', { id }),
@@ -2022,8 +2088,25 @@ export const api = {
   /** 笔记目录的绝对路径，用于订阅 workspace:activity 自动刷新。 */
   notesDirPath: () => invoke<string>('notes_dir_path'),
 
-  testHimalayaEmail: (account: EmailAccountConfig, existingAccounts?: EmailAccountConfig[]) =>
-    invoke<string>('test_himalaya_email_cmd', { account, existingAccounts }),
+  /** 扩展 → 自动化。图存在 `{app_data}/automations/`，类型归 `src/chat/automation/types.ts`。 */
+  automationList: () => invoke<AutomationMeta[]>('automation_list'),
+  automationGet: (id: string) => invoke<Automation>('automation_get', { id }),
+  automationSave: (automation: Automation) =>
+    invoke<Automation>('automation_save', { automation }),
+  automationDelete: (id: string) => invoke<void>('automation_delete', { id }),
+  automationSetEnabled: (id: string, enabled: boolean) =>
+    invoke<Automation>('automation_set_enabled', { id, enabled }),
+  automationRun: (id: string, untilNodeId?: string) =>
+    invoke<AutomationRunStarted>('automation_run', { id, untilNodeId: untilNodeId ?? null }),
+  automationCancel: (id: string) => invoke<void>('automation_cancel', { id }),
+  automationExport: (id: string, path: string) =>
+    invoke<void>('automation_export', { id, path }),
+  automationImport: (path: string) => invoke<Automation>('automation_import', { path }),
+  automationRunsList: (id: string) => invoke<AutomationRunSummary[]>('automation_runs_list', { id }),
+  onAutomationRun: (listener: (payload: AutomationRunEvent) => void) =>
+    on<AutomationRunEvent>('automation-run', listener),
+  onAutomationChanged: (listener: (payload: AutomationChangedEvent) => void) =>
+    on<AutomationChangedEvent>('automation-changed', listener),
 
   // 窗口控制
   /** 给当前（chat）窗口上 Mica，返回材质是否真的生效。Win10 没有 Mica 时为 false —— 这条
@@ -2064,6 +2147,15 @@ export const api = {
   startDragging: async () => {
     const win = getCurrentWindow()
     await win.startDragging()
+  },
+
+  /** 把聊天窗口上次停留的路由交给 Rust 持久化（null = 清除）。 */
+  rememberChatLastRoute: async (route: string | null): Promise<void> => {
+    try {
+      await invoke('chat_remember_last_route', { route })
+    } catch {
+      // 路由持久化是尽力而为：失败只影响「重开回到哪条对话」，绝不打断交互。
+    }
   },
 
   // 事件监听
@@ -2261,6 +2353,10 @@ export const api = {
     if (!isTauriRuntime()) return Promise.resolve(() => {})
     return on<{ conversationId: string; reload?: boolean | null; error?: string | null }>('chat-open-conversation', (payload) => listener(payload))
   },
+  onConversationPopoutsChanged: (listener: (payload: { conversationIds: string[] }) => void) => {
+    if (!isTauriRuntime()) return Promise.resolve(() => {})
+    return on<{ conversationIds: string[] }>('chat-popouts-changed', (payload) => listener(payload))
+  },
   onChatExternalSendReady: (listener: () => void) => {
     if (!isTauriRuntime()) return Promise.resolve(() => {})
     return on<unknown>('chat-external-send-ready', () => listener())
@@ -2302,22 +2398,20 @@ export const api = {
     invoke<McpServerStatus>('chat_mcp_server_status', { serverId }),
   chatMcpListToolDefs: (serverId: string) =>
     invoke<{ name: string; description: string }[]>('chat_mcp_list_tool_defs', { serverId }),
-  chatMcpReloadServer: (serverId: string) =>
-    invoke<void>('chat_mcp_reload_server', { serverId }),
   /** 后台预热 MCP 连接（fire-and-forget）：不传 = 全部启用的 server；结果走 onMcpServerState 推送。 */
   chatMcpWarmup: (serverIds?: string[]) => {
     if (!isTauriRuntime()) return Promise.resolve()
     return invoke<void>('chat_mcp_warmup', { serverIds })
   },
-  chatSkillsList: (skillScanPaths?: string[]) =>
+  chatSkillsList: (skillScanPaths?: string[], projectCwd?: string) =>
     invoke<{ success: boolean; skills: SkillMeta[]; warnings?: string[]; error?: string | null }>(
       'chat_skills_list',
-      { skillScanPaths },
+      { skillScanPaths, projectCwd },
     ),
-  chatSkillsRead: (skillId: string) =>
+  chatSkillsRead: (skillId: string, projectCwd?: string) =>
     invoke<{ success: boolean; skill?: SkillDetail | null; error?: string | null }>(
       'chat_skills_read',
-      { skillId },
+      { skillId, projectCwd },
     ),
   chatSkillsImport: (path: string) =>
     invoke<{ success: boolean; skill?: SkillMeta | null; error?: string | null }>(
@@ -2376,17 +2470,6 @@ export const api = {
     skipped = false,
   ) =>
     invoke<void>('chat_submit_user_choice', { toolCallId, answers, skipped }),
-  chatPythonComplete: (
-    runId: string,
-    content: string,
-    isError: boolean,
-    artifacts: ChatToolArtifact[] = [],
-  ) =>
-    invoke<void>('chat_python_complete', { runId, content, isError, artifacts }),
-  onChatRunPython: (listener: (payload: ChatRunPythonPayload) => void) => {
-    if (!isTauriRuntime()) return Promise.resolve(() => {})
-    return subscribeChatPython(listener)
-  },
   onChatAssistantsChanged: (listener: (assistantId: string) => void) => {
     if (!isTauriRuntime()) return Promise.resolve(() => {})
     return on<string>('chat-assistants-changed', (payload) => listener(payload))

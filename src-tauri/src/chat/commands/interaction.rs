@@ -7,7 +7,6 @@ use tokio::time::{sleep, timeout};
 use crate::chat::agent::execute::truncate_chars;
 use crate::chat::attachments::{compose_text_attachments_for_api, TextAttachmentInput};
 use crate::chat::{AgentPlanState, ChatMessageSegment, Conversation, ToolCallRecord};
-use crate::mcp::types::ChatToolArtifact;
 use crate::state::AppState;
 
 use super::catalog::strip_transcripts_for_frontend;
@@ -158,8 +157,9 @@ pub(crate) fn chat_confirm_tool_call(
                 .filter(|mode| !mode.is_empty()),
         });
         crate::chat::protocol::withdraw_tool_approval(&app, &tool_call_id);
+        return Ok(());
     }
-    Ok(())
+    Err("这条审批已经失效".to_string())
 }
 
 /// 返回开发者「请求调试」缓冲快照（最新在前）。仅内存，未开启开关时通常为空。
@@ -400,8 +400,8 @@ pub(crate) fn chat_submit_user_choice(
 ///   - **内置 agent 循环** → 放进 `pending_chat_steering` 信箱，`run_agent_loop` 在下一个轮次
 ///     边界取走（`chat::agent::steering`）。
 ///   - **外部 CLI** → 把 `SessionCommand::Steer` 送进常驻会话的 actor，由各协议自己决定：
-///     codex 走 `turn/steer`（真注入，不中断）；claude 的 stream-json 输入是**顺序**处理的、
-///     没有注入原语，ACP 也没有 —— 那两条会回 false。
+///     codex 走 `turn/steer`（真注入，不中断）；dsh 走 `session/steer` → `agent.steer()`；
+///     claude 的 stream-json 输入是**顺序**处理的、没有注入原语，ACP 也没有 —— 那两条会回 false。
 ///
 /// 返回 `false` = 没进去（此刻没有在跑的轮次 / 该协议不支持 / 对端拒绝），前端据此把这条留在
 /// 队列里，按普通消息在轮末发出去。注意「进去了」不等于「已生效」：真正生效的信号是那张
@@ -426,6 +426,8 @@ pub(crate) async fn chat_steer_message(
                 crate::external_agents::session::live::SessionCommand::Steer {
                     id: message.id,
                     text: message.text,
+                    images: Vec::new(),
+                    kind: crate::external_agents::session::live::MessageInjectionKind::Steer,
                     accepted: accepted_tx,
                 },
             )
@@ -440,30 +442,73 @@ pub(crate) async fn chat_steer_message(
     Ok(state.push_chat_steering(&conversation_id, message))
 }
 
-/// 前端 Pyodide 执行完成后回传结果。
+/// 原生 follow-up：把消息排到当前运行结束后，由同一个常驻会话 / 内置循环继续处理。
+///
+/// 外部 CLI：Pi RPC `follow_up`；dsh 官方 `session/prompt` → `agent.followup()`。
+/// 内置 Kivio Agent / Chat：放进 `pending_chat_follow_up` 信箱，终答边界注入（不打断工具循环）。
+/// 空闲（没有在飞轮次）时回 false，前端再按普通新轮发出。
+///
+/// 返回 false 时前端保留本地队列，轮末按普通消息发送；只有对端明确响应 success 才返回 true。
 #[tauri::command]
-pub(crate) fn chat_python_complete(
-    app: AppHandle,
-    state: State<AppState>,
-    run_id: String,
+pub(crate) async fn chat_follow_up_message(
+    state: State<'_, AppState>,
+    conversation_id: String,
+    follow_up_id: String,
     content: String,
-    is_error: bool,
-    artifacts: Option<Vec<ChatToolArtifact>>,
-) -> Result<(), String> {
-    let pending = state
-        .pending_python_runs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(&run_id);
-    if let Some(pending) = pending {
-        crate::chat::protocol::detach_python_request(&app, &run_id);
-        let _ = pending.sender.send(crate::mcp::types::PythonRunResult {
-            content,
-            is_error,
-            artifacts: artifacts.unwrap_or_default(),
-        });
+    attachments: Vec<String>,
+    text_attachments: Option<Vec<TextAttachmentInput>>,
+) -> Result<bool, String> {
+    let mut content =
+        compose_text_attachments_for_api(&content, &text_attachments.unwrap_or_default());
+    let paths: Vec<std::path::PathBuf> = attachments.into_iter().map(Into::into).collect();
+    let (image_paths, file_paths): (Vec<_>, Vec<_>) = paths
+        .into_iter()
+        .partition(|path| crate::external_agents::attachments::image_mime_for_path(path).is_some());
+    if let Some((control, image_mime_whitelist)) =
+        state.external_follow_up_live_session(&conversation_id)
+    {
+        let (images, degraded_images) = crate::external_agents::attachments::load_image_blocks(
+            &image_paths,
+            image_mime_whitelist,
+        );
+        content.push_str(&crate::external_agents::attachments::image_paths_note(
+            &degraded_images,
+        ));
+        content.push_str(&crate::external_agents::attachments::file_attachments_note(
+            &file_paths,
+        ));
+        if content.trim().is_empty() && images.is_empty() {
+            return Ok(false);
+        }
+        let text = crate::chat::agent::SteeringMessage::new(follow_up_id.clone(), &content)
+            .map(|message| message.text)
+            .unwrap_or_default();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let sent = control
+            .send(
+                crate::external_agents::session::live::SessionCommand::Steer {
+                    id: follow_up_id,
+                    text,
+                    images,
+                    kind: crate::external_agents::session::live::MessageInjectionKind::FollowUp,
+                    accepted: accepted_tx,
+                },
+            )
+            .await
+            .is_ok();
+        if !sent {
+            return Ok(false);
+        }
+        return Ok(accepted_rx.await.unwrap_or(false));
     }
-    Ok(())
+    // 内置循环只接文本（含虚拟文本附件）。磁盘/图片走轮末普通发送，避免静默丢附件。
+    if !image_paths.is_empty() || !file_paths.is_empty() {
+        return Ok(false);
+    }
+    let Some(message) = crate::chat::agent::SteeringMessage::new(follow_up_id, &content) else {
+        return Ok(false);
+    };
+    Ok(state.push_chat_follow_up(&conversation_id, message))
 }
 
 pub(super) fn emit_chat_plan_state(
@@ -609,8 +654,10 @@ pub(crate) async fn request_tool_approval_outcome(
             sensitivity: "sensitive".to_string(),
         },
     );
+    // 墙钟超时会把晚到的「允许」变成 Codex 的 `Rejected("rejected by user")`：卡片撤了，
+    // 点允许是空操作。原生 CLI 一直等到用户点或取消，这里对齐。
     let result = tokio::select! {
-        result = timeout(Duration::from_secs(60), rx) => result,
+        result = rx => result,
         _ = wait_for_chat_cancel(state, conversation_id, generation) => {
             let mut pending = state
                 .pending_chat_tool_approvals
@@ -623,17 +670,14 @@ pub(crate) async fn request_tool_approval_outcome(
         }
     };
     match result {
-        Ok(Ok(value)) => value,
-        _ => {
+        Ok(value) => value,
+        Err(_) => {
             let mut pending = state
                 .pending_chat_tool_approvals
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             pending.remove(&record.id);
             drop(pending);
-            // 超时/通道断开 ⇒ 这条已经按拒绝处理了。必须把卡片撤掉，否则用户回来点
-            // 「允许」是个静默空操作（`chat_confirm_tool_call` 找不到条目就直接 Ok），
-            // 他会以为自己批准了，而工具早就被拒了。
             withdraw_tool_confirm(app, &record.id);
             crate::state::ToolApprovalOutcome::default()
         }
@@ -873,6 +917,52 @@ pub(super) fn format_tool_approval_summary(record: &ToolCallRecord) -> ToolAppro
                 target: None,
                 detail: String::new(),
             };
+        }
+        "request_permissions" | "permissions" => {
+            if let Some(cwd) = field(&["cwd", "working_directory"]) {
+                target = Some(cwd.clone());
+                lines.push(format!("Working directory: {cwd}"));
+            }
+            if let Some(reason) = field(&["reason"]) {
+                if target.is_none() {
+                    target = Some(truncate_chars(&reason, 120));
+                }
+                lines.push(reason);
+            }
+            if parsed
+                .as_ref()
+                .and_then(|value| value.pointer("/permissions/network/enabled"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                lines.push("Network access".to_string());
+            }
+            if let Some(writes) = parsed
+                .as_ref()
+                .and_then(|value| value.pointer("/permissions/fileSystem/write"))
+                .and_then(Value::as_array)
+            {
+                for path in writes.iter().filter_map(Value::as_str) {
+                    lines.push(format!("Write: {path}"));
+                }
+            }
+            if let Some(entries) = parsed
+                .as_ref()
+                .and_then(|value| value.pointer("/permissions/fileSystem/entries"))
+                .and_then(Value::as_array)
+            {
+                for entry in entries {
+                    let access = entry
+                        .get("access")
+                        .and_then(Value::as_str)
+                        .unwrap_or("access");
+                    if let Some(kind) = entry.pointer("/path/value/kind").and_then(Value::as_str) {
+                        lines.push(format!("{access}: {kind}"));
+                    } else if let Some(path) = entry.pointer("/path/path").and_then(Value::as_str) {
+                        lines.push(format!("{access}: {path}"));
+                    }
+                }
+            }
         }
         _ => {}
     }

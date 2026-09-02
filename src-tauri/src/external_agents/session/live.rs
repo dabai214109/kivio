@@ -15,6 +15,13 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::external_agents::types::UnifiedAgentEvent;
 
+/// How long an unused live CLI **process** may sit before the sweeper drops it.
+///
+/// This is only a memory cap. The native session id stays on disk (`live-*.json`) and
+/// the next turn — 40 minutes later, or after the app restarts — must `thread/resume`
+/// / `--resume` that same id. Do not treat this TTL as a context lifetime.
+pub const LIVE_SESSION_IDLE_TTL: Duration = Duration::from_secs(600);
+
 /// 一条待用户答复的工具审批询问（claude 的 `control_request` / `can_use_tool`）。
 ///
 /// 会话侧只负责把它送出去、并在收到 `ApprovalDecision` 后回一条 `control_response`；
@@ -70,6 +77,12 @@ pub struct ApprovalBridge {
     pub decisions: mpsc::Receiver<ApprovalDecision>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MessageInjectionKind {
+    Steer,
+    FollowUp,
+}
+
 /// A command sent to a live session's actor task.
 pub enum SessionCommand {
     /// Run one turn: write the prompt, stream `UnifiedAgentEvent`s into `events`, and report the
@@ -80,6 +93,9 @@ pub enum SessionCommand {
         reasoning: Option<String>,
         /// 本轮用户消息的原生图片块（ACP → image content block；Codex → localImage 临时文件）。空=无图。
         images: Vec<crate::external_agents::attachments::ImageBlock>,
+        /// Codex `workspace-write` 默认锁在 cwd：附件目录 / 临时图片必须作为
+        /// `runtimeWorkspaceRoots` 下发，否则 CLI 读不到。其它协议忽略。
+        extra_writable_roots: Vec<String>,
         events: mpsc::Sender<UnifiedAgentEvent>,
         done: oneshot::Sender<Result<(), String>>,
         /// 本轮的权限审批通道。`None` = 宿主不接权限询问（未启用 / 协议不支持）⇒ 会话对
@@ -88,9 +104,11 @@ pub enum SessionCommand {
     },
     /// Interrupt the in-flight turn without killing the process (protocol-level interrupt).
     Cancel,
-    /// 运行中注入一条用户消息（steering）：不中断在飞的轮次，让 CLI 带着新指示继续。
+    /// 运行中注入一条用户消息：不中断在飞的轮次。
     ///
-    /// `accepted` 回 true 只表示**协议层受理了**（codex 的 `turn/steer` 返回了 result）。
+    /// `kind` 区分立刻引导（当前轮）与 follow-up（下一轮）。`accepted` 回 true 只表示
+    /// 协议层受理了（codex `turn/steer`、Pi `steer` / `follow_up`、dsh `session/steer` /
+    /// `session/prompt`）。
     /// 回 false 的情形都要让调用方把这条消息留在队列里、按普通消息在轮末发出去：
     /// 轮次之间没有可注入的对象、该 CLI 的协议不支持、或者对端明确拒绝
     /// （codex 的 review / compact 轮次不可 steer）。**绝不能悄悄吞掉**。
@@ -98,6 +116,8 @@ pub enum SessionCommand {
         /// 前端生成的 id，原样回到 `user_steer` 卡上供前端对账出队。
         id: String,
         text: String,
+        images: Vec<crate::external_agents::attachments::ImageBlock>,
+        kind: MessageInjectionKind,
         accepted: oneshot::Sender<bool>,
     },
     /// 停止 CLI 侧的一个后台任务（Background tasks 面板的停止按钮）。
@@ -126,9 +146,9 @@ pub const CANCELLED_SESSION_LOST: &str = "__cancelled_session_lost__";
 /// 界面显示一套、会话实际跑另一套，这**违反 spec 第 8 条**（UI 所见必须与会话实际配置一致），
 /// 是功能退步而不是缺功能。指纹变了就换个进程。
 ///
-/// 只有把这些配置放在**启动参数**里的 CLI 需要它（目前只有 claude：`--model` / `--effort` /
-/// `--permission-mode` / `--append-system-prompt-file` 全是启动 flag）。ACP / codex 能在会话内
-/// 改模型与推理档位，指纹恒为 `default()`，永不触发重连，行为不变。
+/// 只有启动时锁死、会话内改不了的配置才进指纹（claude：`--effort` / `--permission-mode`；
+/// Pi：`--model` / `--thinking`；codex：sandbox / approvalPolicy，只在 `thread/start`）。
+/// ACP 能在会话内改相关项，指纹恒为 `default()`。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LaunchConfig {
     /// `model|reasoning|sandbox`，恒可知。
@@ -140,6 +160,20 @@ pub struct LaunchConfig {
 }
 
 impl LaunchConfig {
+    /// Pi receives model/thinking as process launch flags. Empty selection still
+    /// fingerprints as `"|"` so it matches chat-turn fingerprints,
+    /// not `Default` (`flags == ""`).
+    pub fn for_pi(model: Option<&str>, reasoning: Option<&str>) -> Self {
+        Self {
+            flags: format!(
+                "{}|{}",
+                model.unwrap_or_default(),
+                reasoning.unwrap_or_default()
+            ),
+            instructions: None,
+        }
+    }
+
     /// 已建立的会话（`self`，注册时的配置）能否服务配置为 `incoming` 的这一轮。
     pub fn accepts(&self, incoming: &LaunchConfig) -> bool {
         if self.flags != incoming.flags {
@@ -188,6 +222,12 @@ impl TurnBusyGuard {
     pub fn new(busy: Arc<AtomicBool>) -> Self {
         busy.store(true, Ordering::Release);
         Self(busy)
+    }
+
+    pub fn try_new(busy: Arc<AtomicBool>) -> Option<Self> {
+        busy.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| Self(busy))
     }
 }
 
@@ -304,10 +344,23 @@ mod tests {
         assert!(established.accepts(&cfg("opus||", None)));
     }
 
-    /// 非 claude 协议指纹恒为默认值 ⇒ 永不触发重连，既有行为不变。
+    /// 两边都是默认指纹时互相接受（ACP 仍走这条）。
     #[test]
     fn default_launch_config_always_accepts() {
         assert!(LaunchConfig::default().accepts(&LaunchConfig::default()));
+    }
+
+    #[test]
+    fn pi_launch_config_matches_chat_turns_even_with_empty_selection() {
+        let idle = LaunchConfig::for_pi(None, None);
+        assert_eq!(idle.flags, "|");
+        assert_ne!(idle, LaunchConfig::default());
+        assert!(idle.accepts(&LaunchConfig::for_pi(None, None)));
+        assert!(!LaunchConfig::default().accepts(&idle));
+        assert!(LaunchConfig::for_pi(Some("opus"), Some("high"))
+            .accepts(&LaunchConfig::for_pi(Some("opus"), Some("high"))));
+        assert!(!LaunchConfig::for_pi(Some("opus"), Some("high"))
+            .accepts(&LaunchConfig::for_pi(Some("opus"), Some("low"))));
     }
 
     /// 轮内重连之后，guard 必须重新挂到**新**会话上。
@@ -343,6 +396,19 @@ mod tests {
             new_session.is_idle(Duration::from_secs(0)),
             "guard 落地即清"
         );
+    }
+
+    #[test]
+    fn a_control_guard_cannot_clear_an_existing_turn_guard() {
+        let (session, _rx) = make("pi", "/proj");
+        let turn_guard = TurnBusyGuard::new(session.busy.clone());
+        assert!(TurnBusyGuard::try_new(session.busy.clone()).is_none());
+        assert!(session.busy.load(Ordering::Acquire));
+        drop(turn_guard);
+        let control_guard = TurnBusyGuard::try_new(session.busy.clone()).expect("idle session");
+        assert!(session.busy.load(Ordering::Acquire));
+        drop(control_guard);
+        assert!(!session.busy.load(Ordering::Acquire));
     }
 
     #[test]

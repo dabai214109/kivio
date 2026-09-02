@@ -86,6 +86,8 @@ type ShelfId = ConversationLibraryShelf
 
 interface SessionCenterProps {
   lang: Lang
+  /** 嵌在设置页里时隐藏与设置标题重复的 h1 */
+  embedded?: boolean
   currentConversationId?: string
   generatingConversationIds?: ReadonlySet<string>
   onSelectConversation: (id: string, conversation?: ConversationSearchHit) => void
@@ -102,8 +104,11 @@ interface LibraryState {
   error: string
 }
 
+export type { SessionCenterProps }
+
 export function SessionCenter({
   lang,
+  embedded = false,
   currentConversationId,
   generatingConversationIds = new Set(),
   onSelectConversation,
@@ -415,6 +420,25 @@ export function SessionCenter({
     [currentConversationId, loadPage, notify, onConversationDeleted],
   )
 
+  const regenerateTitle = useCallback(
+    async (id: string) => {
+      setBusy(true)
+      setMenu(null)
+      try {
+        await chatApi.regenerateConversationTitle(id)
+        notify()
+        await loadPage({ append: false })
+      } catch (err) {
+        window.alert(
+          t.chatRegenerateTitleFailed + (err instanceof Error ? err.message : String(err)),
+        )
+      } finally {
+        setBusy(false)
+      }
+    },
+    [loadPage, notify, t],
+  )
+
   const deleteOne = useCallback(
     async (id: string) => {
       if (!window.confirm(t.chatDeleteConversationConfirm)) return
@@ -542,9 +566,7 @@ export function SessionCenter({
   const shelfNavVertical = (
     <>
       <nav className="flex flex-col gap-0.5">
-        <div className="mb-1 px-2 text-[11px] font-medium uppercase tracking-wide text-neutral-400">
-          {t.chatLibShelf}
-        </div>
+        <div className="mb-1 px-2 text-[12px] text-neutral-400">{t.chatLibShelf}</div>
         {shelves.map(({ id, label, icon: Icon }) => {
           const active = shelf === id && !projectId && !setId
           return (
@@ -554,8 +576,8 @@ export function SessionCenter({
               onClick={() => pickShelf(id)}
               className={`flex items-center gap-2 rounded-md px-2 py-1.5 text-left text-[13px] transition-colors ${
                 active
-                  ? 'bg-neutral-100 font-medium text-neutral-900 dark:bg-neutral-800 dark:text-neutral-50'
-                  : 'text-neutral-600 hover:bg-neutral-50 dark:text-neutral-300 dark:hover:bg-neutral-900'
+                  ? 'bg-neutral-100 font-medium text-neutral-900 dark:bg-white/[0.08] dark:text-neutral-50'
+                  : 'text-neutral-600 hover:bg-neutral-50 dark:text-neutral-300 dark:hover:bg-white/[0.05]'
               }`}
             >
               <Icon size={14} className="shrink-0 opacity-70" />
@@ -567,7 +589,7 @@ export function SessionCenter({
 
       {sets.length > 0 && (
         <nav className="flex flex-col gap-0.5">
-          <div className="mb-1 flex items-center gap-1 px-2 text-[11px] font-medium uppercase tracking-wide text-neutral-400">
+          <div className="mb-1 flex items-center gap-1 px-2 text-[12px] text-neutral-400">
             <Layers size={11} /> {t.chatTabSets}
           </div>
           {sets.map((s) => {
@@ -579,8 +601,8 @@ export function SessionCenter({
                 onClick={() => pickSet(active ? null : s.id)}
                 className={`truncate rounded-md px-2 py-1.5 text-left text-[13px] transition-colors ${
                   active
-                    ? 'bg-neutral-100 font-medium text-neutral-900 dark:bg-neutral-800 dark:text-neutral-50'
-                    : 'text-neutral-600 hover:bg-neutral-50 dark:text-neutral-300 dark:hover:bg-neutral-900'
+                    ? 'bg-neutral-100 font-medium text-neutral-900 dark:bg-white/[0.08] dark:text-neutral-50'
+                    : 'text-neutral-600 hover:bg-neutral-50 dark:text-neutral-300 dark:hover:bg-white/[0.05]'
                 }`}
               >
                 {s.name}
@@ -592,7 +614,7 @@ export function SessionCenter({
 
       {projects.length > 0 && (
         <nav className="flex flex-col gap-0.5">
-          <div className="mb-1 flex items-center gap-1 px-2 text-[11px] font-medium uppercase tracking-wide text-neutral-400">
+          <div className="mb-1 flex items-center gap-1 px-2 text-[12px] text-neutral-400">
             <FolderKanban size={11} /> {t.chatTabProjects}
           </div>
           {projects.map((p) => {
@@ -604,8 +626,8 @@ export function SessionCenter({
                 onClick={() => pickProject(active ? null : p.id)}
                 className={`truncate rounded-md px-2 py-1.5 text-left text-[13px] transition-colors ${
                   active
-                    ? 'bg-neutral-100 font-medium text-neutral-900 dark:bg-neutral-800 dark:text-neutral-50'
-                    : 'text-neutral-600 hover:bg-neutral-50 dark:text-neutral-300 dark:hover:bg-neutral-900'
+                    ? 'bg-neutral-100 font-medium text-neutral-900 dark:bg-white/[0.08] dark:text-neutral-50'
+                    : 'text-neutral-600 hover:bg-neutral-50 dark:text-neutral-300 dark:hover:bg-white/[0.05]'
                 }`}
               >
                 {p.name}
@@ -621,7 +643,7 @@ export function SessionCenter({
     `shrink-0 rounded-full px-2.5 py-1 text-[12px] transition-colors ${
       active
         ? 'bg-neutral-900 font-medium text-white dark:bg-neutral-100 dark:text-neutral-900'
-        : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200 dark:bg-neutral-800 dark:text-neutral-300 dark:hover:bg-neutral-700'
+        : 'bg-neutral-100 text-neutral-600 hover:bg-neutral-200 dark:bg-white/[0.06] dark:text-neutral-300 dark:hover:bg-white/[0.1]'
     }`
 
   return (
@@ -629,55 +651,123 @@ export function SessionCenter({
       ref={rootRef}
       className="assistant-center-root flex h-full min-h-0 flex-col text-neutral-900 dark:text-neutral-100"
     >
-      {/* Header */}
-      <div
-        className={`shrink-0 border-b border-neutral-200 pb-3 pt-5 dark:border-neutral-800 ${
-          compactPad ? 'px-3' : 'px-6 pb-4 pt-6'
-        }`}
-      >
-        <div className="mx-auto flex w-full max-w-[1200px] items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
+      <div className={`shrink-0 ${compactPad ? 'px-3 pb-2.5 pt-4' : 'px-6 pb-3 pt-5'} ${embedded ? '!pt-1' : ''}`}>
+        <div className="mx-auto flex w-full max-w-[1200px] items-center justify-between gap-3">
+          {embedded ? (
+            <span className="text-[12px] tabular-nums text-neutral-400">
+              {state.loading
+                ? t.chatLoading
+                : t.chatLibCount.replace('{n}', String(state.total))}
+            </span>
+          ) : (
             <h1
-              className={`flex min-w-0 items-center gap-2 font-semibold tracking-normal text-neutral-950 dark:text-neutral-50 ${
-                compactPad ? 'text-[20px]' : 'gap-2.5 text-[26px]'
+              className={`flex min-w-0 items-center gap-2 font-semibold tracking-tight text-neutral-950 dark:text-neutral-50 ${
+                compactPad ? 'text-[18px]' : 'gap-2.5 text-[22px]'
               }`}
             >
-              <MessagesSquare size={compactPad ? 18 : 22} className="shrink-0 text-neutral-500" />
+              <MessagesSquare size={compactPad ? 17 : 20} className="shrink-0 text-neutral-500" />
               <span className="truncate">{t.chatNavSessions}</span>
             </h1>
-            {!compactPad && (
-              <p className="mt-2 max-w-2xl text-[13.5px] leading-relaxed text-neutral-500 dark:text-neutral-400">
-                {t.chatSessionSubtitle}
-              </p>
-            )}
-          </div>
-          <div className="flex shrink-0 items-center gap-2 pt-0.5">
+          )}
+          <div className="flex shrink-0 items-center gap-2">
+            {!embedded && (
             <span className="hidden text-[12px] tabular-nums text-neutral-400 sm:inline">
               {state.loading
                 ? t.chatLoading
                 : t.chatLibCount.replace('{n}', String(state.total))}
             </span>
+            )}
             <IconButton size="md" label={t.chatSessionRefresh} onClick={() => void loadPage({ append: false })} disabled={state.loading || busy}>
               <RefreshCw size={15} className={state.loading ? 'animate-spin' : ''} />
             </IconButton>
           </div>
         </div>
+      </div>
 
-        {/* Toolbar：Input + Select + Toggle，与技能商店/知识库/设置同一套组件 */}
-        <div className="mx-auto mt-3 flex w-full max-w-[1200px] flex-col gap-2">
-          <div className="relative w-full min-w-0">
-            <Search size={14} className="pointer-events-none absolute left-2.5 top-1/2 z-[1] -translate-y-1/2 text-neutral-400" />
-            <input
-              ref={searchInputRef}
-              type="search"
-              value={searchInput}
-              onChange={(e) => setSearchInput(e.target.value)}
-              placeholder={t.chatSessionSearchPlaceholder}
-              data-tauri-drag-region="false"
-              className="kv-input w-full min-w-0 !pl-8"
-            />
+      {/* Body */}
+      <div
+        ref={bodyRef}
+        className={`mx-auto flex min-h-0 w-full max-w-[1200px] flex-1 flex-col ${
+          compactPad ? 'gap-2 px-2 pb-2' : 'gap-3 px-4 pb-4'
+        }`}
+      >
+        {/* 窄屏：书架 / 集 / 项目 → 横向 chip，不占死 200px */}
+        {shelfAsChips ? (
+          <div className="custom-scrollbar shrink-0 overflow-x-auto">
+            <div className="flex min-w-min items-center gap-1.5">
+              {shelves.map(({ id, label }) => (
+                <button
+                  key={id}
+                  type="button"
+                  onClick={() => pickShelf(id)}
+                  className={chipBtn(shelf === id && !projectId && !setId)}
+                >
+                  {label}
+                </button>
+              ))}
+              {sets.length > 0 && (
+                <>
+                  <span className="mx-0.5 h-4 w-px shrink-0 bg-neutral-200 dark:bg-white/[0.1]" />
+                  {sets.map((s) => (
+                    <button
+                      key={s.id}
+                      type="button"
+                      onClick={() => pickSet(setId === s.id ? null : s.id)}
+                      className={chipBtn(setId === s.id)}
+                    >
+                      {s.name}
+                    </button>
+                  ))}
+                </>
+              )}
+              {projects.length > 0 && (
+                <>
+                  <span className="mx-0.5 h-4 w-px shrink-0 bg-neutral-200 dark:bg-white/[0.1]" />
+                  {projects.map((p) => (
+                    <button
+                      key={p.id}
+                      type="button"
+                      onClick={() => pickProject(projectId === p.id ? null : p.id)}
+                      className={chipBtn(projectId === p.id)}
+                    >
+                      {p.name}
+                    </button>
+                  ))}
+                </>
+              )}
+            </div>
           </div>
-          <div className="flex min-w-0 flex-wrap items-center gap-2.5">
+        ) : null}
+
+        <div className="flex min-h-0 flex-1 overflow-hidden rounded-xl border border-neutral-200 bg-white dark:border-white/[0.08] dark:bg-[var(--bg-input)]">
+        {!shelfAsChips && (
+          <aside
+            className={`custom-scrollbar flex shrink-0 flex-col gap-4 overflow-y-auto border-r border-neutral-200/80 bg-neutral-50/70 px-2 py-3 dark:border-white/[0.07] dark:bg-white/[0.02] ${
+              layout.page < 900 ? 'w-[152px]' : 'w-[176px]'
+            }`}
+          >
+            {shelfNavVertical}
+          </aside>
+        )}
+
+        {/* Main list */}
+        <div
+          ref={tableHostRef}
+          className="flex min-h-0 min-w-0 flex-1 flex-col"
+        >
+          <div className="flex shrink-0 flex-wrap items-center gap-2 border-b border-neutral-100 px-3 py-2 dark:border-white/[0.06]">
+            <div className="relative min-w-[200px] flex-1">
+              <Search size={14} className="pointer-events-none absolute left-2.5 top-1/2 z-[1] -translate-y-1/2 text-neutral-400" />
+              <input
+                ref={searchInputRef}
+                type="search"
+                value={searchInput}
+                onChange={(e) => setSearchInput(e.target.value)}
+                placeholder={t.chatSessionSearchPlaceholder}
+                data-tauri-drag-region="false"
+                className="kv-input w-full min-w-0 !h-[32px] !pl-8"
+              />
+            </div>
             <Select
               className="w-[148px] shrink-0"
               value={`${sort}:${order}`}
@@ -701,86 +791,15 @@ export function SessionCenter({
               onChange={(value) => setDensity(value as ConversationLibraryDensity)}
               options={densityOptions}
             />
-            <div className="flex h-[30px] shrink-0 items-center gap-2 border-l border-neutral-200 pl-3 dark:border-neutral-700">
+            <label className="flex h-[30px] shrink-0 items-center gap-2">
               <Toggle checked={fullText} onChange={setFullText} ariaLabel={t.chatLibFullText} />
               <span className="whitespace-nowrap text-[12.5px] text-neutral-600 dark:text-neutral-300">
                 {t.chatLibFullText}
               </span>
-            </div>
+            </label>
           </div>
-        </div>
-      </div>
-
-      {/* Body */}
-      <div
-        ref={bodyRef}
-        className={`mx-auto flex min-h-0 w-full max-w-[1200px] flex-1 ${
-          shelfAsChips ? 'flex-col' : 'flex-row'
-        } ${compactPad ? 'gap-2 px-2 pb-2 pt-2' : 'gap-0 px-4 pb-4 pt-3'}`}
-      >
-        {/* 窄屏：书架 / 集 / 项目 → 横向 chip，不占死 200px */}
-        {shelfAsChips ? (
-          <div className="custom-scrollbar shrink-0 overflow-x-auto pb-1">
-            <div className="flex min-w-min items-center gap-1.5">
-              {shelves.map(({ id, label }) => (
-                <button
-                  key={id}
-                  type="button"
-                  onClick={() => pickShelf(id)}
-                  className={chipBtn(shelf === id && !projectId && !setId)}
-                >
-                  {label}
-                </button>
-              ))}
-              {sets.length > 0 && (
-                <>
-                  <span className="mx-0.5 h-4 w-px shrink-0 bg-neutral-200 dark:bg-neutral-700" />
-                  {sets.map((s) => (
-                    <button
-                      key={s.id}
-                      type="button"
-                      onClick={() => pickSet(setId === s.id ? null : s.id)}
-                      className={chipBtn(setId === s.id)}
-                    >
-                      {s.name}
-                    </button>
-                  ))}
-                </>
-              )}
-              {projects.length > 0 && (
-                <>
-                  <span className="mx-0.5 h-4 w-px shrink-0 bg-neutral-200 dark:bg-neutral-700" />
-                  {projects.map((p) => (
-                    <button
-                      key={p.id}
-                      type="button"
-                      onClick={() => pickProject(projectId === p.id ? null : p.id)}
-                      className={chipBtn(projectId === p.id)}
-                    >
-                      {p.name}
-                    </button>
-                  ))}
-                </>
-              )}
-            </div>
-          </div>
-        ) : (
-          <aside
-            className={`custom-scrollbar flex shrink-0 flex-col gap-4 overflow-y-auto border-r border-neutral-200 pr-3 dark:border-neutral-800 ${
-              layout.page < 900 ? 'w-[148px]' : 'w-[180px]'
-            }`}
-          >
-            {shelfNavVertical}
-          </aside>
-        )}
-
-        {/* Main list */}
-        <div
-          ref={tableHostRef}
-          className={`flex min-h-0 min-w-0 flex-1 flex-col ${shelfAsChips ? '' : 'pl-3'}`}
-        >
           {selected.size > 0 && (
-            <div className="mb-2 flex flex-wrap items-center gap-1.5 rounded-lg border border-neutral-200 bg-neutral-50 px-2.5 py-2 dark:border-neutral-700 dark:bg-neutral-900/60">
+            <div className="flex shrink-0 flex-wrap items-center gap-1.5 border-b border-neutral-100 bg-neutral-50/90 px-3 py-1.5 dark:border-white/[0.06] dark:bg-white/[0.03]">
               <span className="text-[12.5px] font-medium text-neutral-700 dark:text-neutral-200">
                 {t.chatLibSelected.replace('{n}', String(selected.size))}
               </span>
@@ -798,12 +817,12 @@ export function SessionCenter({
                   {!compactPad && <span>{t.chatLibMoveToSet}</span>}
                 </Button>
                 {moveOpen === 'set' && (
-                  <div className="absolute left-0 top-full z-20 mt-1 max-h-56 w-48 overflow-y-auto rounded-md border border-neutral-200 bg-white py-1 shadow-lg dark:border-neutral-700 dark:bg-neutral-900">
-                    <button type="button" className="block w-full px-3 py-1.5 text-left text-[12.5px] hover:bg-neutral-50 dark:hover:bg-neutral-800" onClick={() => bulkMoveSet(null)}>
+                  <div className="absolute left-0 top-full z-20 mt-1 max-h-56 w-48 overflow-y-auto rounded-md border border-neutral-200 bg-white py-1 shadow-lg dark:border-white/[0.09] dark:bg-[#2a2a2c]">
+                    <button type="button" className="block w-full px-3 py-1.5 text-left text-[12.5px] hover:bg-neutral-50 dark:hover:bg-white/[0.06]" onClick={() => bulkMoveSet(null)}>
                       {t.chatLibClearOwner}
                     </button>
                     {sets.map((s) => (
-                      <button key={s.id} type="button" className="block w-full truncate px-3 py-1.5 text-left text-[12.5px] hover:bg-neutral-50 dark:hover:bg-neutral-800" onClick={() => bulkMoveSet(s.id)}>
+                      <button key={s.id} type="button" className="block w-full truncate px-3 py-1.5 text-left text-[12.5px] hover:bg-neutral-50 dark:hover:bg-white/[0.06]" onClick={() => bulkMoveSet(s.id)}>
                         {s.name}
                       </button>
                     ))}
@@ -816,12 +835,12 @@ export function SessionCenter({
                   {!compactPad && <span>{t.chatLibMoveToProject}</span>}
                 </Button>
                 {moveOpen === 'project' && (
-                  <div className="absolute left-0 top-full z-20 mt-1 max-h-56 w-48 overflow-y-auto rounded-md border border-neutral-200 bg-white py-1 shadow-lg dark:border-neutral-700 dark:bg-neutral-900">
-                    <button type="button" className="block w-full px-3 py-1.5 text-left text-[12.5px] hover:bg-neutral-50 dark:hover:bg-neutral-800" onClick={() => bulkMoveProject(null)}>
+                  <div className="absolute left-0 top-full z-20 mt-1 max-h-56 w-48 overflow-y-auto rounded-md border border-neutral-200 bg-white py-1 shadow-lg dark:border-white/[0.09] dark:bg-[#2a2a2c]">
+                    <button type="button" className="block w-full px-3 py-1.5 text-left text-[12.5px] hover:bg-neutral-50 dark:hover:bg-white/[0.06]" onClick={() => bulkMoveProject(null)}>
                       {t.chatLibClearOwner}
                     </button>
                     {projects.map((p) => (
-                      <button key={p.id} type="button" className="block w-full truncate px-3 py-1.5 text-left text-[12.5px] hover:bg-neutral-50 dark:hover:bg-neutral-800" onClick={() => bulkMoveProject(p.id)}>
+                      <button key={p.id} type="button" className="block w-full truncate px-3 py-1.5 text-left text-[12.5px] hover:bg-neutral-50 dark:hover:bg-white/[0.06]" onClick={() => bulkMoveProject(p.id)}>
                         {p.name}
                       </button>
                     ))}
@@ -846,46 +865,45 @@ export function SessionCenter({
                 <Trash2 size={12} />
                 {!compactPad && <span>{t.chatLibDelete}</span>}
               </Button>
-              <button type="button" className="ml-auto text-[12px] text-neutral-500 hover:text-neutral-800" onClick={clearSelection}>
+              <button type="button" className="ml-auto text-[12px] text-neutral-500 hover:text-neutral-800 dark:text-neutral-400 dark:hover:text-neutral-200" onClick={clearSelection}>
                 {t.chatLibClearSelection}
               </button>
             </div>
           )}
 
           {state.error && (
-            <div className="mb-2 rounded-md border border-red-200 bg-red-50 px-3 py-2 text-[13px] text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300">
+            <div className="shrink-0 border-b border-red-200 bg-red-50 px-3 py-2 text-[13px] text-red-700 dark:border-red-900/50 dark:bg-red-950/30 dark:text-red-300">
               {state.error}
             </div>
           )}
 
+          <div className="flex min-w-0 shrink-0 items-center gap-2 border-b border-neutral-200/70 bg-neutral-50 px-3 py-[7px] text-[12px] font-medium text-neutral-500 dark:border-white/[0.07] dark:bg-white/[0.03] dark:text-neutral-400">
+            <label className="flex w-7 shrink-0 items-center justify-center">
+              <input
+                type="checkbox"
+                checked={state.items.length > 0 && selected.size === state.items.length}
+                onChange={(e) => (e.target.checked ? selectAllVisible() : clearSelection())}
+                className="rounded"
+              />
+            </label>
+            <span className="min-w-0 flex-1 truncate">{t.chatLibColTitle}</span>
+            {cols.model && (
+              <span className="w-24 shrink-0 truncate">{t.chatLibColModel}</span>
+            )}
+            {cols.owner && (
+              <span className="w-24 shrink-0 truncate">{t.chatLibColOwner}</span>
+            )}
+            {cols.msgs && (
+              <span className="w-12 shrink-0 text-right">{t.chatLibColMsgs}</span>
+            )}
+            <span className="w-14 shrink-0 text-right">{t.chatLibColTime}</span>
+            <span className="w-8 shrink-0" />
+          </div>
           <div
             ref={listRef}
             onScroll={onScrollList}
-            className="custom-scrollbar min-h-0 flex-1 overflow-x-hidden overflow-y-auto rounded-xl border border-neutral-200 bg-white dark:border-neutral-800 dark:bg-neutral-950/40"
+            className="custom-scrollbar min-h-0 flex-1 overflow-x-hidden overflow-y-auto"
           >
-            {/* Column header — 列显隐跟表格宽度，标题强制单行 truncate；禁止视口 sm: 再撑开 */}
-            <div className="sticky top-0 z-10 flex min-w-0 items-center gap-2 border-b border-neutral-100 bg-neutral-50/95 px-3 py-2 text-[11px] font-medium uppercase tracking-wide text-neutral-400 backdrop-blur dark:border-neutral-800 dark:bg-neutral-900/95">
-              <label className="flex w-7 shrink-0 items-center justify-center">
-                <input
-                  type="checkbox"
-                  checked={state.items.length > 0 && selected.size === state.items.length}
-                  onChange={(e) => (e.target.checked ? selectAllVisible() : clearSelection())}
-                  className="rounded"
-                />
-              </label>
-              <span className="min-w-0 flex-1 truncate">{t.chatLibColTitle}</span>
-              {cols.model && (
-                <span className="w-24 shrink-0 truncate">{t.chatLibColModel}</span>
-              )}
-              {cols.owner && (
-                <span className="w-24 shrink-0 truncate">{t.chatLibColOwner}</span>
-              )}
-              {cols.msgs && (
-                <span className="w-12 shrink-0 text-right">{t.chatLibColMsgs}</span>
-              )}
-              <span className="w-14 shrink-0 text-right">{t.chatLibColTime}</span>
-              <span className="w-8 shrink-0" />
-            </div>
 
             {state.loading && state.items.length === 0 ? (
               <div className="flex flex-col gap-2 p-4">
@@ -894,20 +912,18 @@ export function SessionCenter({
                 ))}
               </div>
             ) : state.items.length === 0 ? (
-              <div className="flex flex-col items-center justify-center px-6 py-20 text-center">
-                <div className="flex h-14 w-14 items-center justify-center rounded-md bg-neutral-100 text-neutral-400 dark:bg-neutral-800">
-                  <MessagesSquare size={28} strokeWidth={1.5} />
-                </div>
-                <p className="mt-4 text-[15px] font-medium text-neutral-700 dark:text-neutral-200">
+              <div className="flex flex-col items-center justify-center px-6 py-16 text-center">
+                <MessagesSquare size={22} strokeWidth={1.5} className="text-neutral-300 dark:text-neutral-600" />
+                <p className="mt-3 text-[13.5px] text-neutral-500">
                   {debouncedQ ? t.chatSessionEmptySearch : t.chatSessionEmpty}
                 </p>
-                <p className="mt-1.5 max-w-sm text-[13px] text-neutral-500">{t.chatLibEmptyHint}</p>
+                <p className="mt-1 max-w-sm text-[12.5px] text-neutral-400">{t.chatLibEmptyHint}</p>
               </div>
             ) : (
               grouped.map((group) => (
                 <div key={group.key}>
                   {group.label && (
-                    <div className="sticky top-[33px] z-[5] border-b border-neutral-100 bg-neutral-50/90 px-3 py-1.5 text-[11px] font-medium text-neutral-500 backdrop-blur dark:border-neutral-800 dark:bg-neutral-900/90">
+                    <div className="sticky top-0 z-[5] border-b border-neutral-100 bg-white/95 px-3 py-1.5 text-[12px] font-medium text-neutral-500 backdrop-blur dark:border-white/[0.06] dark:bg-[var(--bg-input)]/95">
                       {group.label}
                       <span className="ml-1.5 tabular-nums text-neutral-400">{group.items.length}</span>
                     </div>
@@ -929,9 +945,9 @@ export function SessionCenter({
                         onKeyDown={(e: ReactKeyboardEvent) => {
                           if (e.key === 'Enter') onSelectConversation(c.id, c)
                         }}
-                        className={`group flex cursor-pointer items-center gap-2 border-b border-neutral-50 px-3 ${rowPad} transition-colors hover:bg-neutral-50 dark:border-neutral-900 dark:hover:bg-neutral-900/50 ${
-                          isSel ? 'bg-sky-50/80 dark:bg-sky-950/20' : ''
-                        } ${isCurrent ? 'ring-1 ring-inset ring-sky-200 dark:ring-sky-900' : ''}`}
+                        className={`group flex cursor-pointer items-center gap-2 border-b border-neutral-50 px-3 ${rowPad} transition-colors hover:bg-neutral-50 dark:border-white/[0.04] dark:hover:bg-white/[0.04] ${
+                          isSel ? 'bg-sky-50/80 dark:bg-[var(--accent-soft)]' : ''
+                        } ${isCurrent ? 'ring-1 ring-inset ring-sky-200 dark:ring-white/15' : ''}`}
                       >
                         <label data-row-chrome className="flex w-7 shrink-0 items-center justify-center" onClick={(e) => e.stopPropagation()}>
                           <input
@@ -961,7 +977,7 @@ export function SessionCenter({
                                     void patchOne(c.id, { title: renameDraft.trim() })
                                   } else setRenameId(null)
                                 }}
-                                className="min-w-0 flex-1 rounded border border-neutral-300 bg-white px-1.5 py-0.5 text-[13px] dark:border-neutral-600 dark:bg-neutral-900"
+                                className="min-w-0 flex-1 rounded border border-neutral-300 bg-white px-1.5 py-0.5 text-[13px] dark:border-[var(--border-input)] dark:bg-[var(--bg-hover)]"
                               />
                             ) : (
                               <span className="min-w-0 truncate text-[13.5px] font-medium text-neutral-900 dark:text-neutral-50">
@@ -1009,7 +1025,7 @@ export function SessionCenter({
                         <button
                           data-row-chrome
                           type="button"
-                          className="grid size-8 shrink-0 place-items-center rounded-md text-neutral-400 opacity-60 hover:bg-neutral-100 hover:text-neutral-700 group-hover:opacity-100 dark:hover:bg-neutral-800"
+                          className="grid size-8 shrink-0 place-items-center rounded-md text-neutral-400 opacity-60 hover:bg-neutral-100 hover:text-neutral-700 group-hover:opacity-100 dark:text-neutral-500 dark:hover:bg-white/[0.08] dark:hover:text-neutral-200"
                           onClick={(e) => {
                             e.stopPropagation()
                             const rect = (e.currentTarget as HTMLElement).getBoundingClientRect()
@@ -1035,12 +1051,13 @@ export function SessionCenter({
             {!state.loading && !state.loadingMore && hasMore && (
               <button
                 type="button"
-                className="w-full py-2.5 text-center text-[12.5px] text-neutral-500 hover:bg-neutral-50 dark:hover:bg-neutral-900"
+                className="w-full py-2.5 text-center text-[12.5px] text-neutral-500 hover:bg-neutral-50 dark:hover:bg-white/[0.04]"
                 onClick={() => void loadPage({ append: true })}
               >
                 {t.chatLibLoadMore}
               </button>
             )}
+          </div>
           </div>
         </div>
       </div>
@@ -1050,7 +1067,7 @@ export function SessionCenter({
         <>
           <div className="fixed inset-0 z-40" onClick={() => setMenu(null)} />
           <div
-            className="fixed z-50 w-[180px] rounded-lg border border-neutral-200 bg-white py-1 shadow-xl dark:border-neutral-700 dark:bg-neutral-900"
+            className="fixed z-50 w-[180px] rounded-lg border border-neutral-200 bg-white py-1 shadow-xl dark:border-white/[0.09] dark:bg-[#2a2a2c]"
             style={{ left: menu.x, top: menu.y }}
           >
             <MenuItem
@@ -1065,6 +1082,12 @@ export function SessionCenter({
                 setRenameDraft(menuConv.title)
                 setMenu(null)
               }}
+            />
+            <MenuItem
+              label={t.chatRegenerateTitle}
+              icon={<RefreshCw size={13} />}
+              disabled={(menuConv.message_count ?? 0) === 0 || busy}
+              onClick={() => void regenerateTitle(menuConv.id)}
             />
             <MenuItem
               label={menuConv.archived ? t.chatLibUnarchive : t.chatLibArchive}
@@ -1086,7 +1109,7 @@ export function SessionCenter({
                 })()
               }}
             />
-            <div className="my-1 border-t border-neutral-100 dark:border-neutral-800" />
+            <div className="my-1 border-t border-neutral-100 dark:border-white/[0.07]" />
             <MenuItem
               label={t.chatLibDelete}
               danger
@@ -1105,18 +1128,21 @@ function MenuItem({
   onClick,
   icon,
   danger,
+  disabled,
 }: {
   label: string
   onClick: () => void
   icon?: React.ReactNode
   danger?: boolean
+  disabled?: boolean
 }) {
   // icon optional
   return (
     <button
       type="button"
       onClick={onClick}
-      className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] hover:bg-neutral-50 dark:hover:bg-neutral-800 ${
+      disabled={disabled}
+      className={`flex w-full items-center gap-2 px-3 py-1.5 text-left text-[13px] hover:bg-neutral-50 disabled:cursor-default disabled:opacity-40 dark:hover:bg-white/[0.06] ${
         danger ? 'text-red-600 dark:text-red-400' : 'text-neutral-700 dark:text-neutral-200'
       }`}
     >

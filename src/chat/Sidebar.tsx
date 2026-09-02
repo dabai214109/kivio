@@ -1,19 +1,19 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from 'react'
 import { createPortal } from 'react-dom'
 import { save } from '@tauri-apps/plugin-dialog'
 import {
-  ChevronDown,
   ChevronRight,
   Folder,
   FolderPlus,
   Layers,
   LayoutGrid,
   MoreHorizontal,
-  MessagesSquare,
   NotebookPen,
   Plus,
   Search,
+  Settings,
   SquarePen,
+  Workflow,
 } from 'lucide-react'
 import type { ChatAssistant, ChatProject, ChatSet, ConversationListItem, ConversationSearchHit } from './types'
 import { HighlightText } from './searchHighlight'
@@ -34,13 +34,14 @@ import { useInsertionReorder } from '../utils/insertionReorder'
 import { applyConversationPins, withPinAt, type ConversationPin } from './conversationPins'
 import { ChatTitlebarActions } from './ChatTitlebarActions'
 import { chatTitlebarMacInsetClass, isMac, usesNativeTitlebar } from './platform'
+import { clampSidebarWidth, SIDEBAR_DEFAULT_WIDTH } from './persistence'
 import { useChatPerfRenderProbe } from './chatPerformanceProbe'
 import type { ConversationMenuAnchor } from './ConversationContextMenu'
 import type { ChatUserProfile } from './types'
 import { UserAvatar } from './UserAvatar'
 import { i18n, useT, type I18n, type Lang } from '../settings/i18n'
 import { conversationMarkdownFilename } from './conversationExport'
-import { isProvisionalTitle } from './conversationTitle'
+import { displayConversationTitle, isPlaceholderTitle, isProvisionalTitle } from './conversationTitle'
 import { SwapTitle } from './SwapTitle'
 
 function resolveChatUserProfile(
@@ -54,7 +55,7 @@ function resolveChatUserProfile(
 
 const modLabel = isMac ? '⌘' : 'Ctrl'
 
-export type ExtensionsNavItem = 'assistants' | 'skill' | 'mcp' | 'knowledge' | 'notes' | 'sessions'
+export type ExtensionsNavItem = 'assistants' | 'skill' | 'mcp' | 'knowledge' | 'notes' | 'automations'
 
 /**
  * 点击会话时要同步切换的侧栏导航上下文。
@@ -77,7 +78,7 @@ const extensionSubItems: Array<{
   { id: 'mcp', label: () => 'MCP', icon: McpIcon },
   { id: 'knowledge', label: (t) => t.chatNavKnowledge, icon: KnowledgeIcon },
   { id: 'notes', label: (t) => t.chatNavNotes, icon: (props) => <NotebookPen size={props.size} className={props.className} strokeWidth={1.75} /> },
-  { id: 'sessions', label: (t) => t.chatNavSessions, icon: (props) => <MessagesSquare size={props.size} className={props.className} strokeWidth={1.75} /> },
+  { id: 'automations', label: (t) => t.chatNavAutomations, icon: (props) => <Workflow size={props.size} className={props.className} strokeWidth={1.75} /> },
 ]
 
 const PROJECT_PREVIEW_LIMIT = 5
@@ -131,7 +132,7 @@ function partitionPinnedFirst(
 function conversationMatchesSearch(conversation: ConversationListItem, query: string): boolean {
   if (!query) return true
   return (
-    conversation.title.toLowerCase().includes(query) ||
+    displayConversationTitle(conversation.title, conversation.preview).toLowerCase().includes(query) ||
     conversation.preview.toLowerCase().includes(query)
   )
 }
@@ -199,6 +200,7 @@ export interface SidebarProps {
     scope?: ConversationSelectionScope,
   ) => void
   onNewConversation: () => void
+  onOpenInPopout?: (conversationId: string) => void | Promise<void>
   onConversationDeleted?: (id: string) => void
   onForceDropConversation?: (id: string) => void
   /** 真实会话列表 refetch 落地后回调（父组件据此剪枝乐观条目，见 visibleConversations 注释）。 */
@@ -206,11 +208,14 @@ export interface SidebarProps {
   onOpenSettings: () => void
   onOpenExtensionsItem: (item: ExtensionsNavItem) => void
   onSelectLang: (lang: Lang) => void
-  onCheckUpdate: () => void
+  onOpenUsage: () => void
   settingsActive?: boolean
   extensionsActive?: ExtensionsNavItem | null
   collapsed: boolean
   onToggleCollapsed: () => void
+  /** 展开态宽度。拖拽过程只写 CSS 变量，松手才回传。 */
+  width?: number
+  onWidthChange?: (width: number) => void
   refreshKey: number
   profileRefreshKey?: number
   searchOpen: boolean
@@ -223,67 +228,75 @@ function SidebarUserFooter({
   settingsActive,
   onOpenSettings,
   onSelectLang,
-  onCheckUpdate,
+  onOpenUsage,
 }: {
   profile: ChatUserProfile
   lang: Lang
   settingsActive: boolean
   onOpenSettings: () => void
   onSelectLang: (lang: Lang) => void
-  onCheckUpdate: () => void
+  onOpenUsage: () => void
 }) {
   const [menuRect, setMenuRect] = useState<{ left: number; top: number; width: number } | null>(null)
-  const rowRef = useRef<HTMLButtonElement>(null)
+  const rowRef = useRef<HTMLDivElement>(null)
+  const t = i18n[lang]
+
+  const toggleMenu = () => {
+    if (menuRect) {
+      setMenuRect(null)
+      return
+    }
+    const rect = rowRef.current?.getBoundingClientRect()
+    if (!rect) return
+    setMenuRect({ left: rect.left, top: rect.top, width: rect.width })
+  }
 
   return (
     <div
       className="shrink-0 border-t border-neutral-200/60 p-1.5 dark:border-neutral-800/80"
       data-tauri-drag-region="false"
     >
-      {/* 整行即触发（对齐 Claude）：不再是「名字 + 独立齿轮按钮」，设置折进菜单。 */}
-      <button
+      <div
         ref={rowRef}
-        type="button"
-        onClick={() => {
-          if (menuRect) {
-            setMenuRect(null)
-            return
-          }
-          const rect = rowRef.current?.getBoundingClientRect()
-          if (!rect) return
-          setMenuRect({ left: rect.left, top: rect.top, width: rect.width })
-        }}
-        className={`flex w-full items-center gap-2 rounded-lg px-1.5 py-1 text-left transition-colors ${
+        className={`flex w-full items-center gap-1 rounded-lg px-1.5 py-1 transition-colors ${
           menuRect || settingsActive
             ? 'bg-black/[0.06] dark:bg-white/[0.1]'
             : 'hover:bg-black/[0.04] dark:hover:bg-white/[0.06]'
         }`}
-        aria-haspopup="menu"
-        aria-expanded={menuRect !== null}
       >
-        <UserAvatar profile={profile} size={22} />
-        <span
-          className="min-w-0 flex-1 truncate text-[12.5px] text-neutral-700 dark:text-neutral-300"
-          title={profile.displayName || undefined}
+        <button
+          type="button"
+          onClick={toggleMenu}
+          className="flex min-w-0 flex-1 items-center gap-2 text-left"
+          aria-haspopup="menu"
+          aria-expanded={menuRect !== null}
         >
-          {profile.displayName || 'Kivio'}
-        </span>
-        <ChevronDown
-          size={13}
-          strokeWidth={2}
-          className={`shrink-0 text-neutral-400 transition-transform duration-[var(--kv-dur-fast)] dark:text-neutral-500 ${
-            menuRect ? 'rotate-180' : ''
-          }`}
-        />
-      </button>
+          <UserAvatar profile={profile} size={22} />
+          <span
+            className="min-w-0 flex-1 truncate text-[12.5px] text-neutral-700 dark:text-neutral-300"
+            title={profile.displayName || undefined}
+          >
+            {profile.displayName || 'Kivio'}
+          </span>
+        </button>
+        <IconButton
+          size="xs"
+          label={`${t.settings} (${isMac ? '⌘,' : 'Ctrl+,'})`}
+          onClick={() => {
+            setMenuRect(null)
+            onOpenSettings()
+          }}
+        >
+          <Settings strokeWidth={1.75} />
+        </IconButton>
+      </div>
 
       {menuRect && (
         <SidebarAccountMenu
           triggerRect={menuRect}
           lang={lang}
-          onOpenSettings={onOpenSettings}
           onSelectLang={onSelectLang}
-          onCheckUpdate={onCheckUpdate}
+          onOpenUsage={onOpenUsage}
           onClose={() => setMenuRect(null)}
         />
       )}
@@ -314,7 +327,7 @@ function NavRow({ icon, label, onClick, disabled, active, iconMotion }: NavRowPr
       }`}
     >
       <span
-        className={`flex h-5 w-5 shrink-0 items-center justify-center text-neutral-600 transition duration-300 ease-out will-change-transform group-hover:text-neutral-800 group-active:scale-90 dark:text-neutral-400 dark:group-hover:text-neutral-200 ${iconMotion ?? ''}`}
+        className={`flex h-5 w-5 shrink-0 items-center justify-center text-neutral-600 transition duration-300 ease-out group-hover:text-neutral-800 group-active:scale-90 dark:text-neutral-400 dark:group-hover:text-neutral-200 ${iconMotion ?? ''}`}
       >
         {icon}
       </span>
@@ -351,7 +364,7 @@ function ExtensionsNav({
         }`}
         aria-expanded={expanded}
       >
-        <span className="flex h-5 w-5 shrink-0 items-center justify-center text-neutral-600 transition duration-300 ease-out will-change-transform group-hover:text-neutral-800 group-active:scale-90 group-hover:rotate-3 group-hover:scale-110 dark:text-neutral-400 dark:group-hover:text-neutral-200">
+        <span className="flex h-5 w-5 shrink-0 items-center justify-center text-neutral-600 transition duration-300 ease-out group-hover:text-neutral-800 group-active:scale-90 group-hover:rotate-3 group-hover:scale-110 dark:text-neutral-400 dark:group-hover:text-neutral-200">
           <LayoutGrid size={17} strokeWidth={1.75} />
         </span>
         <span className="min-w-0 flex-1 truncate">{t.chatNavExtensions}</span>
@@ -479,11 +492,19 @@ function SearchDialog({
           {results.length > 0 ? (
             results.map((conversation, index) => {
               const active = conversation.id === currentConversationId
+              const listedTitle =
+                displayConversationTitle(conversation.title, conversation.preview)
+                || t.chatLibUntitled
               const projectLabel = conversationProjectLabel(conversation, projects)
               const setId = conversation.set_id ?? conversation.setId ?? null
               const setLabel = setId ? sets.find((s) => s.id === setId)?.name ?? '' : ''
               const snippet = (conversation.match_snippet ?? conversation.matchSnippet ?? '').trim()
-              const showSnippet = Boolean(normalizedQuery && snippet && snippet !== conversation.title)
+              const showSnippet = Boolean(
+                normalizedQuery
+                && snippet
+                && snippet !== listedTitle
+                && !isPlaceholderTitle(snippet),
+              )
               return (
                 <button
                   key={conversation.id}
@@ -502,30 +523,30 @@ function SearchDialog({
                     <div className="flex min-w-0 items-center gap-2">
                       {normalizedQuery ? (
                         <HighlightText
-                          text={conversation.title || t.chatLibUntitled}
+                          text={listedTitle}
                           query={normalizedQuery}
-                          className={`min-w-0 flex-1 truncate text-[13px] ${
+                          className={`min-w-0 flex-1 truncate text-[13px] font-medium ${
                             active
-                              ? 'font-semibold text-neutral-950 dark:text-neutral-50'
-                              : 'font-medium text-neutral-800 dark:text-neutral-200'
+                              ? 'text-neutral-950 dark:text-neutral-50'
+                              : 'text-neutral-800 dark:text-neutral-200'
                           }${
                             generatingConversationIds.has(conversation.id)
-                            && isProvisionalTitle(conversation.title, conversation.preview)
+                            && isProvisionalTitle(listedTitle, conversation.preview)
                               ? ' kv-title-provisional'
                               : ''
                           }`}
                         />
                       ) : (
                         <SwapTitle
-                          text={conversation.title}
-                          title={conversation.title}
-                          className={`min-w-0 flex-1 truncate text-[13px] ${
+                          text={listedTitle}
+                          title={listedTitle}
+                          className={`min-w-0 flex-1 truncate text-[13px] font-medium ${
                             active
-                              ? 'font-semibold text-neutral-950 dark:text-neutral-50'
-                              : 'font-medium text-neutral-800 dark:text-neutral-200'
+                              ? 'text-neutral-950 dark:text-neutral-50'
+                              : 'text-neutral-800 dark:text-neutral-200'
                           }${
                             generatingConversationIds.has(conversation.id)
-                            && isProvisionalTitle(conversation.title, conversation.preview)
+                            && isProvisionalTitle(listedTitle, conversation.preview)
                               ? ' kv-title-provisional'
                               : ''
                           }`}
@@ -563,6 +584,22 @@ function SearchDialog({
   )
 }
 
+function applySidebarWidthCss(aside: HTMLElement | null, nextWidth: number) {
+  const px = `${nextWidth}px`
+  aside?.style.setProperty('--chat-sidebar-width', px)
+  const shell = aside?.closest('.chat-window-shell')
+  if (shell instanceof HTMLElement) {
+    shell.style.setProperty('--chat-sidebar-width', px)
+  }
+}
+
+function setSidebarResizing(aside: HTMLElement | null, resizing: boolean) {
+  const shell = aside?.closest('.chat-window-shell')
+  if (shell instanceof HTMLElement) {
+    shell.classList.toggle('is-sidebar-resizing', resizing)
+  }
+}
+
 export const Sidebar = memo(function Sidebar({
   lang,
   currentConversationId,
@@ -574,17 +611,20 @@ export const Sidebar = memo(function Sidebar({
   onSelectSet,
   onSelectConversation,
   onNewConversation,
+  onOpenInPopout,
   onConversationDeleted,
   onForceDropConversation,
   onConversationsLoaded,
   onOpenSettings,
   onOpenExtensionsItem,
   onSelectLang,
-  onCheckUpdate,
+  onOpenUsage,
   settingsActive = false,
   extensionsActive = null,
   collapsed,
   onToggleCollapsed,
+  width = SIDEBAR_DEFAULT_WIDTH,
+  onWidthChange,
   refreshKey,
   profileRefreshKey = 0,
   searchOpen,
@@ -592,12 +632,55 @@ export const Sidebar = memo(function Sidebar({
 }: SidebarProps) {
   const t = i18n[lang]
   const asideRef = useRef<HTMLElement>(null)
+  const dragStateRef = useRef<{ startX: number; startWidth: number; width: number; raf: number } | null>(null)
   // 折叠后侧栏仍挂载（用于滑出动画），用 inert 让其退出 tab 序 / 不可点击 / 不进 a11y 树。
   // useLayoutEffect：在绘制前与 JSX 里的 aria-hidden 原子地一起生效，避免短暂可聚焦窗口。
   useLayoutEffect(() => {
     const el = asideRef.current
     if (el) el.inert = collapsed
   }, [collapsed])
+  useLayoutEffect(() => {
+    applySidebarWidthCss(asideRef.current, width)
+  }, [width])
+  const handleResizeStart = useCallback(
+    (event: ReactPointerEvent<HTMLDivElement>) => {
+      if (event.button !== 0) return
+      event.preventDefault()
+      event.stopPropagation()
+      const aside = asideRef.current
+      const measured = aside?.getBoundingClientRect().width ?? 0
+      const startWidth = measured > 0 ? measured : width
+      dragStateRef.current = { startX: event.clientX, startWidth, width: startWidth, raf: 0 }
+      setSidebarResizing(aside, true)
+
+      const onMove = (moveEvent: PointerEvent) => {
+        const state = dragStateRef.current
+        if (!state) return
+        const nextWidth = clampSidebarWidth(state.startWidth + (moveEvent.clientX - state.startX), window.innerWidth)
+        state.width = nextWidth
+        if (!state.raf) {
+          state.raf = window.requestAnimationFrame(() => {
+            state.raf = 0
+            applySidebarWidthCss(asideRef.current, state.width)
+          })
+        }
+      }
+      const onUp = () => {
+        window.removeEventListener('pointermove', onMove)
+        window.removeEventListener('pointerup', onUp)
+        const state = dragStateRef.current
+        dragStateRef.current = null
+        setSidebarResizing(asideRef.current, false)
+        if (!state) return
+        if (state.raf) window.cancelAnimationFrame(state.raf)
+        applySidebarWidthCss(asideRef.current, state.width)
+        if (state.width !== Math.round(startWidth)) onWidthChange?.(state.width)
+      }
+      window.addEventListener('pointermove', onMove)
+      window.addEventListener('pointerup', onUp)
+    },
+    [onWidthChange, width],
+  )
   const [conversations, setConversations] = useState<ConversationListItem[]>([])
   const [projects, setProjects] = useState<ChatProject[]>([])
   const [sets, setSets] = useState<ChatSet[]>([])
@@ -605,6 +688,11 @@ export const Sidebar = memo(function Sidebar({
   const [conversationPins, setConversationPins] = useState<Record<string, ConversationPin[]>>({})
   // 置顶手势的进行中覆盖：生成中乐观行 / 列表 refetch 都不得把刚点的 PIN 冲掉。
   const [pinOverrides, setPinOverrides] = useState<Record<string, boolean>>({})
+  /** 归档已乐观摘掉、但 persist/refetch 尚未落地：挡住过期 list 把条目写回来（其余行会跟着上下抽）。 */
+  const [suppressedConversationIds, setSuppressedConversationIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  )
+  const [titleGeneratingIds, setTitleGeneratingIds] = useState<Set<string>>(() => new Set())
   const [assistants, setAssistants] = useState<ChatAssistant[]>([])
   const [searchQuery, setSearchQuery] = useState('')
   // 后端全量索引搜索结果（覆盖所有对话，不止已加载的前 80）；空查询/非 Tauri 时为空，回退客户端过滤。
@@ -729,6 +817,40 @@ export const Sidebar = memo(function Sidebar({
     }
   }
 
+  const handleRegenerateConversationTitle = async (id: string) => {
+    setTitleGeneratingIds((previous) => {
+      if (previous.has(id)) return previous
+      const next = new Set(previous)
+      next.add(id)
+      return next
+    })
+    try {
+      const updated = await chatApi.regenerateConversationTitle(id)
+      setTitleGeneratingIds((previous) => {
+        if (!previous.has(id)) return previous
+        const next = new Set(previous)
+        next.delete(id)
+        return next
+      })
+      setConversations((items) =>
+        items.map((item) => (item.id === id ? { ...item, title: updated.title } : item)),
+      )
+      await loadSidebarData({ silent: true })
+    } catch (err) {
+      console.error('Failed to regenerate conversation title:', err)
+      window.alert(
+        t.chatRegenerateTitleFailed + (err instanceof Error ? err.message : String(err)),
+      )
+    } finally {
+      setTitleGeneratingIds((previous) => {
+        if (!previous.has(id)) return previous
+        const next = new Set(previous)
+        next.delete(id)
+        return next
+      })
+    }
+  }
+
   const handleTogglePinConversation = async (id: string, pinned: boolean) => {
     // 乐观更新：侧栏立刻重排，避免等磁盘写回才跳动。
     setPinOverrides((previous) => (previous[id] === pinned ? previous : { ...previous, [id]: pinned }))
@@ -753,6 +875,12 @@ export const Sidebar = memo(function Sidebar({
 
   /** 归档：侧栏「最近」不再显示；只在对话库「归档」书架可见。 */
   const handleArchiveConversation = async (id: string) => {
+    setSuppressedConversationIds((prev) => {
+      if (prev.has(id)) return prev
+      const next = new Set(prev)
+      next.add(id)
+      return next
+    })
     // 1) 立刻从侧栏真实列表摘掉
     setConversations((items) => items.filter((item) => item.id !== id))
     // 2) 清父组件乐观条目 / in-flight，否则 visibleConversations 会因「真实列表没有」又把乐观项并回来
@@ -767,6 +895,13 @@ export const Sidebar = memo(function Sidebar({
     } catch (err) {
       console.error('Failed to archive conversation:', err)
       await loadSidebarData({ silent: true })
+    } finally {
+      setSuppressedConversationIds((prev) => {
+        if (!prev.has(id)) return prev
+        const next = new Set(prev)
+        next.delete(id)
+        return next
+      })
     }
   }
 
@@ -987,11 +1122,13 @@ export const Sidebar = memo(function Sidebar({
 
   const visibleConversations = useMemo(() => {
     // 侧栏永不展示已归档（后端 list 也会滤；这里再兜一层防脏数据/旧索引）
-    const active = conversations.filter((item) => !item.archived)
+    const active = conversations.filter(
+      (item) => !item.archived && !suppressedConversationIds.has(item.id),
+    )
     if (optimisticConversations.length === 0) return applyPinOverrides(active, pinOverrides)
     const realById = new Map(active.map((item) => [item.id, item]))
     const visibleOptimisticConversations = optimisticConversations.filter((item) => {
-      if (item.archived) return false
+      if (item.archived || suppressedConversationIds.has(item.id)) return false
       const real = realById.get(item.id)
       // 真实列表里没有 → 保留。新会话从创建到首次 refetch 之间只存在于乐观列表；run 刚结束
       // 的那次 commit 里 generating 已清、refetch 还没落地，此刻若按 generating 判丢弃，
@@ -1004,7 +1141,7 @@ export const Sidebar = memo(function Sidebar({
       // 真实条目仍是占位标题「新对话」说明它落后于乐观条目（乐观条目持有刚持久化的最新数据）：
       // 首轮完成后、refetch 落地前，真实列表里这条还是旧快照 —— 直接切过去会让标题动效
       // 先倒退成「新对话」再跳成生成标题，且行实例销毁重建导致 SwapTitle 过渡不触发。
-      return real.title === '新对话'
+      return isPlaceholderTitle(real.title)
     }).map((item) => overlayOptimisticConversation(item, realById.get(item.id)))
     if (visibleOptimisticConversations.length === 0) return applyPinOverrides(active, pinOverrides)
     const optimisticIds = new Set(visibleOptimisticConversations.map((item) => item.id))
@@ -1012,7 +1149,7 @@ export const Sidebar = memo(function Sidebar({
       ...visibleOptimisticConversations,
       ...active.filter((item) => !optimisticIds.has(item.id)),
     ], pinOverrides)
-  }, [conversations, generatingConversationIds, optimisticConversations, pinOverrides])
+  }, [conversations, generatingConversationIds, optimisticConversations, pinOverrides, suppressedConversationIds])
 
   const normalizedSearchQuery = searchQuery.trim().toLowerCase()
 
@@ -1105,12 +1242,16 @@ export const Sidebar = memo(function Sidebar({
         : conversationDrag.draggingId
           ? {
               drag: conversationDrag,
-              label: visibleConversations.find((c) => c.id === conversationDrag.draggingId)?.title,
+              label: (() => {
+                const conv = visibleConversations.find((c) => c.id === conversationDrag.draggingId)
+                if (!conv) return undefined
+                return displayConversationTitle(conv.title, conv.preview) || t.chatLibUntitled
+              })(),
             }
           : null
     if (!active?.label || !active.drag.ghostPos) return null
     return { label: active.label, ...active.drag.ghostPos }
-  }, [conversationDrag, projectDrag, projects, setDrag, sets, visibleConversations])
+  }, [conversationDrag, projectDrag, projects, setDrag, sets, t.chatLibUntitled, visibleConversations])
 
   const setConversationMap = useMemo(() => {
     const map = new Map<string, ConversationListItem[]>()
@@ -1218,11 +1359,18 @@ export const Sidebar = memo(function Sidebar({
     <>
       <aside
         ref={asideRef}
-        className={`chat-sidebar-shell flex w-[240px] shrink-0 flex-col overflow-hidden${
+        className={`chat-sidebar-shell relative flex shrink-0 flex-col overflow-hidden${
           collapsed ? ' is-collapsed' : ''
         }${settingsActive ? ' is-settings-cover' : ''}`}
         aria-hidden={collapsed}
       >
+        {!collapsed && (
+          <div
+            className="chat-sidebar-resize"
+            data-tauri-drag-region="false"
+            onPointerDown={handleResizeStart}
+          />
+        )}
         {/* 侧栏内顶栏行只在 macOS 存在：那两枚按钮要贴着系统交通灯排。
             Windows / Linux 已把它们常驻到全宽标题栏带（见 ChatTitlebar），此处渲染会重复。 */}
         {usesNativeTitlebar && (
@@ -1500,6 +1648,7 @@ export const Sidebar = memo(function Sidebar({
                           reorder={conversationReorderFor(project.id)}
                           currentConversationId={currentConversationId}
                           generatingConversationIds={generatingConversationIds}
+                          titleGeneratingConversationIds={titleGeneratingIds}
                           projects={projects}
                           sets={sets}
                           lang={lang}
@@ -1509,7 +1658,9 @@ export const Sidebar = memo(function Sidebar({
                           onSelectConversation={(id, conversation) => {
                             onSelectConversation(id, conversation, { project, set: null })
                           }}
+                          onOpenInPopout={onOpenInPopout}
                           onRenameConversation={handleRenameConversation}
+                          onRegenerateConversationTitle={handleRegenerateConversationTitle}
                           onTogglePinConversation={handleTogglePinConversation}
                           onArchiveConversation={handleArchiveConversation}
                           onExportConversation={handleExportConversation}
@@ -1649,6 +1800,7 @@ export const Sidebar = memo(function Sidebar({
                               reorder={conversationReorderFor(set.id)}
                               currentConversationId={currentConversationId}
                               generatingConversationIds={generatingConversationIds}
+                              titleGeneratingConversationIds={titleGeneratingIds}
                               projects={projects}
                               sets={sets}
                               lang={lang}
@@ -1658,7 +1810,9 @@ export const Sidebar = memo(function Sidebar({
                               onSelectConversation={(id, conversation) => {
                                 onSelectConversation(id, conversation, { project: null, set })
                               }}
+                              onOpenInPopout={onOpenInPopout}
                               onRenameConversation={handleRenameConversation}
+                              onRegenerateConversationTitle={handleRegenerateConversationTitle}
                               onTogglePinConversation={handleTogglePinConversation}
                               onArchiveConversation={handleArchiveConversation}
                               onExportConversation={handleExportConversation}
@@ -1712,6 +1866,7 @@ export const Sidebar = memo(function Sidebar({
                       conversations={recentConversations}
                       currentConversationId={currentConversationId}
                       generatingConversationIds={generatingConversationIds}
+                      titleGeneratingConversationIds={titleGeneratingIds}
                       projects={projects}
                       sets={sets}
                       lang={lang}
@@ -1721,7 +1876,9 @@ export const Sidebar = memo(function Sidebar({
                       onSelectConversation={(id, conversation) => {
                         onSelectConversation(id, conversation, { project: null, set: null })
                       }}
+                      onOpenInPopout={onOpenInPopout}
                       onRenameConversation={handleRenameConversation}
+                      onRegenerateConversationTitle={handleRegenerateConversationTitle}
                       onTogglePinConversation={handleTogglePinConversation}
                       onArchiveConversation={handleArchiveConversation}
                       onExportConversation={handleExportConversation}
@@ -1744,7 +1901,7 @@ export const Sidebar = memo(function Sidebar({
         settingsActive={settingsActive}
         onOpenSettings={onOpenSettings}
         onSelectLang={onSelectLang}
-        onCheckUpdate={onCheckUpdate}
+        onOpenUsage={onOpenUsage}
       />
 
       {projectMenuState && menuProject && (

@@ -12,12 +12,10 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
-use crate::inpainting::InpaintingClient;
 #[cfg(target_os = "macos")]
 use crate::macos_ocr::MacOcrClient;
 use crate::mcp::manager::McpSession;
-use crate::mcp::types::{McpTool, PythonRunResult};
-use crate::native_tools::SandboxExportContext;
+use crate::mcp::types::McpTool;
 use crate::offline_models::OfflineModelManager;
 use crate::rapidocr::RapidOcrClient;
 use crate::settings::Settings;
@@ -29,12 +27,6 @@ pub struct PendingChatExternalAttachment {
     pub r#type: String,
     pub name: String,
     pub path: String,
-}
-
-#[derive(Debug)]
-pub struct PendingPythonRun {
-    pub sender: oneshot::Sender<PythonRunResult>,
-    pub export_ctx: SandboxExportContext,
 }
 
 /// 一条挂起的会话级授权。run_id 用来在应答/取消/超时时撤掉快照里的授权卡。
@@ -158,6 +150,17 @@ pub struct AppState {
     pub chat_active_replies: Mutex<HashMap<String, HashSet<String>>>,
     /// Sequenced, replayable realtime chat protocol state keyed by run id.
     pub chat_protocol: Mutex<crate::chat::protocol::ChatProtocolHub>,
+    /// 协议直连通道：按窗口 label 分槽。主聊天窗 filter=All，弹出窗只订一条对话。
+    /// 同 label 再订阅替换旧槽；send 失败且窗口已销毁时从 map 摘掉；窗口还在则发
+    /// `chat-protocol-channel-reset` 让前端重建通道。
+    pub chat_protocol_subscribers:
+        Mutex<HashMap<String, crate::chat::protocol::ChatProtocolSubscriber>>,
+    /// 当前已拉出独立窗口的对话 id，供 `chat-popouts-changed` 与主窗占位同步。
+    /// 高频事件是否跳过主窗 All，看的是活着的 `Conversation` 订阅者，不用这个集合
+    /// （窗口已建但通道订成 All / 已死时按窗口集合跳过会把 token 投进黑洞）。
+    pub chat_popout_conversations: Mutex<HashSet<String>>,
+    /// 串行化弹出窗创建，避免两个 async open 都看到 < MAX 再各建一个。
+    pub chat_popout_create_lock: tokio::sync::Mutex<()>,
     /// 等待用户确认的敏感 Chat tool 调用（key = tool_call_id）。
     pub pending_chat_tool_approvals: Mutex<HashMap<String, PendingToolApproval>>,
     /// 本对话已按工具名授予的「总是允许」集合：`(conversation_id, 小写工具名)`。
@@ -184,8 +187,6 @@ pub struct AppState {
     /// ponytail: 只在 `ToolResult` 落地时消费一次并移除；那一轮死在半路的残留会留到进程退出
     /// （一条询问一个小 JSON，量级可忽略）。真要收严就在轮末按 run 清一次。
     pub answered_ask_user_content: Mutex<HashMap<String, serde_json::Value>>,
-    /// 等待前端 Pyodide 完成的 run_python 调用。
-    pub pending_python_runs: Mutex<HashMap<String, PendingPythonRun>>,
     /// 保护 Chat 空白会话复用的短临界区，避免快速多次新建时并发创建多个空白对话。
     pub chat_create_conversation_lock: tokio::sync::Mutex<()>,
     /// 外部 CLI 斜杠命令探测缓存（agent_id:cwd → 命令列表）。
@@ -224,6 +225,10 @@ pub struct AppState {
     /// 无法定向到具体某条臂，所以前端在 `reply_models ≥ 2` 时不给「立刻引导」入口。要支持就把键
     /// 换成 run_id，并让前端把当前 run_id 传进来。
     pub pending_chat_steering: Mutex<HashMap<String, Vec<crate::chat::agent::SteeringMessage>>>,
+    /// 运行中原生 follow-up 信箱：conversation_id → 待在终答后续跑的用户消息。
+    /// 不在轮首注入（那是 `pending_chat_steering`）。仅内存、不持久化。
+    /// 同样按 conversation_id 建键，前端在 `reply_models ≥ 2` 时不给自动 follow-up。
+    pub pending_chat_follow_up: Mutex<HashMap<String, Vec<crate::chat::agent::SteeringMessage>>>,
     /// Lens 启动前抓到的选中文本：放在这里等前端 enterSelect 来取走。
     /// 取一次清一次（take 语义）。无选中 / 取过 / translate 模式 = None。
     pub pending_selection: Mutex<Option<String>>,
@@ -244,6 +249,9 @@ pub struct AppState {
     /// 运行时学习到的"该端点拒绝 `prompt_cache_retention`"集合（按 base_url）。
     /// long 档 24h 被拒时记入，后续只发 key 不发 24h。
     pub prompt_cache_retention_unsupported: Mutex<HashSet<String>>,
+    /// 运行时学习到的"该端点拒绝 Responses reasoning item 回放"集合（按 base_url）。
+    /// 带回放的请求首次 4xx 后记入，后续不再回放（降级 = 修复前行为，对话不 brick）。
+    pub reasoning_replay_unsupported: Mutex<HashSet<String>>,
     /// 出图端点自愈缓存：(provider_id, normalized_model) → 上次成功的 [`ImageRoute`]。
     /// 首选端点被 provider 判为端点错配后，换端点成功即记入，下次同模型直达正确端点。
     /// 仅内存、不落盘（`ImageRoute` 是运行时枚举，非配置）。
@@ -271,8 +279,6 @@ pub struct AppState {
     /// RapidOCR 离线 OCR 客户端。模型 + onnxruntime dylib 都由用户在设置页面下载到 app data 目录,
     /// 安装包不带任何 ONNX Runtime 二进制。`status()` 检查 4 个文件齐不齐, 不齐让前端引导下载。
     pub rapidocr: std::sync::Arc<RapidOcrClient>,
-    /// MI-GAN 惰性 session；只在替换翻译调用且离线包已显式下载后加载。
-    pub inpainting: std::sync::Arc<InpaintingClient>,
     /// 多 agent / 子 agent 任务表（P3）：spawn 的子 agent 状态、按名寻址、并发上限。
     pub sub_agents: crate::chat::sub_agent::SubAgentManager,
     /// 后台 run_command 进程注册表：job_id → 跟踪中的后台命令。
@@ -288,6 +294,10 @@ pub struct AppState {
     /// 请求（脱敏 headers + body）+ 响应摘要。默认关闭（`chat_tools.request_debug_enabled`），
     /// 关闭时 adapter 短路、不构造记录。仅内存、不落盘，进程退出即清。
     pub request_debug: Mutex<VecDeque<crate::chat::request_debug::RequestDebugRecord>>,
+    /// 正在执行的自动化：automation_id → run_id。同一条自动化同时只跑一轮。
+    pub automation_active_runs: Mutex<HashMap<String, String>>,
+    /// 用户取消的 automation run_id 集合。
+    pub automation_cancelled_runs: Mutex<HashSet<String>>,
 }
 
 /// 一条外部 CLI 后台任务（claude 的 `system/task_started` / `task_notification`）。
@@ -373,9 +383,13 @@ impl AppState {
         #[cfg(target_os = "macos")] macos_ocr: std::sync::Arc<MacOcrClient>,
         offline_models: std::sync::Arc<OfflineModelManager>,
         rapidocr: std::sync::Arc<RapidOcrClient>,
-        inpainting: std::sync::Arc<InpaintingClient>,
     ) -> Self {
         let mcp_tool_snapshots = load_mcp_tool_snapshots(&usage_dir);
+        let active_key_idx = settings
+            .providers
+            .iter()
+            .map(|p| (p.id.clone(), p.clamped_active_key_index()))
+            .collect();
         AppState {
             settings: RwLock::new(settings),
             explain_images: Mutex::new(HashMap::new()),
@@ -390,6 +404,9 @@ impl AppState {
             chat_active_generations: Mutex::new(HashMap::new()),
             chat_active_replies: Mutex::new(HashMap::new()),
             chat_protocol: Mutex::new(crate::chat::protocol::ChatProtocolHub::default()),
+            chat_protocol_subscribers: Mutex::new(HashMap::new()),
+            chat_popout_conversations: Mutex::new(HashSet::new()),
+            chat_popout_create_lock: tokio::sync::Mutex::new(()),
             pending_chat_tool_approvals: Mutex::new(HashMap::new()),
             chat_tool_always_allow: Mutex::new(HashSet::new()),
             chat_session_consent: Mutex::new(HashSet::new()),
@@ -397,7 +414,6 @@ impl AppState {
             chat_consent_prompt_lock: tokio::sync::Mutex::new(()),
             pending_chat_user_prompts: Mutex::new(HashMap::new()),
             answered_ask_user_content: Mutex::new(HashMap::new()),
-            pending_python_runs: Mutex::new(HashMap::new()),
             chat_create_conversation_lock: tokio::sync::Mutex::new(()),
             external_slash_commands_cache: Mutex::new(HashMap::new()),
             external_agent_models_cache: Mutex::new(HashMap::new()),
@@ -407,13 +423,15 @@ impl AppState {
             external_live_sessions: Mutex::new(HashMap::new()),
             pending_chat_external_sends: Mutex::new(Vec::new()),
             pending_chat_steering: Mutex::new(HashMap::new()),
+            pending_chat_follow_up: Mutex::new(HashMap::new()),
             pending_selection: Mutex::new(None),
             lens_freeze_frame_image_id: Mutex::new(None),
             lens_pending_reset: Mutex::new(None),
             key_cooldowns: Mutex::new(HashMap::new()),
-            active_key_idx: Mutex::new(HashMap::new()),
+            active_key_idx: Mutex::new(active_key_idx),
             prompt_cache_key_unsupported: Mutex::new(HashSet::new()),
             prompt_cache_retention_unsupported: Mutex::new(HashSet::new()),
+            reasoning_replay_unsupported: Mutex::new(HashSet::new()),
             image_route_cache: Mutex::new(HashMap::new()),
             mcp_sessions: tokio::sync::Mutex::new(HashMap::new()),
             mcp_tool_snapshots: Mutex::new(mcp_tool_snapshots),
@@ -424,11 +442,12 @@ impl AppState {
             macos_ocr,
             offline_models,
             rapidocr,
-            inpainting,
             sub_agents: crate::chat::sub_agent::SubAgentManager::default(),
             background_commands: Arc::new(Mutex::new(HashMap::new())),
             external_background_tasks: Mutex::new(HashMap::new()),
             request_debug: Mutex::new(VecDeque::new()),
+            automation_active_runs: Mutex::new(HashMap::new()),
+            automation_cancelled_runs: Mutex::new(HashSet::new()),
         }
     }
 
@@ -447,8 +466,7 @@ impl AppState {
             #[cfg(target_os = "macos")]
             MacOcrClient::headless(),
             offline_models.clone(),
-            RapidOcrClient::headless(offline_models.clone()),
-            InpaintingClient::new(offline_models),
+            RapidOcrClient::headless(offline_models),
         )
     }
     /// 该供应商应当使用的 HTTP 客户端。默认跟随系统代理（与加这个开关之前一致），
@@ -692,6 +710,49 @@ impl AppState {
             .remove(conversation_id);
     }
 
+    /// 用户在运行中排 follow-up：放进终答后续跑的信箱。没有活跃 run 则 false。
+    pub fn push_chat_follow_up(
+        &self,
+        conversation_id: &str,
+        message: crate::chat::agent::SteeringMessage,
+    ) -> bool {
+        if self
+            .chat_active_generations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(conversation_id)
+            .map(|active| active.is_empty())
+            .unwrap_or(true)
+        {
+            return false;
+        }
+        self.pending_chat_follow_up
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(conversation_id.to_string())
+            .or_default()
+            .push(message);
+        true
+    }
+
+    pub fn take_chat_follow_up(
+        &self,
+        conversation_id: &str,
+    ) -> Vec<crate::chat::agent::SteeringMessage> {
+        self.pending_chat_follow_up
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(conversation_id)
+            .unwrap_or_default()
+    }
+
+    pub fn clear_chat_follow_up(&self, conversation_id: &str) {
+        self.pending_chat_follow_up
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(conversation_id);
+    }
+
     /// 对话被删除时清理其按 conversation_id 累积的运行态痕迹：活跃 generation 集合、
     /// 会话级工具同意标记、按工具名的「总是允许」集合。三者都严格按 conversation_id 取键，对话删除后再不会被
     /// 引用，是最无歧义的有界清理点（不影响其它活跃对话）。generation 号本身来自进程级
@@ -710,6 +771,7 @@ impl AppState {
             .unwrap_or_else(|e| e.into_inner())
             .retain(|(conv, _)| conv != conversation_id);
         self.clear_chat_steering(conversation_id);
+        self.clear_chat_follow_up(conversation_id);
     }
 
     /// 尝试占用某个对话的某条 run 回复槽位。同会话允许多条 run 并存（多模型一问多答）；
@@ -1010,6 +1072,21 @@ impl AppState {
         })
     }
 
+    /// 控制面操作只在会话空闲时独占 busy 标志；不能覆盖正在生成的 guard。
+    pub fn try_mark_external_live_session_busy(
+        &self,
+        conversation_id: &str,
+    ) -> Result<crate::external_agents::session::live::TurnBusyGuard, String> {
+        let map = self
+            .external_live_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = map
+            .get(conversation_id)
+            .ok_or_else(|| "external live session is unavailable".to_string())?;
+        crate::external_agents::session::live::TurnBusyGuard::try_new(session.busy.clone())
+            .ok_or_else(|| "Pi session is busy; wait for the current run to finish".to_string())
+    }
     /// 取出该会话常驻 CLI 的控制通道（若有）。给「运行中插话」用：外部 CLI 那条路不走
     /// `pending_chat_steering` 信箱（那是内置 agent 循环的轮首注入），而是把命令直接送进
     /// 会话 actor，由各协议自己决定能不能注入。不存在常驻会话 = 这条对话没在跑 CLI。
@@ -1025,12 +1102,46 @@ impl AppState {
             .map(|session| session.control.clone())
     }
 
+    /// 取出宣称 follow-up 能力的常驻会话控制通道，以及该 CLI 的图片 MIME 白名单。
+    /// 没有常驻会话、或该协议不支持 follow-up，都回 `None`（前端按普通轮末发送）。
+    pub fn external_follow_up_live_session(
+        &self,
+        conversation_id: &str,
+    ) -> Option<(
+        tokio::sync::mpsc::Sender<crate::external_agents::session::live::SessionCommand>,
+        &'static [&'static str],
+    )> {
+        let map = self
+            .external_live_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = map.get(conversation_id)?;
+        let def = crate::external_agents::registry::get_agent_def(&session.agent_id)?;
+        if !def.supports_follow_up {
+            return None;
+        }
+        Some((session.control.clone(), def.image_mime_whitelist))
+    }
+
+    /// 取出 Pi 常驻会话控制通道（session tree / fork / switch）。
+    pub fn external_pi_live_session_control(
+        &self,
+        conversation_id: &str,
+    ) -> Option<tokio::sync::mpsc::Sender<crate::external_agents::session::live::SessionCommand>>
+    {
+        self.external_live_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(conversation_id)
+            .filter(|session| session.agent_id == "pi")
+            .map(|session| session.control.clone())
+    }
+
     pub fn register_external_live_session(
         &self,
         conversation_id: String,
         session: crate::external_agents::session::live::LiveSession,
     ) {
-        const IDLE_TTL: Duration = Duration::from_secs(600);
         const MAX_LIVE_SESSIONS: usize = 6;
         let mut map = self
             .external_live_sessions
@@ -1038,7 +1149,7 @@ impl AppState {
             .unwrap_or_else(|e| e.into_inner());
         // Reclaim idle sessions (dropping each entry closes its actor + child) and any whose
         // actor already exited. 有在飞轮次的会话不参与回收（见 `LiveSession::busy`）。
-        map.retain(|_, s| !s.is_idle(IDLE_TTL));
+        map.retain(|_, s| !s.is_idle(crate::external_agents::session::live::LIVE_SESSION_IDLE_TTL));
         // Bound concurrent live processes: evict least-recently-used until under the cap.
         // 同样跳过在飞的 —— 正在跑长轮次的那条恰好 `last_activity` 最旧，不排除就一定被它选中。
         while map.len() >= MAX_LIVE_SESSIONS {
@@ -1062,6 +1173,25 @@ impl AppState {
             .remove(conversation_id);
     }
 
+    pub fn move_external_live_session(
+        &self,
+        source_conversation_id: &str,
+        destination_conversation_id: &str,
+    ) -> Result<(), String> {
+        let mut map = self
+            .external_live_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if map.contains_key(destination_conversation_id) {
+            return Err("destination conversation already has a live session".to_string());
+        }
+        let mut session = map
+            .remove(source_conversation_id)
+            .ok_or_else(|| "source live session disappeared".to_string())?;
+        session.last_activity = Instant::now();
+        map.insert(destination_conversation_id.to_string(), session);
+        Ok(())
+    }
     /// Reclaim every idle/dead live session (e.g. from a periodic sweeper). Returns how many
     /// were dropped. Dropping each entry closes its actor + child process.
     pub fn sweep_idle_external_live_sessions(&self, idle_ttl: Duration) -> usize {
@@ -1323,6 +1453,22 @@ impl AppState {
             .insert(base_url.to_string());
     }
 
+    /// 该 base_url 是否已被学习为"拒绝 Responses reasoning item 回放"。
+    pub fn reasoning_replay_unsupported(&self, base_url: &str) -> bool {
+        self.reasoning_replay_unsupported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(base_url)
+    }
+
+    /// 记住该 base_url 拒绝 reasoning item 回放（带回放的请求首次 4xx 后调用）。
+    pub fn mark_reasoning_replay_unsupported(&self, base_url: &str) {
+        self.reasoning_replay_unsupported
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(base_url.to_string());
+    }
+
     /// 该 base_url 是否已被学习为"拒绝 prompt_cache_retention"。
     pub fn prompt_cache_retention_unsupported(&self, base_url: &str) -> bool {
         self.prompt_cache_retention_unsupported
@@ -1359,6 +1505,50 @@ impl AppState {
             .unwrap_or_else(|e| e.into_inner());
         active.insert(provider_id.to_string(), idx);
     }
+
+    /// 用户点选当前 Key：立刻切过去，并清掉该供应商全部冷却，避免刚选中的槽还在 401 冷却里被跳过。
+    pub fn prefer_key(&self, provider_id: &str, idx: usize) {
+        let mut cooldowns = self.key_cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+        cooldowns.retain(|(id, _), _| id != provider_id);
+        drop(cooldowns);
+        let mut active = self
+            .active_key_idx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        active.insert(provider_id.to_string(), idx);
+    }
+
+    /// 设置保存后：密钥池或点选下标变了才覆盖进程内 failover 指针；其它设置改动不打断正在用的备用 Key。
+    pub fn sync_preferred_api_keys(&self, previous: &Settings, next: &Settings) {
+        let next_ids: std::collections::HashSet<&str> =
+            next.providers.iter().map(|p| p.id.as_str()).collect();
+        {
+            let mut active = self
+                .active_key_idx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            active.retain(|id, _| next_ids.contains(id.as_str()));
+        }
+        {
+            let mut cooldowns = self.key_cooldowns.lock().unwrap_or_else(|e| e.into_inner());
+            cooldowns.retain(|(id, _), _| next_ids.contains(id.as_str()));
+        }
+        for provider in &next.providers {
+            let preferred = provider.clamped_active_key_index();
+            let changed = previous
+                .providers
+                .iter()
+                .find(|old| old.id == provider.id)
+                .map(|old| {
+                    old.api_keys != provider.api_keys
+                        || old.active_key_index != provider.active_key_index
+                })
+                .unwrap_or(true);
+            if changed {
+                self.prefer_key(&provider.id, preferred);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1373,8 +1563,7 @@ pub(crate) fn test_app_state() -> AppState {
         #[cfg(target_os = "macos")]
         MacOcrClient::disabled(),
         offline_models.clone(),
-        RapidOcrClient::new(offline_models.clone()),
-        InpaintingClient::new(offline_models),
+        RapidOcrClient::new(offline_models),
     )
 }
 
@@ -1694,6 +1883,14 @@ mod tests {
         let st = test_state();
         st.mark_key_ok("p", 2);
         assert_eq!(st.pick_active_key("p", 3, &HashSet::new()), Some(2));
+    }
+
+    #[test]
+    fn prefer_key_sets_active_and_clears_cooldowns() {
+        let st = test_state();
+        st.mark_key_failed("p", 1);
+        st.prefer_key("p", 1);
+        assert_eq!(st.pick_active_key("p", 3, &HashSet::new()), Some(1));
     }
 
     #[test]

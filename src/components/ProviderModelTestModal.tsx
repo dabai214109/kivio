@@ -1,22 +1,25 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { X, RefreshCw, Check } from 'lucide-react'
 import { api } from '../api/tauri'
 import type { ProviderRequestConfig } from '../api/tauri'
 import { ModelIcon } from '../chat/ModelIcon'
 import { Button, IconButton } from './Button'
+import { MODEL_TEST_CONCURRENCY, runPool } from './providerModelTestPool'
 
 type Lang = 'zh' | 'en'
-type Result = { status: 'testing' | 'ok' | 'fail'; error?: string }
+type Result = { status: 'queued' | 'testing' | 'ok' | 'fail'; error?: string }
 
 /**
  * 供应商「测试连接」弹窗：勾选已添加的模型批量测试。
- * 每个模型发一条极小对话请求（后端 test_provider_connection 带 model），
+ * 每个模型发一条短对话请求（后端 test_provider_connection 带 model），
  * 失败时展示后端原始报错（含 404/503 等状态码）。
  */
 export function ProviderModelTestModal({
   providerId,
   baseUrl,
   apiKeys,
+  activeKeyIndex,
   apiFormat,
   request,
   models,
@@ -26,6 +29,7 @@ export function ProviderModelTestModal({
   providerId: string
   baseUrl: string
   apiKeys: string[]
+  activeKeyIndex?: number
   apiFormat: string
   /** 编辑中的请求配置：测试必须和真实聊天带一样的头，否则「测试通过、聊天 403」。 */
   request?: ProviderRequestConfig
@@ -36,6 +40,11 @@ export function ProviderModelTestModal({
   const [selected, setSelected] = useState<Set<string>>(() => new Set(models))
   const [results, setResults] = useState<Record<string, Result>>({})
   const [running, setRunning] = useState(false)
+  const runIdRef = useRef(0)
+
+  useEffect(() => () => {
+    runIdRef.current += 1
+  }, [])
 
   const t = {
     title: lang === 'zh' ? '测试模型' : 'Test Models',
@@ -47,6 +56,8 @@ export function ProviderModelTestModal({
     fail: lang === 'zh' ? '失败' : 'Failed',
     close: lang === 'zh' ? '关闭' : 'Close',
     selectedCount: (n: number) => (lang === 'zh' ? `已选 ${n}` : `${n} selected`),
+    progress: (done: number, total: number) =>
+      lang === 'zh' ? `${done}/${total}` : `${done}/${total}`,
   }
 
   const allChecked = models.length > 0 && selected.size === models.length
@@ -59,57 +70,76 @@ export function ProviderModelTestModal({
     })
   const toggleAll = () => setSelected(allChecked ? new Set() : new Set(models))
 
+  const finishedCount = Object.values(results).filter(
+    (r) => r.status === 'ok' || r.status === 'fail',
+  ).length
+
   const runTests = async () => {
     const targets = models.filter((m) => selected.has(m))
     if (targets.length === 0 || running) return
+    const runId = ++runIdRef.current
     setRunning(true)
-    setResults((prev) => {
-      const next = { ...prev }
-      targets.forEach((m) => { next[m] = { status: 'testing' } })
-      return next
-    })
-    await Promise.all(
-      targets.map(async (model) => {
-        try {
-          const r = await api.testProviderConnection(providerId, {
-            id: providerId,
-            baseUrl,
-            apiKeys,
-            apiFormat,
-            model,
-            request,
-          })
-          setResults((prev) => ({
-            ...prev,
-            [model]: r.success ? { status: 'ok' } : { status: 'fail', error: r.error },
-          }))
-        } catch (e) {
-          setResults((prev) => ({
-            ...prev,
-            [model]: { status: 'fail', error: e instanceof Error ? e.message : String(e) },
-          }))
-        }
-      }),
+    setResults(
+      Object.fromEntries(targets.map((m) => [m, { status: 'queued' as const }])),
     )
-    setRunning(false)
+    await runPool(targets, MODEL_TEST_CONCURRENCY, async (model) => {
+      if (runIdRef.current !== runId) return
+      setResults((prev) => ({ ...prev, [model]: { status: 'testing' } }))
+      try {
+        const r = await api.testProviderConnection(providerId, {
+          id: providerId,
+          baseUrl,
+          apiKeys,
+          activeKeyIndex,
+          apiFormat,
+          model,
+          request,
+        })
+        if (runIdRef.current !== runId) return
+        setResults((prev) => ({
+          ...prev,
+          [model]: r.success ? { status: 'ok' } : { status: 'fail', error: r.error },
+        }))
+      } catch (e) {
+        if (runIdRef.current !== runId) return
+        setResults((prev) => ({
+          ...prev,
+          [model]: { status: 'fail', error: e instanceof Error ? e.message : String(e) },
+        }))
+      }
+    })
+    if (runIdRef.current === runId) setRunning(false)
   }
 
-  return (
+  const statusClass = (status: Result['status'] | undefined) => {
+    if (status === 'ok') return 'kv-mtest-status kv-mtest-status--ok'
+    if (status === 'fail') return 'kv-mtest-status kv-mtest-status--fail'
+    return 'kv-mtest-status'
+  }
+
+  return createPortal(
     <div
-      className="kv-modal-backdrop"
+      className="kv-modal-backdrop kv-modal-backdrop--portal"
       data-tauri-drag-region="false"
       onMouseDown={(e) => { if (e.target === e.currentTarget) onClose() }}
     >
-      <div className="kv-modal kv-model-test-modal" data-tauri-drag-region="false" onMouseDown={(e) => e.stopPropagation()}>
-        <div className="flex items-center justify-between mb-2">
-          <h3 className="text-[14px] font-semibold">{t.title}</h3>
+      <div
+        className="kv kv-modal kv-model-test-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="kv-mtest-title"
+        data-tauri-drag-region="false"
+        onMouseDown={(e) => e.stopPropagation()}
+      >
+        <div className="kv-mtest-head">
+          <h3 id="kv-mtest-title" className="kv-mtest-title">{t.title}</h3>
           <IconButton size="xs" onClick={onClose} label={t.close} data-tauri-drag-region="false">
             <X size={14} />
           </IconButton>
         </div>
 
         {models.length === 0 ? (
-          <p className="kv-panel-body py-4">{t.empty}</p>
+          <p className="kv-mtest-empty">{t.empty}</p>
         ) : (
           <>
             <div className="kv-mtest-toolbar">
@@ -117,14 +147,18 @@ export function ProviderModelTestModal({
                 <input type="checkbox" className="kv-mtest-check" checked={allChecked} onChange={toggleAll} />
                 <span className="text-[12px]">{t.selectAll}</span>
               </label>
-              <span className="kv-row-desc">{t.selectedCount(selected.size)}</span>
+              <span className="kv-row-desc">
+                {running
+                  ? t.progress(finishedCount, selected.size)
+                  : t.selectedCount(selected.size)}
+              </span>
             </div>
 
             <ul className="kv-mtest-list custom-scrollbar">
               {models.map((model) => {
                 const res = results[model]
                 return (
-                  <li key={model}>
+                  <li key={model} className="kv-mtest-item">
                     <div className="kv-mtest-row">
                       <input
                         type="checkbox"
@@ -135,15 +169,17 @@ export function ProviderModelTestModal({
                       />
                       <ModelIcon model={model} size={16} />
                       <span className="kv-mtest-name" title={model}>{model}</span>
-                      {res?.status === 'testing' && (
-                        <span className="kv-mtest-status"><RefreshCw size={12} className="animate-spin" /></span>
-                      )}
-                      {res?.status === 'ok' && (
-                        <span className="kv-mtest-status kv-mtest-status--ok"><Check size={13} strokeWidth={2.5} />{t.ok}</span>
-                      )}
-                      {res?.status === 'fail' && (
-                        <span className="kv-mtest-status kv-mtest-status--fail"><X size={13} strokeWidth={2.5} />{t.fail}</span>
-                      )}
+                      <span className={statusClass(res?.status)}>
+                        {res?.status === 'testing' && (
+                          <RefreshCw size={12} className="animate-spin" />
+                        )}
+                        {res?.status === 'ok' && (
+                          <><Check size={13} strokeWidth={2.5} />{t.ok}</>
+                        )}
+                        {res?.status === 'fail' && (
+                          <><X size={13} strokeWidth={2.5} />{t.fail}</>
+                        )}
+                      </span>
                     </div>
                     {res?.status === 'fail' && res.error && (
                       <pre className="kv-mtest-error">{res.error}</pre>
@@ -152,22 +188,25 @@ export function ProviderModelTestModal({
                 )
               })}
             </ul>
-
-            <div className="flex justify-end gap-2 pt-3">
-              <Button variant="ghost" onClick={onClose} data-tauri-drag-region="false">{t.close}</Button>
-              <Button
-                variant="primary"
-                onClick={runTests}
-                disabled={running || selected.size === 0}
-                data-tauri-drag-region="false"
-              >
-                <RefreshCw size={12} className={running ? 'animate-spin' : ''} />
-                {running ? t.running : t.run}
-              </Button>
-            </div>
           </>
         )}
+
+        <div className="kv-mtest-foot">
+          <Button variant="ghost" onClick={onClose} data-tauri-drag-region="false">{t.close}</Button>
+          {models.length > 0 && (
+            <Button
+              variant="primary"
+              onClick={runTests}
+              disabled={running || selected.size === 0}
+              data-tauri-drag-region="false"
+            >
+              <RefreshCw size={12} className={running ? 'animate-spin' : ''} />
+              {running ? t.running : t.run}
+            </Button>
+          )}
+        </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   )
 }

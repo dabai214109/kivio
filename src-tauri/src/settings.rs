@@ -79,8 +79,9 @@ impl Default for ProviderRequestConfig {
 /**
  * AI 模型提供商配置
  *
- * api_keys 支持多 key failover：第一个为主 key，后续为备用 key；
- * 当某个 key 触发配额/限流/鉴权失败时会自动切换到下一个。
+ * api_keys 是密钥池；`active_key_index` 是用户点选的当前 Key。
+ * 鉴权/配额失败时仍会自动切到池里其它 Key（进程内 `active_key_idx`），
+ * 重启或用户再次点选后回到这里保存的索引。
  *
  * api_key_legacy 字段仅用于反序列化兼容旧版（v2.3.1 及之前）单 key 配置，
  * sanitize_settings 会把它合并到 api_keys[0]。
@@ -119,6 +120,9 @@ pub struct ModelProvider {
     /// 「请求配置」：自定义头 / 代理 / prompt 缓存 / CLI 身份。
     #[serde(default)]
     pub request: ProviderRequestConfig,
+    /// 用户点选的当前 Key 下标。缺省 / 越界时按 0 处理。
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub active_key_index: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +168,29 @@ impl ProviderApiFormat {
 impl ModelProvider {
     pub fn api_format_kind(&self) -> ProviderApiFormat {
         ProviderApiFormat::from_raw(&self.api_format)
+    }
+
+    /// 夹到现有密钥池范围内；空池为 0。
+    pub fn clamped_active_key_index(&self) -> usize {
+        match self.api_keys.len() {
+            0 => 0,
+            n => self.active_key_index.min(n - 1),
+        }
+    }
+
+    /// 当前点选的 Key；该槽为空时退回池里第一条非空。
+    pub fn preferred_api_key(&self) -> Option<&str> {
+        let idx = self.clamped_active_key_index();
+        self.api_keys
+            .get(idx)
+            .map(String::as_str)
+            .filter(|k| !k.trim().is_empty())
+            .or_else(|| {
+                self.api_keys
+                    .iter()
+                    .map(String::as_str)
+                    .find(|k| !k.trim().is_empty())
+            })
     }
 
     /// Prompt 缓存策略。非法/空串视为 `short`（与 sanitize 一致）。
@@ -405,6 +432,15 @@ pub enum WebSearchProvider {
     ExaMcp,
     Ollama,
     Grok,
+    Deepseek,
+    Brave,
+    Serper,
+    Bocha,
+    Zhipu,
+    Tinyfish,
+    TinyfishMcp,
+    Searxng,
+    Kimi,
     /// 前端可能列出尚未接入后端的占位服务商；持久化时兜底为未知，避免旧值导致整份设置解析失败。
     #[serde(other)]
     Unknown,
@@ -428,6 +464,9 @@ pub struct LensWebSearchConfig {
     pub enabled: bool,
     #[serde(default)]
     pub provider: WebSearchProvider,
+    /// Independent `web_fetch` provider. `None` follows `provider` (legacy configs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_provider: Option<WebSearchProvider>,
     #[serde(default)]
     pub tavily_api_key: String,
     #[serde(default = "default_tavily_base_url")]
@@ -450,6 +489,45 @@ pub struct LensWebSearchConfig {
     pub grok_base_url: String,
     #[serde(default = "default_grok_system_prompt")]
     pub grok_system_prompt: String,
+    #[serde(default)]
+    pub deepseek_api_key: String,
+    #[serde(default = "default_deepseek_model")]
+    pub deepseek_model: String,
+    #[serde(default = "default_deepseek_base_url")]
+    pub deepseek_base_url: String,
+    #[serde(default = "default_grok_system_prompt")]
+    pub deepseek_system_prompt: String,
+    #[serde(default)]
+    pub brave_api_key: String,
+    #[serde(default = "default_brave_base_url")]
+    pub brave_base_url: String,
+    #[serde(default)]
+    pub serper_api_key: String,
+    #[serde(default = "default_serper_base_url")]
+    pub serper_base_url: String,
+    #[serde(default)]
+    pub bocha_api_key: String,
+    #[serde(default = "default_bocha_base_url")]
+    pub bocha_base_url: String,
+    #[serde(default)]
+    pub zhipu_api_key: String,
+    #[serde(default = "default_zhipu_base_url")]
+    pub zhipu_base_url: String,
+    #[serde(default)]
+    pub tinyfish_api_key: String,
+    #[serde(default = "default_tinyfish_base_url")]
+    pub tinyfish_base_url: String,
+    #[serde(default = "default_tinyfish_mcp_url")]
+    pub tinyfish_mcp_url: String,
+    /// TinyFish MCP 走 OAuth 2.1，不贴 API Key。授权结果存在这里，搜索时带 Authorization。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tinyfish_mcp_auth: Option<ConnectorAuth>,
+    #[serde(default)]
+    pub searxng_base_url: String,
+    #[serde(default)]
+    pub kimi_api_key: String,
+    #[serde(default = "default_kimi_base_url")]
+    pub kimi_base_url: String,
     #[serde(default = "default_web_search_max_results")]
     pub max_results: u8,
     #[serde(default = "default_web_search_depth")]
@@ -461,6 +539,7 @@ impl Default for LensWebSearchConfig {
         Self {
             enabled: false,
             provider: WebSearchProvider::Tavily,
+            fetch_provider: None,
             tavily_api_key: String::new(),
             tavily_base_url: default_tavily_base_url(),
             exa_api_key: String::new(),
@@ -472,6 +551,25 @@ impl Default for LensWebSearchConfig {
             grok_model: default_grok_model(),
             grok_base_url: default_grok_base_url(),
             grok_system_prompt: default_grok_system_prompt(),
+            deepseek_api_key: String::new(),
+            deepseek_model: default_deepseek_model(),
+            deepseek_base_url: default_deepseek_base_url(),
+            deepseek_system_prompt: default_grok_system_prompt(),
+            brave_api_key: String::new(),
+            brave_base_url: default_brave_base_url(),
+            serper_api_key: String::new(),
+            serper_base_url: default_serper_base_url(),
+            bocha_api_key: String::new(),
+            bocha_base_url: default_bocha_base_url(),
+            zhipu_api_key: String::new(),
+            zhipu_base_url: default_zhipu_base_url(),
+            tinyfish_api_key: String::new(),
+            tinyfish_base_url: default_tinyfish_base_url(),
+            tinyfish_mcp_url: default_tinyfish_mcp_url(),
+            tinyfish_mcp_auth: None,
+            searxng_base_url: String::new(),
+            kimi_api_key: String::new(),
+            kimi_base_url: default_kimi_base_url(),
             max_results: default_web_search_max_results(),
             search_depth: default_web_search_depth(),
         }
@@ -500,6 +598,42 @@ fn default_grok_model() -> String {
 
 fn default_grok_base_url() -> String {
     "https://api.x.ai/v1".to_string()
+}
+
+fn default_deepseek_model() -> String {
+    "deepseek-v4-flash".to_string()
+}
+
+fn default_deepseek_base_url() -> String {
+    "https://api.deepseek.com".to_string()
+}
+
+fn default_brave_base_url() -> String {
+    "https://api.search.brave.com".to_string()
+}
+
+fn default_serper_base_url() -> String {
+    "https://google.serper.dev".to_string()
+}
+
+fn default_bocha_base_url() -> String {
+    "https://api.bochaai.com".to_string()
+}
+
+fn default_zhipu_base_url() -> String {
+    "https://open.bigmodel.cn/api/paas/v4".to_string()
+}
+
+fn default_tinyfish_base_url() -> String {
+    "https://api.search.tinyfish.ai".to_string()
+}
+
+fn default_tinyfish_mcp_url() -> String {
+    "https://agent.tinyfish.ai/mcp".to_string()
+}
+
+fn default_kimi_base_url() -> String {
+    "https://api.kimi.com/coding/v1/search".to_string()
 }
 
 pub fn default_grok_system_prompt() -> String {
@@ -565,11 +699,13 @@ fn default_message_order() -> String {
 }
 
 pub fn default_chat_max_output_tokens() -> u32 {
-    32768
+    16_384
 }
 
-pub(crate) fn clamp_chat_max_output_tokens(value: u32) -> u32 {
-    value.clamp(512, 65_536)
+pub(crate) fn clamp_chat_max_output_tokens(_value: u32) -> u32 {
+    // 对齐 Pi：maxTokens 写在模型目录上，没有用户档位。自定义模型没填时缺省 16384。
+    // Kivio 有库用库；未收录一律发这个 16k，不按协议省略。
+    default_chat_max_output_tokens()
 }
 
 impl Default for LensConfig {
@@ -602,7 +738,7 @@ pub struct ChatConfig {
     pub stream_enabled: bool,
     #[serde(default = "default_true")]
     pub thinking_enabled: bool,
-    /// Chat 模型最终回答最大输出 tokens。
+    /// 未收录模型的输出上限兜底（对齐 Pi 自定义模型缺省 16384；有库/覆盖时用库值）。
     #[serde(default = "default_chat_max_output_tokens")]
     pub max_output_tokens: u32,
     /// 响应语言（"zh"/"en" 等）。空字符串表示跟随 Lens 默认语言，再跟随 target_lang。
@@ -611,6 +747,9 @@ pub struct ChatConfig {
     /// 自定义 system prompt；空则使用内置 Chat 模板（Kivio Agent 运行时）。
     #[serde(default)]
     pub system_prompt: String,
+    /// 输入框「问题优化」的自定义系统提示词；空则使用内置优化提示词。
+    #[serde(default)]
+    pub prompt_optimize_prompt: String,
     /// Chat 侧栏显示的用户名；空则前端使用默认文案。
     #[serde(default)]
     pub user_display_name: String,
@@ -633,8 +772,9 @@ pub struct ChatConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ChatModeConfig {
-    /// Extra Chat instructions stacked on the built-in capability contract.
-    /// Empty → contract only (`chat_runtime_prompt()`).
+    /// Optional extra Chat instructions. Empty → no Chat identity essay;
+    /// runtime still injects date plus conversation context (assistant / set /
+    /// memory / knowledge base). File/shell limits are the tool filter, not prompt.
     pub system_prompt: String,
     pub web_search: bool,
     pub web_fetch: bool,
@@ -666,6 +806,7 @@ impl Default for ChatConfig {
             max_output_tokens: default_chat_max_output_tokens(),
             default_language: String::new(),
             system_prompt: String::new(),
+            prompt_optimize_prompt: String::new(),
             user_display_name: String::new(),
             user_avatar: String::new(),
             default_agent_runtime: crate::chat::AgentRuntimeConfig::default(),
@@ -690,13 +831,16 @@ pub struct ExternalCliAgentConfig {
     pub custom_models: Vec<CliCustomModel>,
     /// 该 CLI 的第三方供应商（中转站）列表。每个 CLI 各自一份，同 ccgui 的分桶方式。
     pub providers: Vec<ExternalCliProvider>,
-    /// 当前生效的供应商 id；空 = 不托管，用 CLI 自己的配置（默认）。
+    /// 当前默认供应商 id；空 = 使用 CLI 自己的默认配置。
+    /// Pi / OpenCode / dsh 的 providers 会全部并存，此字段只决定未显式选模型时的默认项。
     pub current_provider: String,
 }
 
 /// 一个第三方供应商（中转站）。**各 CLI 用到的字段不同**：
-/// - claude / gemini / 其余 env 系：只用 `env`（`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` …）
-/// - codex：只用 `config_toml` / `auth_json`，物化成一个私有 `CODEX_HOME`
+/// - claude / gemini / 其余 env 系：只用 `env`（`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` …）；
+///   claude 聊天选模按 cc-switch 写入 `~/.claude/settings.json` 的 `model` / `env.ANTHROPIC_MODEL`
+/// - codex：只用 `config_toml` / `auth_json`，物化成一个私有 `CODEX_HOME`；聊天选模写入
+///   `~/.codex/config.toml` 顶层 `model`（文件已存在时）以及 CLI 正在读的那份
 /// - grok：只用 `config_toml`，把其中的 `[models]` / `[model.*]` 合并进 `~/.grok/config.toml`
 /// - opencode / pi：用 `config_json` / `auth_json` / `default_model` 合并进 CLI 原生全局配置
 /// - dsh：用 `config_json` 在 Kivio 私有 profile 中挂载 `llm-pi-ai`，Key 通过 `env` 注入
@@ -709,6 +853,8 @@ pub struct ExternalCliProvider {
     /// 从 cc-switch 导入时**保留原 id**，这样二次导入走更新而不是新增一条重复的。
     pub id: String,
     pub name: String,
+    /// 仅对支持并存的 CLI 生效；false = 启用（兼容旧配置），true = 不物化、不注入。
+    pub disabled: bool,
     pub remark: String,
     pub env: Vec<CliEnvVar>,
     /// codex：私有 CODEX_HOME 里 config.toml 的全文；grok：写入原生 `~/.grok/config.toml` 的片段（至少含 models / model）。
@@ -829,6 +975,7 @@ fn resolve_mixer_side_model(
  * title_summary：标题总结副任务使用；为空时继承当前会话主模型（无会话时回退有效 Chat 默认）。
  * compression：上下文/历史对话压缩副任务使用；为空时继承当前会话主模型（无会话时回退有效 Chat 默认）。
  * image_generation：生图副任务使用；为空时若当前会话主模型支持直接生图则继承该模型。
+ * prompt_optimize：输入框问题优化副任务使用；为空时继承当前会话主模型。
  * advisor：顾问模型（executor-advisor 模式）——主循环模型可用 `advisor` 工具向它
  *   单次咨询；为空 = 功能关闭（工具不注册），没有继承语义。
  */
@@ -846,6 +993,8 @@ pub struct DefaultModelsConfig {
     #[serde(default)]
     pub image_generation: DefaultModelSelection,
     #[serde(default)]
+    pub prompt_optimize: DefaultModelSelection,
+    #[serde(default)]
     pub advisor: DefaultModelSelection,
 }
 
@@ -857,6 +1006,7 @@ impl Default for DefaultModelsConfig {
             title_summary: DefaultModelSelection::default(),
             compression: DefaultModelSelection::default(),
             image_generation: DefaultModelSelection::default(),
+            prompt_optimize: DefaultModelSelection::default(),
             advisor: DefaultModelSelection::default(),
         }
     }
@@ -962,10 +1112,11 @@ pub struct ChatNativeToolsConfig {
     pub edit_file: bool,
     #[serde(default)]
     pub run_command: bool,
-    #[serde(default)]
-    pub run_python: bool,
     #[serde(default = "default_true")]
     pub knowledge_search: bool,
+    /// Agent tools to list / create / edit / run automations.
+    #[serde(default = "default_true")]
+    pub automation: bool,
     /// Default root for ordinary (non-project) conversation workbenches.
     /// Missing legacy configs deserialize to an empty string so sanitize can
     /// migrate `workspace_roots[0]` before falling back to the platform default.
@@ -985,8 +1136,8 @@ impl ChatNativeToolsConfig {
             || self.write_file
             || self.edit_file
             || self.run_command
-            || self.run_python
             || self.knowledge_search
+            || self.automation
     }
 }
 
@@ -1006,8 +1157,8 @@ impl Default for ChatNativeToolsConfig {
             write_file: true,
             edit_file: true,
             run_command: true,
-            run_python: true,
             knowledge_search: true,
+            automation: true,
             working_directory: default_chat_working_directory(),
             workspace_roots: Vec::new(),
         }
@@ -1127,7 +1278,9 @@ fn default_skill_fallback_mode() -> String {
 }
 
 pub const CHAT_TOOL_MIN_TIMEOUT_MS: u64 = 1_000;
-pub const CHAT_TOOL_MAX_TIMEOUT_MS: u64 = 300_000;
+/// 显式 `bash` `timeout_ms` 与 `bash_output` wait 的上限。省略 timeout 的
+/// 前台 bash 等到进程退出，不受默认 60s 工具超时约束。
+pub const CHAT_TOOL_MAX_TIMEOUT_MS: u64 = 600_000;
 /// 旧版工具轮次默认值。现默认**不限**（`None`），此常量仅供一次性迁移
 /// （`sanitize_settings` 把存量 20 归一到不限）与前端展示预设使用。
 pub const CHAT_TOOL_LEGACY_DEFAULT_ROUNDS: u32 = 20;
@@ -1464,112 +1617,6 @@ impl KnowledgeBaseConfig {
     }
 }
 
-fn default_imap_port() -> u16 {
-    993
-}
-
-fn default_smtp_port() -> u16 {
-    587
-}
-
-fn default_imap_encryption() -> String {
-    "tls".to_string()
-}
-
-fn default_smtp_encryption() -> String {
-    "start-tls".to_string()
-}
-
-/// Himalaya 邮箱账户（IMAP 读 + SMTP 发）；凭据明文存 settings，同步到 ~/.config/himalaya/config.toml。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct EmailAccountConfig {
-    /// TOML `[accounts.<id>]` 段名；空时由 email 推导。
-    pub id: String,
-    pub email: String,
-    pub display_name: String,
-    pub password: String,
-    pub imap_host: String,
-    #[serde(default = "default_imap_port")]
-    pub imap_port: u16,
-    #[serde(default = "default_imap_encryption")]
-    pub imap_encryption: String,
-    pub smtp_host: String,
-    #[serde(default = "default_smtp_port")]
-    pub smtp_port: u16,
-    #[serde(default = "default_smtp_encryption")]
-    pub smtp_encryption: String,
-    #[serde(default)]
-    pub is_default: bool,
-}
-
-impl Default for EmailAccountConfig {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            email: String::new(),
-            display_name: String::new(),
-            password: String::new(),
-            imap_host: String::new(),
-            imap_port: default_imap_port(),
-            imap_encryption: default_imap_encryption(),
-            smtp_host: String::new(),
-            smtp_port: default_smtp_port(),
-            smtp_encryption: default_smtp_encryption(),
-            is_default: false,
-        }
-    }
-}
-
-pub fn email_account_id_from_address(email: &str) -> String {
-    let slug: String = email
-        .trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
-        .collect();
-    let trimmed = slug.trim_matches('-');
-    if trimmed.is_empty() {
-        "default".to_string()
-    } else {
-        trimmed.to_string()
-    }
-}
-
-/// 注入系统提示：已配置的 Himalaya 邮箱列表。
-pub fn email_accounts_system_prompt(
-    accounts: &[EmailAccountConfig],
-    himalaya_binary: Option<&str>,
-) -> Option<String> {
-    if accounts.is_empty() {
-        return None;
-    }
-    let lines: Vec<String> = accounts
-        .iter()
-        .map(|account| {
-            let id = if account.id.trim().is_empty() {
-                email_account_id_from_address(&account.email)
-            } else {
-                account.id.trim().to_string()
-            };
-            format!("- {} (account id: {id})", account.email.trim())
-        })
-        .collect();
-    let binary_line = himalaya_binary
-        .map(str::trim)
-        .filter(|path| !path.is_empty())
-        .map(|path| format!("Himalaya binary: {path}"));
-    Some(format!(
-        "Configured mailboxes (Himalaya CLI — activate the himalaya skill and use run_command):\n{}\nUse Himalaya installed via the Kivio Email connector, or a system PATH himalaya binary.{}{}",
-        lines.join("\n"),
-        binary_line
-            .as_ref()
-            .map(|line| format!("\n{line}"))
-            .unwrap_or_default(),
-        "\nConfirm with the user before sending, deleting, or bulk-moving mail."
-    ))
-}
-
 /**
  * 独立截图标注功能配置（截图 → 箭头/矩形/马赛克标注 → 复制/保存）
  */
@@ -1634,6 +1681,10 @@ pub struct Settings {
     /// `--from-autostart` 仍会单独跳过弹窗（插件参数偶发丢失时靠本开关兜底）。
     #[serde(default = "default_false")]
     pub launch_minimized_to_tray: bool,
+    /// 关闭聊天窗口时隐藏复用（默认 false = 销毁 WebView 回收内存）。
+    /// 高频开关 / 低配机可避免每次冷创建的启动延迟和风扇起来。
+    #[serde(default = "default_false")]
+    pub keep_chat_window_alive: bool,
     #[serde(default)]
     pub translator_provider_id: String,
     #[serde(default = "default_openai_model")]
@@ -1695,6 +1746,10 @@ pub struct Settings {
     /// 更新旧内置、补齐新增，**保留用户自建**。已 seed v1 的老用户靠它拿到新专家；置 true 后不再跑。
     #[serde(default)]
     pub builtin_assistants_seeded_v2: bool,
+    /// 一次性迁移标记（v3，非破坏性）：按 id upsert 补齐产品/法务/财务/教学/审查/求职。
+    /// 已 seed v2 的老用户靠它拿到新专家；置 true 后不再跑。
+    #[serde(default)]
+    pub builtin_assistants_seeded_v3: bool,
     /// 一次性迁移标记：把 pre-green-light 安装（原生工具默认全关 + 旧 approval_policy）
     /// 带到新默认——原生文件/命令工具置 true，且仅当 approval_policy 仍是旧默认时改 "auto"。
     /// 幂等：置 true 后不再翻转，尊重用户此后手动关闭某工具或改 policy 的选择。
@@ -1721,9 +1776,6 @@ pub struct Settings {
     /// 只在 chat 模型选择器里展示为顶部"收藏"组；失效项（provider 删/禁用/模型没了）展示时过滤。
     #[serde(default)]
     pub favorite_models: Vec<String>,
-    /// IMAP/SMTP 邮箱（Himalaya）；保存时同步到 ~/.config/himalaya/config.toml。
-    #[serde(default)]
-    pub email_accounts: Vec<EmailAccountConfig>,
     // 旧版字段，用于迁移
     #[serde(skip_serializing_if = "Option::is_none")]
     pub openai: Option<OpenAIConfig>,
@@ -1782,6 +1834,13 @@ impl Settings {
         resolve_mixer_side_model(&self.default_models.compression, session, self)
     }
 
+    pub fn effective_prompt_optimize_model_for_session(
+        &self,
+        session: Option<SessionModel<'_>>,
+    ) -> (String, String) {
+        resolve_mixer_side_model(&self.default_models.prompt_optimize, session, self)
+    }
+
     pub fn image_generation_model(&self) -> Option<(String, String)> {
         if self.default_models.image_generation.is_configured()
             && !self.default_models.image_generation.model.trim().is_empty()
@@ -1809,6 +1868,22 @@ impl Settings {
             None
         }
     }
+
+    /// Extra OAuth tokens stored outside `chat_tools.servers`, keyed by MCP resource URL.
+    /// The MCP manager persists a refreshed token to every slot bound to that URL
+    /// without knowing each product name.
+    pub(crate) fn detached_oauth_auth_for_url_mut(
+        &mut self,
+        resource_url: &str,
+    ) -> Option<&mut Option<ConnectorAuth>> {
+        fn url_matches(left: &str, right: &str) -> bool {
+            left.trim().trim_end_matches('/') == right.trim().trim_end_matches('/')
+        }
+        if url_matches(self.lens.web_search.tinyfish_mcp_url.trim(), resource_url) {
+            return Some(&mut self.lens.web_search.tinyfish_mcp_auth);
+        }
+        None
+    }
 }
 
 impl Default for Settings {
@@ -1829,6 +1904,7 @@ impl Default for Settings {
             auto_paste: true,
             launch_at_startup: false,
             launch_minimized_to_tray: false,
+            keep_chat_window_alive: false,
             translator_provider_id: "default-translator".to_string(),
             translator_model: "gpt-4o".to_string(),
             chat_provider_id: String::new(),
@@ -1852,6 +1928,7 @@ impl Default for Settings {
             retry_attempts: default_retry_attempts(),
             builtin_assistants_seeded_v1: false,
             builtin_assistants_seeded_v2: false,
+            builtin_assistants_seeded_v3: false,
             chat_tools_greenlit_v1: false,
             onboarding_status: default_onboarding_status(),
             auto_check_update: true,
@@ -1859,7 +1936,6 @@ impl Default for Settings {
             image_archive_path: String::new(),
             obsidian_vault_path: String::new(),
             favorite_models: Vec::new(),
-            email_accounts: Vec::new(),
             openai: None,
         }
     }
@@ -1901,9 +1977,6 @@ pub fn is_skill_enabled(chat_tools: &ChatToolsConfig, skill_id: &str) -> bool {
         .any(|disabled| disabled == skill_id)
 }
 
-/// Bundled skill id for the email (Himalaya) connector — hidden until configured.
-pub const EMAIL_CONNECTOR_SKILL_ID: &str = "himalaya";
-
 /// Bundled skill ids for the Obsidian connector — hidden until a vault path is
 /// configured. Adapted from kepano/obsidian-skills (see resources/skills/NOTICE.md).
 pub const OBSIDIAN_CONNECTOR_SKILL_IDS: &[&str] = &[
@@ -1913,24 +1986,13 @@ pub const OBSIDIAN_CONNECTOR_SKILL_IDS: &[&str] = &[
     "obsidian-cli",
 ];
 
-pub fn email_connector_configured(accounts: &[EmailAccountConfig]) -> bool {
-    !accounts.is_empty()
-}
-
 /// The Obsidian connector is "configured" once a vault path is set.
 pub fn obsidian_connector_configured(vault_path: &str) -> bool {
     !vault_path.trim().is_empty()
 }
 
 /// Connector-backed skills stay unavailable until their connector is configured.
-pub fn skill_connector_satisfied(
-    skill_id: &str,
-    email_accounts: &[EmailAccountConfig],
-    obsidian_vault_configured: bool,
-) -> bool {
-    if skill_id == EMAIL_CONNECTOR_SKILL_ID {
-        return email_connector_configured(email_accounts);
-    }
+pub fn skill_connector_satisfied(skill_id: &str, obsidian_vault_configured: bool) -> bool {
     if OBSIDIAN_CONNECTOR_SKILL_IDS.contains(&skill_id) {
         return obsidian_vault_configured;
     }
@@ -1942,21 +2004,19 @@ pub fn skill_connector_satisfied(
 pub fn skill_globally_available(
     chat_tools: &ChatToolsConfig,
     skill_id: &str,
-    email_accounts: &[EmailAccountConfig],
     obsidian_vault_configured: bool,
 ) -> bool {
     if !crate::plugins::plugin_skill_available(skill_id) {
         return false;
     }
     is_skill_enabled(chat_tools, skill_id)
-        && skill_connector_satisfied(skill_id, email_accounts, obsidian_vault_configured)
+        && skill_connector_satisfied(skill_id, obsidian_vault_configured)
 }
 
 /// When [`skill_globally_available`] is false, returns a loop/UI-friendly error.
 pub fn skill_global_unavailable_error(
     chat_tools: &ChatToolsConfig,
     skill_id: &str,
-    email_accounts: &[EmailAccountConfig],
     obsidian_vault_configured: bool,
     skill_name: &str,
 ) -> Option<String> {
@@ -1971,12 +2031,7 @@ pub fn skill_global_unavailable_error(
     if !is_skill_enabled(chat_tools, skill_id) {
         return Some(format!("Skill is disabled in Settings: {skill_name}"));
     }
-    if !skill_connector_satisfied(skill_id, email_accounts, obsidian_vault_configured) {
-        if skill_id == EMAIL_CONNECTOR_SKILL_ID {
-            return Some(format!(
-                "Skill requires a configured email connector: {skill_name}"
-            ));
-        }
+    if !skill_connector_satisfied(skill_id, obsidian_vault_configured) {
         return Some(format!(
             "Skill requires a configured Obsidian connector: {skill_name}"
         ));
@@ -2025,62 +2080,6 @@ fn mirror_explicit_chat_default_for_persistence(settings: &mut Settings) {
     }
 }
 
-fn sanitize_email_accounts(accounts: &mut Vec<EmailAccountConfig>) {
-    accounts.retain(|account| !account.email.trim().is_empty());
-    for account in accounts.iter_mut() {
-        account.email = account.email.trim().to_string();
-        account.display_name = account.display_name.trim().to_string();
-        account.password = account.password.trim().to_string();
-        account.imap_host = account.imap_host.trim().to_string();
-        account.smtp_host = account.smtp_host.trim().to_string();
-        account.imap_encryption = account.imap_encryption.trim().to_lowercase();
-        account.smtp_encryption = account.smtp_encryption.trim().to_lowercase();
-        if account.id.trim().is_empty() {
-            account.id = email_account_id_from_address(&account.email);
-        } else {
-            account.id = account
-                .id
-                .trim()
-                .to_lowercase()
-                .chars()
-                .map(|c| {
-                    if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                        c
-                    } else {
-                        '-'
-                    }
-                })
-                .collect::<String>()
-                .trim_matches('-')
-                .to_string();
-        }
-        if account.id.is_empty() {
-            account.id = "default".to_string();
-        }
-        if account.display_name.is_empty() {
-            account.display_name = account.email.clone();
-        }
-        if account.imap_port == 0 {
-            account.imap_port = default_imap_port();
-        }
-        if account.smtp_port == 0 {
-            account.smtp_port = default_smtp_port();
-        }
-        if account.imap_encryption.is_empty() {
-            account.imap_encryption = default_imap_encryption();
-        }
-        if account.smtp_encryption.is_empty() {
-            account.smtp_encryption = default_smtp_encryption();
-        }
-    }
-    if accounts.len() == 1 {
-        accounts[0].is_default = true;
-    }
-    if !accounts.is_empty() && !accounts.iter().any(|account| account.is_default) {
-        accounts[0].is_default = true;
-    }
-}
-
 pub fn sanitize_settings(mut settings: Settings) -> Settings {
     // RapidOCR 档位归一:非法值回落到各自默认(截图=standard,文档处理=high)。
     if settings.screenshot_translation.rapid_ocr_tier != "standard"
@@ -2116,6 +2115,7 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
                 model_overrides: std::collections::HashMap::new(),
                 compress_request_body: false,
                 request: Default::default(),
+                active_key_index: 0,
             });
             settings.translator_provider_id = "default-translator".to_string();
             settings.translator_model = old_openai.model;
@@ -2141,6 +2141,7 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
                 model_overrides: std::collections::HashMap::new(),
                 compress_request_body: false,
                 request: Default::default(),
+                active_key_index: 0,
             });
             settings.screenshot_translation.provider_id = "default-ocr".to_string();
             settings.screenshot_translation.model = old_ocr.model;
@@ -2154,14 +2155,31 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
             let trimmed = legacy.trim().to_string();
             if !trimmed.is_empty() && !provider.api_keys.contains(&trimmed) {
                 provider.api_keys.insert(0, trimmed);
+                provider.active_key_index = provider.active_key_index.saturating_add(1);
             }
         }
-        // 去重 + 去空
+        // 去重 + 去空，并跟着挪 active_key_index（删掉当前槽前面的空/重复项时不能还指着旧下标）。
+        let old_active = provider.active_key_index;
         let mut seen = std::collections::HashSet::new();
-        provider.api_keys.retain(|k| {
+        let mut kept: Vec<String> = Vec::with_capacity(provider.api_keys.len());
+        let mut mapped_active: Option<usize> = None;
+        for (i, k) in provider.api_keys.iter().enumerate() {
             let trimmed = k.trim();
-            !trimmed.is_empty() && seen.insert(trimmed.to_string())
-        });
+            if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+                continue;
+            }
+            if i == old_active {
+                mapped_active = Some(kept.len());
+            }
+            kept.push(k.clone());
+        }
+        provider.api_keys = kept;
+        provider.active_key_index = match provider.api_keys.len() {
+            0 => 0,
+            n => mapped_active
+                .unwrap_or_else(|| old_active.min(n - 1))
+                .min(n - 1),
+        };
 
         // 请求配置归一：settings.json 是用户可以手改的文件，非法头名会让 reqwest
         // 构造请求时直接失败，头值里的 CR/LF 是 header 注入，这里一并丢掉。
@@ -2260,6 +2278,7 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
             &mut settings.default_models.title_summary,
             &mut settings.default_models.compression,
             &mut settings.default_models.image_generation,
+            &mut settings.default_models.prompt_optimize,
         ] {
             if removed_legacy_local_provider_ids.contains(&selection.provider_id) {
                 if let Some((id, model)) = fallback.as_ref() {
@@ -2357,6 +2376,10 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
             &mut settings.default_models.image_generation,
             &settings.providers,
         );
+        sanitize_default_model_selection(
+            &mut settings.default_models.prompt_optimize,
+            &settings.providers,
+        );
         sanitize_default_model_selection(&mut settings.default_models.advisor, &settings.providers);
     }
 
@@ -2436,6 +2459,40 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
         settings.lens.web_search.ollama_api_key.trim().to_string();
     settings.lens.web_search.grok_api_key =
         settings.lens.web_search.grok_api_key.trim().to_string();
+    settings.lens.web_search.deepseek_api_key =
+        settings.lens.web_search.deepseek_api_key.trim().to_string();
+    settings.lens.web_search.brave_api_key =
+        settings.lens.web_search.brave_api_key.trim().to_string();
+    settings.lens.web_search.serper_api_key =
+        settings.lens.web_search.serper_api_key.trim().to_string();
+    settings.lens.web_search.bocha_api_key =
+        settings.lens.web_search.bocha_api_key.trim().to_string();
+    settings.lens.web_search.zhipu_api_key =
+        settings.lens.web_search.zhipu_api_key.trim().to_string();
+    settings.lens.web_search.tinyfish_api_key =
+        settings.lens.web_search.tinyfish_api_key.trim().to_string();
+    settings.lens.web_search.tinyfish_mcp_url = {
+        let trimmed = settings.lens.web_search.tinyfish_mcp_url.trim();
+        if trimmed.is_empty() {
+            default_tinyfish_mcp_url()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    if let Some(auth) = settings.lens.web_search.tinyfish_mcp_auth.as_mut() {
+        auth.access_token = auth.access_token.trim().to_string();
+    }
+    if settings
+        .lens
+        .web_search
+        .tinyfish_mcp_auth
+        .as_ref()
+        .is_some_and(|auth| auth.access_token.is_empty())
+    {
+        settings.lens.web_search.tinyfish_mcp_auth = None;
+    }
+    settings.lens.web_search.searxng_base_url =
+        settings.lens.web_search.searxng_base_url.trim().to_string();
     settings.lens.web_search.grok_model = {
         let trimmed = settings.lens.web_search.grok_model.trim();
         if trimmed.is_empty() {
@@ -2461,6 +2518,31 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
     {
         settings.lens.web_search.grok_system_prompt = default_grok_system_prompt();
     }
+    settings.lens.web_search.deepseek_model = {
+        let trimmed = settings.lens.web_search.deepseek_model.trim();
+        if trimmed.is_empty() {
+            default_deepseek_model()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    settings.lens.web_search.deepseek_base_url = {
+        let trimmed = settings.lens.web_search.deepseek_base_url.trim();
+        if trimmed.is_empty() {
+            default_deepseek_base_url()
+        } else {
+            trimmed.to_string()
+        }
+    };
+    if settings
+        .lens
+        .web_search
+        .deepseek_system_prompt
+        .trim()
+        .is_empty()
+    {
+        settings.lens.web_search.deepseek_system_prompt = default_grok_system_prompt();
+    }
     settings.lens.web_search.exa_mcp_url = {
         let trimmed = settings.lens.web_search.exa_mcp_url.trim();
         if trimmed.is_empty() {
@@ -2475,6 +2557,19 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
         WebSearchProvider::Unknown
     ) {
         settings.lens.web_search.provider = WebSearchProvider::Tavily;
+    }
+    // Fetch 源未设 = 跟随搜索。未知、或没有 URL fetch 接口的源清掉，避免配了却永远走直连。
+    if settings
+        .lens
+        .web_search
+        .fetch_provider
+        .is_some_and(|provider| {
+            matches!(provider, WebSearchProvider::Unknown)
+                || !crate::web_search::provider_supports_fetch(provider)
+                || provider == settings.lens.web_search.provider
+        })
+    {
+        settings.lens.web_search.fetch_provider = None;
     }
     settings.lens.web_search.max_results = settings.lens.web_search.max_results.clamp(1, 10);
     if !matches!(
@@ -2601,7 +2696,6 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
         native.write_file = true;
         native.edit_file = true;
         native.run_command = true;
-        native.run_python = true;
         native.web_fetch = true;
         native.web_search = true;
         if settings.chat_tools.approval_policy == LEGACY_DEFAULT_APPROVAL_POLICY {
@@ -2741,7 +2835,6 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
     // 清理归档目录路径（去除首尾空白）
     settings.image_archive_path = settings.image_archive_path.trim().to_string();
     settings.obsidian_vault_path = settings.obsidian_vault_path.trim().to_string();
-    sanitize_email_accounts(&mut settings.email_accounts);
 
     settings.retry_attempts = clamp_retry_attempts(settings.retry_attempts);
 
@@ -2826,7 +2919,7 @@ fn sanitize_external_cli_agents(
         if !cfg
             .providers
             .iter()
-            .any(|provider| provider.id == cfg.current_provider)
+            .any(|provider| provider.id == cfg.current_provider && !provider.disabled)
         {
             cfg.current_provider = String::new();
         }
@@ -2892,10 +2985,8 @@ pub fn persist_settings(app: &AppHandle, settings: &Settings) -> Result<(), Stri
     mirror_explicit_chat_default_for_persistence(&mut to_persist);
 
     for provider in &mut to_persist.providers {
-        if let Some(primary) = provider.api_keys.first() {
-            if !primary.trim().is_empty() {
-                provider.api_key_legacy = Some(primary.clone());
-            }
+        if let Some(primary) = provider.preferred_api_key() {
+            provider.api_key_legacy = Some(primary.to_string());
         }
     }
 
@@ -2981,7 +3072,7 @@ fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) -> std::io::
 
 /**
  * 从存储文件加载设置
- * 执行清理迁移；若 settings.json 中无 API Key，则从旧版 keyring 一次性迁移
+ * 执行清理迁移（legacy identifier 目录、sanitize）
  */
 pub fn load_settings(app: &AppHandle) -> Settings {
     // 入口先把旧 identifier 目录的数据搬到新目录（幂等）
@@ -3108,6 +3199,10 @@ pub fn default_question_prompt(language: &str, has_image: bool) -> String {
 }
 
 // ========== 默认值辅助函数 ==========
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
 
 fn default_true() -> bool {
     true
@@ -3243,6 +3338,13 @@ mod tests {
     }
 
     #[test]
+    fn legacy_settings_keep_chat_window_alive_off_by_default() {
+        let settings: Settings =
+            serde_json::from_str("{}").expect("legacy settings should deserialize");
+        assert!(!settings.keep_chat_window_alive);
+    }
+
+    #[test]
     fn legacy_model_info_without_temperature_deserializes_as_absent() {
         let info: ModelInfo = serde_json::from_str(
             r#"{"displayName":"Legacy","contextWindow":8192,"maxOutput":2048}"#,
@@ -3314,12 +3416,12 @@ mod tests {
         let mut s = Settings::default();
         s.chat.max_output_tokens = 0;
         let s = sanitize_settings(s);
-        assert_eq!(s.chat.max_output_tokens, 512);
+        assert_eq!(s.chat.max_output_tokens, 16_384);
 
         let mut s = Settings::default();
-        s.chat.max_output_tokens = 100_000;
+        s.chat.max_output_tokens = 32_768;
         let s = sanitize_settings(s);
-        assert_eq!(s.chat.max_output_tokens, 65_536);
+        assert_eq!(s.chat.max_output_tokens, 16_384);
     }
 
     #[test]
@@ -3497,6 +3599,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.providers.push(ModelProvider {
             id: "cloud".to_string(),
@@ -3511,6 +3614,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.translator_provider_id = "apple".to_string();
         s.translator_model = "apple-foundation".to_string();
@@ -3563,6 +3667,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         let s = sanitize_settings(s);
         let p = s.get_provider("p").unwrap();
@@ -3586,6 +3691,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         let s = sanitize_settings(s);
         let p = s.get_provider("p").unwrap();
@@ -3612,10 +3718,65 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         let s = sanitize_settings(s);
         let p = s.get_provider("p").unwrap();
         assert_eq!(p.api_keys, vec!["sk-1".to_string()]);
+    }
+
+    #[test]
+    fn sanitize_settings_remaps_active_key_index_when_empty_keys_dropped() {
+        let mut s = Settings::default();
+        s.providers.push(ModelProvider {
+            id: "p".to_string(),
+            name: "P".to_string(),
+            api_keys: vec![
+                "  ".to_string(),
+                "sk-keep".to_string(),
+                "sk-current".to_string(),
+            ],
+            api_key_legacy: None,
+            base_url: "https://api.example.com/v1".to_string(),
+            available_models: vec![],
+            enabled_models: vec!["m".to_string()],
+            api_format: "openai".to_string(),
+            enabled: true,
+            model_overrides: std::collections::HashMap::new(),
+            compress_request_body: false,
+            request: Default::default(),
+            active_key_index: 2,
+        });
+        let s = sanitize_settings(s);
+        let p = s.get_provider("p").unwrap();
+        assert_eq!(
+            p.api_keys,
+            vec!["sk-keep".to_string(), "sk-current".to_string()]
+        );
+        assert_eq!(p.active_key_index, 1);
+    }
+
+    #[test]
+    fn sanitize_settings_clamps_active_key_index_past_end() {
+        let mut s = Settings::default();
+        s.providers.push(ModelProvider {
+            id: "p".to_string(),
+            name: "P".to_string(),
+            api_keys: vec!["sk-a".to_string(), "sk-b".to_string()],
+            api_key_legacy: None,
+            base_url: "https://api.example.com/v1".to_string(),
+            available_models: vec![],
+            enabled_models: vec!["m".to_string()],
+            api_format: "openai".to_string(),
+            enabled: true,
+            model_overrides: std::collections::HashMap::new(),
+            compress_request_body: false,
+            request: Default::default(),
+            active_key_index: 9,
+        });
+        let s = sanitize_settings(s);
+        let p = s.get_provider("p").unwrap();
+        assert_eq!(p.active_key_index, 1);
     }
 
     #[test]
@@ -3744,6 +3905,7 @@ mod tests {
                 prompt_cache_retention: "garbage".into(),
                 ..Default::default()
             },
+            active_key_index: 0,
         }];
         // 非法 retention + bool false → none
         let s = sanitize_settings(settings.clone());
@@ -3982,6 +4144,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.translator_provider_id = "p".to_string();
         s.screenshot_translation.provider_id = "p".to_string();
@@ -4010,6 +4173,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.providers.push(ModelProvider {
             id: "lens".to_string(),
@@ -4024,6 +4188,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.translator_provider_id = "translator".to_string();
         s.translator_model = "gpt-4o".to_string();
@@ -4055,6 +4220,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.providers.push(ModelProvider {
             id: "lens".to_string(),
@@ -4069,6 +4235,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.translator_provider_id = "translator".to_string();
         s.translator_model = "gpt-4o".to_string();
@@ -4089,6 +4256,10 @@ mod tests {
         );
         assert_eq!(
             s.effective_compression_model_for_session(None),
+            s.effective_chat_model()
+        );
+        assert_eq!(
+            s.effective_prompt_optimize_model_for_session(None),
             s.effective_chat_model()
         );
         assert!(s.image_generation_model().is_none());
@@ -4114,6 +4285,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         settings.providers.push(ModelProvider {
             id: "session".to_string(),
@@ -4128,6 +4300,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         settings.default_models.chat.provider_id = "global".to_string();
         settings.default_models.chat.model = "gemini-3.1-flash-lite".to_string();
@@ -4149,6 +4322,10 @@ mod tests {
             settings.effective_vision_model_for_session(Some(session)),
             ("session".to_string(), "gpt-4.1".to_string())
         );
+        assert_eq!(
+            settings.effective_prompt_optimize_model_for_session(Some(session)),
+            ("session".to_string(), "gpt-4.1".to_string())
+        );
     }
 
     #[test]
@@ -4167,6 +4344,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.chat_provider_id = "chat".to_string();
         s.chat_model = "m2".to_string();
@@ -4194,6 +4372,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.providers.push(ModelProvider {
             id: "vision".to_string(),
@@ -4208,6 +4387,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.providers.push(ModelProvider {
             id: "title".to_string(),
@@ -4222,6 +4402,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.providers.push(ModelProvider {
             id: "compression".to_string(),
@@ -4236,6 +4417,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.providers.push(ModelProvider {
             id: "image".to_string(),
@@ -4250,6 +4432,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.translator_provider_id = "chat".to_string();
         s.translator_model = "chat-model".to_string();
@@ -4284,6 +4467,10 @@ mod tests {
             ("compression".to_string(), "compression-model".to_string())
         );
         assert_eq!(
+            s.effective_prompt_optimize_model_for_session(None),
+            s.effective_chat_model()
+        );
+        assert_eq!(
             s.image_generation_model(),
             Some(("image".to_string(), "image-model".to_string()))
         );
@@ -4305,6 +4492,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.translator_provider_id = "chat".to_string();
         s.translator_model = "m1".to_string();
@@ -4351,6 +4539,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.providers.push(ModelProvider {
             id: "lens".to_string(),
@@ -4365,6 +4554,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.translator_provider_id = "translator".to_string();
         s.translator_model = "gpt-4o".to_string();
@@ -4415,6 +4605,8 @@ mod tests {
             value["defaultModels"]["imageGeneration"]["model"],
             "image-model"
         );
+        assert_eq!(value["defaultModels"]["promptOptimize"]["providerId"], "");
+        assert_eq!(value["defaultModels"]["promptOptimize"]["model"], "");
         assert!(value["defaultModels"]["chat"]["providerId"]
             .as_str()
             .unwrap()
@@ -4522,6 +4714,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.lens.provider_id = "nonexistent".to_string();
         s.lens.model = "ghost-model".to_string();
@@ -4547,6 +4740,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         let s = sanitize_settings(s);
         assert_eq!(s.onboarding_status, "completed");
@@ -4575,6 +4769,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         let s = sanitize_settings(s);
         assert_eq!(s.onboarding_status, "pending");
@@ -4596,6 +4791,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.providers.push(ModelProvider {
             id: "active".to_string(),
@@ -4610,6 +4806,7 @@ mod tests {
             model_overrides: std::collections::HashMap::new(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
         s.translator_provider_id = "disabled".to_string();
         s.translator_model = "off-model".to_string();
@@ -4668,108 +4865,45 @@ mod tests {
     }
 
     #[test]
-    fn email_accounts_system_prompt_mentions_manual_install_and_binary() {
-        let account = EmailAccountConfig {
-            id: "work".into(),
-            email: "user@example.com".into(),
-            ..Default::default()
-        };
-        let prompt =
-            email_accounts_system_prompt(&[account], Some("/opt/kivio/himalaya")).expect("prompt");
-        assert!(prompt.contains("user@example.com"));
-        assert!(prompt.contains("Kivio Email connector"));
-        assert!(prompt.contains("Himalaya binary: /opt/kivio/himalaya"));
-        assert!(!prompt.contains("brew install"));
-
-        let en = email_accounts_system_prompt(
-            &[EmailAccountConfig {
-                email: "user@example.com".into(),
-                ..Default::default()
-            }],
-            None,
-        )
-        .expect("prompt");
-        assert!(en.contains("Kivio Email connector"));
-        assert!(!en.contains("automatically"));
-    }
-
-    #[test]
-    fn skill_globally_available_hides_himalaya_without_email() {
-        let chat_tools = ChatToolsConfig::default();
-        assert!(!skill_globally_available(
-            &chat_tools,
-            EMAIL_CONNECTOR_SKILL_ID,
-            &[],
-            false,
-        ));
-        assert!(!skill_connector_satisfied(
-            EMAIL_CONNECTOR_SKILL_ID,
-            &[],
-            false
-        ));
-        // pdf is not connector-gated
-        assert!(skill_globally_available(&chat_tools, "pdf", &[], false));
-    }
-
-    #[test]
     fn skill_globally_available_hides_obsidian_without_vault() {
         let chat_tools = ChatToolsConfig::default();
         for id in OBSIDIAN_CONNECTOR_SKILL_IDS {
             // No vault configured → each Obsidian skill is unavailable.
             assert!(
-                !skill_globally_available(&chat_tools, id, &[], false),
+                !skill_globally_available(&chat_tools, id, false),
                 "{id} should be hidden without a vault"
             );
-            assert!(!skill_connector_satisfied(id, &[], false));
-            // Vault configured → available (email state is irrelevant here).
+            assert!(!skill_connector_satisfied(id, false));
             assert!(
-                skill_globally_available(&chat_tools, id, &[], true),
+                skill_globally_available(&chat_tools, id, true),
                 "{id} should be available with a vault"
             );
-            assert!(skill_connector_satisfied(id, &[], true));
+            assert!(skill_connector_satisfied(id, true));
         }
         // Non-connector skills are unaffected by vault state.
-        assert!(skill_globally_available(&chat_tools, "pdf", &[], false));
+        assert!(skill_globally_available(&chat_tools, "pdf", false));
     }
 
     #[test]
     fn skill_global_unavailable_error_distinguishes_disabled_and_connector() {
         let mut chat_tools = ChatToolsConfig::default();
-        chat_tools.disabled_skill_ids = vec![EMAIL_CONNECTOR_SKILL_ID.to_string()];
+        chat_tools.disabled_skill_ids = vec!["obsidian-markdown".to_string()];
         assert_eq!(
             skill_global_unavailable_error(
                 &chat_tools,
-                EMAIL_CONNECTOR_SKILL_ID,
-                &[EmailAccountConfig {
-                    email: "a@example.com".into(),
-                    ..Default::default()
-                }],
-                false,
-                "himalaya",
+                "obsidian-markdown",
+                true,
+                "obsidian-markdown",
             )
             .as_deref(),
-            Some("Skill is disabled in Settings: himalaya")
+            Some("Skill is disabled in Settings: obsidian-markdown")
         );
 
         chat_tools.disabled_skill_ids.clear();
         assert_eq!(
             skill_global_unavailable_error(
                 &chat_tools,
-                EMAIL_CONNECTOR_SKILL_ID,
-                &[],
-                false,
-                "himalaya"
-            )
-            .as_deref(),
-            Some("Skill requires a configured email connector: himalaya")
-        );
-
-        // Obsidian skill without a vault → connector error; with a vault → None.
-        assert_eq!(
-            skill_global_unavailable_error(
-                &chat_tools,
                 "obsidian-markdown",
-                &[],
                 false,
                 "obsidian-markdown"
             )
@@ -4780,7 +4914,6 @@ mod tests {
             skill_global_unavailable_error(
                 &chat_tools,
                 "obsidian-markdown",
-                &[],
                 true,
                 "obsidian-markdown"
             ),

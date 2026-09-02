@@ -9,7 +9,7 @@
 //! 1. **复用用户的 `$DSH_HOME`**（默认 `~/.dsh`），因为 `settings.yaml` 里的供应商配置与
 //!    `.credentials.yaml` / `.env` 里的 key 都在那儿 —— 换一个私有 home 就等于要求用户再配一遍。
 //! 2. **只写 `profiles/kivio/`**。用户自己的 `profiles/web`、`profiles/tui` 与家目录那份
-//!    `cordis.patch.yml` 一律不碰（同 Kivio 从不改写 `~/.claude` / `~/.codex` 的既有红线）。
+//!    `cordis.patch.yml` 一律不碰（同 Kivio 不改写 `~/.claude` / `~/.codex` 的凭证与路由）。
 //! 3. **依赖安装走官方 `dsh plugin --profile` 通道**，不自己写 `package.json` + `pnpm install`。
 //!    那条命令做三件我们自己做会漏的事：按模板初始化 profile（`dsh.profile.bundles` 要写
 //!    `@deepseek-ai/dsh-base`，**少了它 profile 起来没有 agent**）、转发 pnpm、按安装结果回填
@@ -21,16 +21,19 @@
 //!
 //! 包含 Kivio profile 的装配与进程级配置：
 //! - `kivio-dsh-bridge.mjs` 一条 insert（在官方 server 上补 `resume` / `cancel` / `command` /
-//!   `commands` / `stop-job` RPC）
+//!   `commands` / `stop-job` / `steer` RPC；follow-up 走官方 `session/prompt`）
 //! - `hmr` 关掉：那是给开发热重载用的，常驻会话里只会带来意外重连
 //! - `session-title-llm` 关掉：Kivio 自己起标题，留着等于每轮多付一次模型调用
 //!   （实测确认它会发 `session/title-llm-request`）
-//! - `llm-deepseek.reasoningEffort`：官方 DeepSeek 路由的档位（只认 `off|high|max`）。
+//! - `llm-deepseek.reasoningEffort`：官方 DeepSeek 路由的档位（只认 `off|low|high|max`）。
 //!   第三方 `llm-pi-ai` 路由另写 `providers.<route>.reasoning`（pi-ai 档位表）。
 //!   都不是启动 flag，也不在 `initialize` 参数里，所以换档位必须重写这个文件并换进程。
-//! - `agent-presets`：四档 Agent 模式（standard / code / minimal / cordis）。与官方 web
-//!   一样关掉 host 平面工具，改由所选 preset 组装；`dsh --profile` 会把随包的
-//!   `config/agent-presets` 补进 `roots`。
+//! - `agent-presets`：官方四档（standard / code / minimal / cordis）加上
+//!   `$DSH_HOME/.agent-presets` 里用户自己写的 preset。与官方 web 一样关掉 host
+//!   平面工具，改由所选 preset 组装；`dsh --profile` 会把随包的 `config/agent-presets`
+//!   补进 `roots`，`includeUserRoot: true` 再挂上用户目录。
+//! - `storage` / `workspace`：与官方 web 共用 `$DSH_HOME/storages`。Kivio 创建的原生会话
+//!   必须挂进 Host Workspace，否则 dsh web 把它们全部丢进「其他项目」。
 //! - 当前 Kivio 供应商的 `llm-pi-ai.providers.<route>`：只挂在 `profiles/kivio`，Key 仅以
 //!   `apiKeyEnv` 引用并由 Kivio 注入进程，不写入 YAML。
 //!
@@ -39,6 +42,7 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::proc::NoConsoleWindow;
@@ -93,7 +97,7 @@ const HOST_PLANE_TOOL_IDS: &[&str] = &[
 ];
 
 /// `$DSH_HOME`，未设时 `~/.dsh`（与上游 `resolveDshHome` 同序）。
-fn dsh_home() -> Option<PathBuf> {
+pub(crate) fn dsh_home() -> Option<PathBuf> {
     if let Some(home) = std::env::var_os("DSH_HOME") {
         let path = PathBuf::from(home);
         if !path.as_os_str().is_empty() {
@@ -108,21 +112,136 @@ pub fn profile_dir() -> Option<PathBuf> {
     dsh_home().map(|home| home.join("profiles").join(KIVIO_PROFILE))
 }
 
-/// 合法 preset id；其它值（含空）回落 `standard`。
-pub fn normalize_agent_preset(value: Option<&str>) -> &'static str {
-    match value.map(str::trim) {
-        Some("code") => "code",
-        Some("minimal") => "minimal",
-        Some("cordis") => "cordis",
-        _ => "standard",
+const USER_PRESET_DIR: &str = ".agent-presets";
+const COMPOSITION_FILE: &str = "agent.cordis.yml";
+const METADATA_FILE: &str = "preset.yml";
+const BUILTIN_PRESET_IDS: &[&str] = &["standard", "code", "minimal", "cordis"];
+
+/// 底栏胶囊里一条用户 preset（官方四档由前端写死，不走这条）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DshAgentPresetOption {
+    pub id: String,
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// `$DSH_HOME/.agent-presets`。官方 web 的「创造模式」把自定义 preset 写在这里。
+pub fn user_preset_root() -> Option<PathBuf> {
+    dsh_home().map(|home| home.join(USER_PRESET_DIR))
+}
+
+/// 列出用户根目录里可加载的自定义 Agent preset（不含官方四档）。
+pub fn list_user_agent_presets() -> Vec<DshAgentPresetOption> {
+    user_preset_root()
+        .map(|root| list_user_agent_presets_in(&root))
+        .unwrap_or_default()
+}
+
+pub fn list_user_agent_presets_in(root: &Path) -> Vec<DshAgentPresetOption> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(id) = name.to_str().map(str::trim) else {
+            continue;
+        };
+        if !is_valid_preset_id(id) || is_builtin_preset_id(id) || !is_loadable_preset_dir(&path) {
+            continue;
+        }
+        let (label, description) = read_preset_metadata(&path);
+        out.push(DshAgentPresetOption {
+            id: id.to_string(),
+            label: label.unwrap_or_else(|| id.to_string()),
+            description,
+        });
     }
+    out.sort_by(|left, right| left.id.cmp(&right.id));
+    out
+}
+
+/// 合法 preset id；其它值（含空、未知自定义）回落 `standard`。
+///
+/// 自定义 id 必须同时满足官方目录名规则 `[a-z0-9][a-z0-9-]*`，并且
+/// `$DSH_HOME/.agent-presets/<id>/agent.cordis.yml` 存在——否则写进 patch 会让
+/// dsh 起不来，未知字符串也绝不能原样插进 YAML。
+pub fn normalize_agent_preset(value: Option<&str>) -> String {
+    resolve_agent_preset(value, user_preset_root().as_deref())
+}
+
+fn resolve_agent_preset(value: Option<&str>, user_root: Option<&Path>) -> String {
+    let Some(id) = value.map(str::trim).filter(|text| !text.is_empty()) else {
+        return "standard".to_string();
+    };
+    if is_builtin_preset_id(id) {
+        return id.to_string();
+    }
+    if is_valid_preset_id(id)
+        && user_root.is_some_and(|root| is_loadable_preset_dir(&root.join(id)))
+    {
+        return id.to_string();
+    }
+    "standard".to_string()
+}
+
+fn is_builtin_preset_id(id: &str) -> bool {
+    BUILTIN_PRESET_IDS.contains(&id)
+}
+
+/// 官方 `copy()` 校验：`[a-z0-9][a-z0-9-]*`。顺带封顶长度，挡住 YAML 注入。
+fn is_valid_preset_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > 128 {
+        return false;
+    }
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_lowercase() || first.is_ascii_digit())
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+fn is_loadable_preset_dir(dir: &Path) -> bool {
+    dir.join(COMPOSITION_FILE).is_file()
+}
+
+fn read_preset_metadata(dir: &Path) -> (Option<String>, Option<String>) {
+    let Ok(text) = std::fs::read_to_string(dir.join(METADATA_FILE)) else {
+        return (None, None);
+    };
+    let Ok(value) = serde_yaml::from_str::<serde_yaml::Value>(&text) else {
+        return (None, None);
+    };
+    let Some(map) = value.as_mapping() else {
+        return (None, None);
+    };
+    let field = |key: &str| {
+        map.get(serde_yaml::Value::String(key.to_string()))
+            .and_then(serde_yaml::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    };
+    (field("name"), field("description"))
+}
+
+#[tauri::command]
+pub fn chat_dsh_list_agent_presets() -> Vec<DshAgentPresetOption> {
+    list_user_agent_presets()
 }
 
 /// profile 的 `cordis.patch.yml` 内容。
 ///
 /// `reasoning` 为 `None` / 空 / `"default"` 时**不写** `llm-deepseek` 那条 —— 让适配器用它
 /// 自己的默认（实测 `defaultEffort: high`）。写一个 `default` 字面量会被 schema 拒（合法值
-/// 只有 `off|high|max`），整棵树起不来。
+/// 只有 `off|low|high|max`），整棵树起不来。
 fn render_patch(reasoning: Option<&str>, preset: Option<&str>) -> String {
     let mut out = String::from(
         "# 由 Kivio 生成并维护，请勿手改（每次启动 dsh 会话时按当前设置重写）。\n\
@@ -154,16 +273,35 @@ fn render_patch(reasoning: Option<&str>, preset: Option<&str>) -> String {
         out.push_str("\n  disabled: true\n");
     }
     out.push_str(
-        "\n# 四档 Agent 模式。随包 roots 由 `dsh --profile` 的 composeProfile 注入。\n\
+        "\n# Agent 模式：随包四档 + $DSH_HOME/.agent-presets 用户 preset。\n\
+         # 随包 roots 由 `dsh --profile` 的 composeProfile 注入；includeUserRoot\n\
+         # 让官方 web 写的自定义 preset 在 kivio profile 里也能挂上。\n\
          - insert:\n\
          \x20   - id: agent-presets\n\
          \x20     name: '@deepseek-ai/dsh-agent-presets'\n\
          \x20     config:\n\
+         \x20       includeUserRoot: true\n\
          \x20       default: ",
     );
-    out.push_str(normalize_agent_preset(preset));
+    out.push_str(&normalize_agent_preset(preset));
     out.push_str(
-        "\n\n# Kivio bridge：保留官方事件流，并补齐跨进程 resume 与协议级 cancel。\n\
+        "\n\n# 与官方 web 共用 $DSH_HOME/storages，把 Kivio 会话挂进 Host Workspace。\n\
+         # 只写插件名，包从本机 dsh 安装解析，不 `plugin add` 进 kivio profile。\n\
+         - insert:\n\
+         \x20   - id: storage\n\
+         \x20     name: '@deepseek-ai/dsh-storage'\n\
+         \x20   - id: storage-json\n\
+         \x20     name: '@deepseek-ai/dsh-storage-json'\n\
+         \x20     config:\n\
+         \x20       root: !!js dshHomePath('storages')\n\
+         \x20   - id: storage-domain\n\
+         \x20     name: '@deepseek-ai/dsh-storage-domain'\n\
+         \x20     config:\n\
+         \x20       backend: json\n\
+         \x20   - id: workspace\n\
+         \x20     name: '@deepseek-ai/dsh-workspace'\n\
+         \n\
+         # Kivio bridge：保留官方事件流，并补齐跨进程 resume 与协议级 cancel。\n\
          - insert:\n\
          \x20   - id: kivio-dsh-jsonrpc-bridge\n\
          \x20     name: './kivio-dsh-bridge.mjs'\n",
@@ -258,37 +396,51 @@ fn parse_active_provider(provider: &ExternalCliProvider) -> Result<ActiveDshProv
     })
 }
 
-fn render_patch_with_provider(
+fn render_patch_with_providers(
     reasoning: Option<&str>,
     preset: Option<&str>,
-    provider: Option<&ExternalCliProvider>,
+    providers: &[ExternalCliProvider],
 ) -> Result<String, String> {
     let mut out = render_patch(reasoning, preset);
-    let Some(provider) = provider else {
+    let providers: Vec<_> = providers
+        .iter()
+        .filter(|provider| !provider.disabled)
+        .collect();
+    if providers.is_empty() {
         return Ok(out);
-    };
-    let active = parse_active_provider(provider)?;
-    let mut config = active.config;
-    if let Some(object) = config.as_object_mut() {
-        if let Some(effort) = normalize_pi_reasoning_effort(reasoning) {
-            object.insert(
-                "reasoning".to_string(),
-                Value::String(effort.to_string()),
-            );
-        } else {
-            object.remove("reasoning");
-        }
     }
-    let yaml = serde_yaml::to_string(&config)
-        .map_err(|err| format!("序列化 dsh 供应商配置失败：{err}"))?;
-    out.push_str("\n# 仅挂载到 Kivio profile 的第三方供应商；API Key 只通过环境变量注入。\n");
-    out.push_str("- id: llm-pi-ai\n  config:\n    providers:\n      ");
-    out.push_str(&active.route);
-    out.push_str(":\n");
-    for line in yaml.trim_start_matches("---\n").lines() {
-        out.push_str("        ");
-        out.push_str(line);
-        out.push('\n');
+
+    let mut active_providers = Vec::with_capacity(providers.len());
+    let mut routes = std::collections::HashSet::new();
+    for provider in providers {
+        let active = parse_active_provider(provider)?;
+        if !routes.insert(active.route.clone()) {
+            return Err(format!("dsh 供应商路由重复：{}", active.route));
+        }
+        active_providers.push(active);
+    }
+
+    out.push_str("\n# 挂载到 Kivio profile 的第三方供应商；API Key 只通过环境变量注入。\n");
+    out.push_str("- id: llm-pi-ai\n  config:\n    providers:\n");
+    for active in active_providers {
+        let mut config = active.config;
+        if let Some(object) = config.as_object_mut() {
+            if let Some(effort) = normalize_pi_reasoning_effort(reasoning) {
+                object.insert("reasoning".to_string(), Value::String(effort.to_string()));
+            } else {
+                object.remove("reasoning");
+            }
+        }
+        let yaml = serde_yaml::to_string(&config)
+            .map_err(|err| format!("序列化 dsh 供应商配置失败：{err}"))?;
+        out.push_str("      ");
+        out.push_str(&active.route);
+        out.push_str(":\n");
+        for line in yaml.trim_start_matches("---\n").lines() {
+            out.push_str("        ");
+            out.push_str(line);
+            out.push('\n');
+        }
     }
     Ok(out)
 }
@@ -303,11 +455,12 @@ pub fn active_provider_default_route() -> Result<Option<(String, String)>, Strin
 
 /// 空 / `"default"` / 未知值视为「不指定」，与 `types::normalize_model` 同语义。
 ///
-/// 只认 `defs/dsh.rs` 的合法档位 `off|high|max`。其它字符串（含换行）绝不能写进
+/// 只认 `defs/dsh.rs` 的合法档位 `off|low|high|max`。其它字符串（含换行）绝不能写进
 /// 共享的 `cordis.patch.yml`：那是顶层 YAML 数组，插一行就能重开 host-plane 工具。
 fn normalize_reasoning_effort(value: Option<&str>) -> Option<&'static str> {
     match value.map(str::trim) {
         Some("off") => Some("off"),
+        Some("low") => Some("low"),
         Some("high") => Some("high"),
         Some("max") => Some("max"),
         _ => None,
@@ -372,8 +525,8 @@ pub async fn ensure_profile_ready(
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建 dsh profile 目录失败：{e}"))?;
     std::fs::write(dir.join(BRIDGE_FILENAME), BRIDGE_SOURCE)
         .map_err(|e| format!("写入 Kivio dsh bridge 失败：{e}"))?;
-    let provider = crate::external_agents::overrides::active_provider("dsh");
-    let patch = render_patch_with_provider(reasoning, preset, provider.as_ref())?;
+    let config = crate::external_agents::overrides::agent_config("dsh").unwrap_or_default();
+    let patch = render_patch_with_providers(reasoning, preset, &config.providers)?;
     std::fs::write(dir.join("cordis.patch.yml"), patch)
         .map_err(|e| format!("写入 dsh profile 配置失败：{e}"))
 }
@@ -408,9 +561,9 @@ fn strip_profile_agent_presets_dep(dir: &Path) {
 /// 用探测到的那个绝对二进制（与跑轮次的是同一个），不走 PATH 再查一次。
 fn remove_provider_env_from_install(
     command: &mut tokio::process::Command,
-    provider: Option<&ExternalCliProvider>,
+    providers: &[ExternalCliProvider],
 ) {
-    if let Some(provider) = provider {
+    for provider in providers.iter().filter(|provider| !provider.disabled) {
         for env in &provider.env {
             command.env_remove(&env.key);
         }
@@ -428,8 +581,8 @@ async fn install_packages(bin: &Path) -> Result<(), String> {
     let mut command = tokio::process::Command::new(bin);
     crate::external_agents::spawn::strip_parent_session_env(&mut command);
     crate::external_agents::installer::pin_official_npm_registry(&mut command);
-    let provider = crate::external_agents::overrides::active_provider("dsh");
-    remove_provider_env_from_install(&mut command, provider.as_ref());
+    let config = crate::external_agents::overrides::agent_config("dsh").unwrap_or_default();
+    remove_provider_env_from_install(&mut command, &config.providers);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -554,7 +707,20 @@ mod tests {
         assert!(yml.contains("id: kivio-dsh-jsonrpc-bridge"));
         assert!(yml.contains("name: '@deepseek-ai/dsh-agent-presets'"));
         assert!(yml.contains("default: standard"));
+        assert!(yml.contains("name: '@deepseek-ai/dsh-workspace'"));
+        assert!(yml.contains("dshHomePath('storages')"));
         assert!(yml.contains("- id: tool-bash\n  disabled: true"));
+    }
+
+    #[test]
+    fn patch_mounts_the_shared_dsh_workspace_registry() {
+        let yml = render_patch(None, None);
+        assert!(yml.contains("name: '@deepseek-ai/dsh-storage'"));
+        assert!(yml.contains("name: '@deepseek-ai/dsh-storage-json'"));
+        assert!(yml.contains("name: '@deepseek-ai/dsh-storage-domain'"));
+        assert!(yml.contains("name: '@deepseek-ai/dsh-workspace'"));
+        assert!(yml.contains("root: !!js dshHomePath('storages')"));
+        assert!(yml.contains("backend: json"));
     }
 
     #[test]
@@ -567,6 +733,16 @@ mod tests {
         assert!(BRIDGE_SOURCE.contains("agentPresets"));
         assert!(BRIDGE_SOURCE.contains("registerProvider"));
         assert!(BRIDGE_SOURCE.contains("session/ask"));
+        assert!(BRIDGE_SOURCE.contains("withExclusiveAgentCall"));
+        let cancel_at = BRIDGE_SOURCE
+            .find("async cancel(params)")
+            .expect("cancel handler");
+        assert!(
+            BRIDGE_SOURCE[cancel_at..cancel_at.saturating_add(700)]
+                .contains("withExclusiveAgentCall"),
+            "session/cancel must join the prompt/steer exclusive queue",
+        );
+        assert!(BRIDGE_SOURCE.contains("agent.followup = agent.steer.bind(agent)"));
         assert!(BRIDGE_SOURCE.contains("'userQuestions'"));
         assert!(BRIDGE_SOURCE.contains("'attachments'"));
         assert!(BRIDGE_SOURCE.contains("'jobs'"));
@@ -575,8 +751,16 @@ mod tests {
         assert!(BRIDGE_SOURCE.contains("session/commands"));
         assert!(BRIDGE_SOURCE.contains("session/stop-job"));
         assert!(BRIDGE_SOURCE.contains("commands.list"));
+        assert!(BRIDGE_SOURCE.contains("executeCommand"));
+        assert!(BRIDGE_SOURCE.contains("encodedCommandImages"));
+        assert!(BRIDGE_SOURCE.contains("commandExecuteTakesImages"));
         assert!(BRIDGE_SOURCE.contains("jobs.kill"));
         assert!(BRIDGE_SOURCE.contains("subagents.interrupt"));
+        assert!(BRIDGE_SOURCE.contains("workspaceRegistry"));
+        assert!(BRIDGE_SOURCE.contains("attachSession"));
+        assert!(BRIDGE_SOURCE.contains("shouldAttachWorkspace"));
+        assert!(BRIDGE_SOURCE.contains("process.chdir(this.cwd)"));
+        assert!(BRIDGE_SOURCE.contains("[kivio-dsh] workspace attach failed:"));
         assert!(!BRIDGE_SOURCE.contains("waitForProviderAdapter"));
         assert!(!BRIDGE_SOURCE.contains("@deepseek-ai/dsh-session"));
     }
@@ -585,7 +769,7 @@ mod tests {
     fn plugin_install_explicitly_removes_provider_key_env() {
         let provider = relay_provider();
         let mut command = tokio::process::Command::new("dsh");
-        remove_provider_env_from_install(&mut command, Some(&provider));
+        remove_provider_env_from_install(&mut command, &[provider]);
         let key = std::ffi::OsStr::new("KIVIO_DSH_RELAY_ONE_API_KEY");
         let entry = command.as_std().get_envs().find(|(name, _)| *name == key);
         assert!(matches!(entry, Some((_, None))));
@@ -594,7 +778,7 @@ mod tests {
     #[test]
     fn provider_patch_mounts_llm_pi_ai_without_serializing_the_api_key() {
         let provider = relay_provider();
-        let yml = render_patch_with_provider(Some("high"), None, Some(&provider)).unwrap();
+        let yml = render_patch_with_providers(Some("high"), None, &[provider]).unwrap();
         assert!(yml.contains("- id: llm-pi-ai"));
         assert!(yml.contains("relay-one:"));
         assert!(yml.contains("apiKeyEnv: KIVIO_DSH_RELAY_ONE_API_KEY"));
@@ -607,17 +791,54 @@ mod tests {
     }
 
     #[test]
+    fn provider_patch_mounts_multiple_providers_together() {
+        let first = relay_provider();
+        let mut second = relay_provider();
+        second.id = "relay-two".to_string();
+        second.name = "Relay Two".to_string();
+        second.native_provider_id = "relay-two".to_string();
+        second.default_model = "claude-test".to_string();
+        second.env = vec![crate::settings::CliEnvVar {
+            key: "KIVIO_DSH_RELAY_TWO_API_KEY".to_string(),
+            value: "sk-second".to_string(),
+        }];
+        second.config_json = second
+            .config_json
+            .replace("KIVIO_DSH_RELAY_ONE_API_KEY", "KIVIO_DSH_RELAY_TWO_API_KEY")
+            .replace("gpt-test", "claude-test");
+
+        let mut disabled = relay_provider();
+        disabled.id = "relay-disabled".to_string();
+        disabled.native_provider_id = "relay-disabled".to_string();
+        disabled.disabled = true;
+
+        let yml = render_patch_with_providers(None, None, &[first, second, disabled]).unwrap();
+        assert!(yml.contains("relay-one:"));
+        assert!(yml.contains("relay-two:"));
+        assert!(!yml.contains("relay-disabled:"));
+        assert!(yml.contains("id: gpt-test"));
+        assert!(yml.contains("id: claude-test"));
+        assert!(!yml.contains("sk-secret"));
+        assert!(!yml.contains("sk-second"));
+    }
+
+    #[test]
     fn provider_patch_writes_pi_ai_reasoning_for_custom_efforts() {
         let provider = relay_provider();
-        let yml = render_patch_with_provider(Some("low"), None, Some(&provider)).unwrap();
+        let yml = render_patch_with_providers(Some("low"), None, &[provider.clone()]).unwrap();
         assert!(yml.contains("reasoning: low"));
+        assert!(yml.contains("reasoningEffort: low"));
+
+        let yml = render_patch_with_providers(Some("minimal"), None, &[provider.clone()]).unwrap();
+        assert!(yml.contains("reasoning: minimal"));
         assert!(!yml.contains("reasoningEffort:"));
         assert!(!yml.contains("- id: llm-deepseek"));
 
-        let yml = render_patch_with_provider(Some("xhigh"), None, Some(&provider)).unwrap();
+        let yml = render_patch_with_providers(Some("xhigh"), None, &[provider.clone()]).unwrap();
         assert!(yml.contains("reasoning: xhigh"));
+        assert!(!yml.contains("reasoningEffort:"));
 
-        let yml = render_patch_with_provider(Some("default"), None, Some(&provider)).unwrap();
+        let yml = render_patch_with_providers(Some("default"), None, &[provider]).unwrap();
         assert!(!yml.contains("reasoning:"));
     }
 
@@ -625,13 +846,13 @@ mod tests {
     fn provider_patch_rejects_missing_key_and_invalid_default_model() {
         let mut provider = relay_provider();
         provider.env.clear();
-        assert!(render_patch_with_provider(None, None, Some(&provider))
+        assert!(render_patch_with_providers(None, None, &[provider])
             .unwrap_err()
             .contains("KIVIO_DSH_RELAY_ONE_API_KEY"));
 
         let mut provider = relay_provider();
         provider.default_model = "missing".to_string();
-        assert!(render_patch_with_provider(None, None, Some(&provider))
+        assert!(render_patch_with_providers(None, None, &[provider])
             .unwrap_err()
             .contains("默认模型"));
     }
@@ -677,20 +898,79 @@ mod tests {
     }
 
     #[test]
-    fn normalize_agent_preset_accepts_only_the_four_ids() {
+    fn normalize_agent_preset_accepts_builtins_and_rejects_unknown() {
         assert_eq!(normalize_agent_preset(None), "standard");
         assert_eq!(normalize_agent_preset(Some("")), "standard");
         assert_eq!(normalize_agent_preset(Some("default")), "standard");
         assert_eq!(normalize_agent_preset(Some("code")), "code");
         assert_eq!(normalize_agent_preset(Some("minimal")), "minimal");
         assert_eq!(normalize_agent_preset(Some("cordis")), "cordis");
+        assert_eq!(normalize_agent_preset(Some("missing-custom")), "standard");
+        assert_eq!(
+            normalize_agent_preset(Some("x\n- id: injected-tool")),
+            "standard"
+        );
     }
 
     #[test]
     fn patch_writes_the_selected_agent_preset() {
         let yml = render_patch(None, Some("minimal"));
+        assert!(yml.contains("includeUserRoot: true"));
         assert!(yml.contains("default: minimal"));
         assert!(!yml.contains("default: standard"));
+    }
+
+    #[test]
+    fn unknown_preset_is_not_interpolated_into_the_patch() {
+        let yml = render_patch(None, Some("x\n- id: injected-tool\n  disabled: false"));
+        assert!(yml.contains("default: standard"));
+        assert!(!yml.contains("injected-tool"));
+    }
+
+    fn write_user_preset(root: &Path, id: &str, metadata: Option<&str>, composition: bool) {
+        let dir = root.join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        if composition {
+            std::fs::write(dir.join(COMPOSITION_FILE), "- name: tool-bash\n").unwrap();
+        }
+        if let Some(text) = metadata {
+            std::fs::write(dir.join(METADATA_FILE), text).unwrap();
+        }
+    }
+
+    #[test]
+    fn lists_user_presets_and_normalizes_existing_custom_ids() {
+        let root = std::env::temp_dir().join(format!("kivio-dsh-presets-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        write_user_preset(
+            &root,
+            "code-review",
+            Some("name: 代码审查\ndescription: 只读评审\n"),
+            true,
+        );
+        write_user_preset(&root, "standard", None, true);
+        write_user_preset(&root, "empty-one", None, false);
+        write_user_preset(&root, "Bad_ID", None, true);
+
+        let listed = list_user_agent_presets_in(&root);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "code-review");
+        assert_eq!(listed[0].label, "代码审查");
+        assert_eq!(listed[0].description.as_deref(), Some("只读评审"));
+
+        assert_eq!(
+            resolve_agent_preset(Some("code-review"), Some(&root)),
+            "code-review"
+        );
+        assert_eq!(
+            resolve_agent_preset(Some("missing"), Some(&root)),
+            "standard"
+        );
+        assert_eq!(
+            resolve_agent_preset(Some("Bad_ID"), Some(&root)),
+            "standard"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
@@ -701,7 +981,7 @@ mod tests {
     }
 
     /// `default` 是 Kivio 侧的「不指定」哨兵，**不是** dsh 的合法档位值
-    /// （schema 只认 `off|high|max`）。写进去整棵配置树会在启动时被拒。
+    /// （schema 只认 `off|low|high|max`）。写进去整棵配置树会在启动时被拒。
     #[test]
     fn patch_omits_reasoning_for_default_and_blank() {
         for value in [None, Some(""), Some("   "), Some("default")] {
@@ -718,6 +998,7 @@ mod tests {
     #[test]
     fn off_is_a_real_effort_not_an_absence() {
         assert!(render_patch(Some("off"), None).contains("reasoningEffort: off"));
+        assert!(render_patch(Some("low"), None).contains("reasoningEffort: low"));
     }
 
     /// 未知档位（含换行 / YAML 注入）必须整段省略，不能原样插进共享 patch。
@@ -725,7 +1006,6 @@ mod tests {
     fn unknown_reasoning_is_omitted_not_interpolated() {
         for value in [
             Some("HIGH"),
-            Some("low"),
             Some("none"),
             Some("high\n- id: injected-tool\n  disabled: false"),
             Some("off\n- insert:\n    - id: evil"),
@@ -787,7 +1067,10 @@ mod tests {
                     dsh: pnpm failed in profile directory C:\\Users\\18758\\.dsh\\profiles\\kivio";
         assert!(pnpm_missing_in_output(None, real));
         assert!(pnpm_missing_in_output(Some(127), "pnpm not found on PATH"));
-        assert!(!pnpm_missing_in_output(Some(1), "network timeout contacting registry"));
+        assert!(!pnpm_missing_in_output(
+            Some(1),
+            "network timeout contacting registry"
+        ));
     }
 
     #[test]

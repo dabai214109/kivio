@@ -8,11 +8,8 @@ use crate::chat::agent::prepare as agent_prepare;
 use crate::chat::attachments::{
     compose_text_attachments_for_api, text_attachments_from_attachments,
 };
-use crate::chat::model_call::{
-    chat_missing_model_error, format_chat_missing_api_key_error, session_model_for_conversation,
-};
 use crate::chat::model_metadata::{
-    chat_max_output_tokens_for_model, model_can_generate_images_directly,
+    chat_max_output_tokens_on_wire, model_can_generate_images_directly,
 };
 use crate::chat::storage::live_set_system_prompt;
 use crate::chat::vision::{
@@ -20,7 +17,10 @@ use crate::chat::vision::{
     auxiliary_vision_tool_record, finish_auxiliary_vision_tool_record,
     user_content_with_auxiliary_vision_result,
 };
-use crate::chat::{Conversation, ToolCallStatus};
+use crate::chat::{
+    chat_missing_model_error, format_chat_missing_api_key_error, session_model_for_conversation,
+    Conversation, ToolCallStatus,
+};
 use crate::skills;
 use crate::state::AppState;
 
@@ -164,7 +164,6 @@ pub(super) async fn complete_assistant_reply_inner(
 
     let last_user_idx = conversation.messages.iter().rposition(|m| m.role == "user");
     let language = crate::settings::resolve_chat_language(&settings);
-    let stream_enabled = settings.chat.stream_enabled;
     // 思考：每对话等级覆盖全局开关。None=跟随全局（现状）；"off"=强制关；low/medium/high=按家族注入。
     let (thinking_enabled, thinking_level) = resolve_thinking(
         conversation.thinking_level.as_deref(),
@@ -357,22 +356,37 @@ pub(super) async fn complete_assistant_reply_inner(
     let last_user_content_for_main = augmented_last_user_content
         .as_deref()
         .or(last_user_api_content);
-    let skill_registry =
-        skills::build_registry(app, &settings.chat_tools.skill_scan_paths).unwrap_or_default();
+    let skill_cwd = crate::chat::storage::resolve_conversation_working_directory(
+        app,
+        conversation,
+        &settings.chat_tools.native_tools.working_directory,
+    )
+    .ok();
+    let skill_registry = skills::build_registry_in(
+        app,
+        &settings.chat_tools.skill_scan_paths,
+        skill_cwd.as_deref(),
+    )
+    .unwrap_or_default();
     let requested_skill_id = active_skill_id.or(conversation.active_skill_id.as_deref());
     let skill_id = resolve_forced_skill_id(
         &settings.chat_tools,
         conversation.assistant_snapshot.as_ref(),
         &skill_registry,
         requested_skill_id,
-        &settings.email_accounts,
         crate::settings::obsidian_connector_configured(&settings.obsidian_vault_path),
     );
     if skill_id.is_none() && conversation.active_skill_id.is_some() {
         conversation.active_skill_id = None;
     }
     let active_skill_detail = skill_id.as_deref().and_then(|id| {
-        skills::read_skill_detail(app, &settings.chat_tools.skill_scan_paths, id).ok()
+        skills::read_skill_detail_in(
+            app,
+            &settings.chat_tools.skill_scan_paths,
+            id,
+            skill_cwd.as_deref(),
+        )
+        .ok()
     });
     let mut effective_chat_tools = settings.chat_tools.clone();
     if arm.is_some() || probe {
@@ -495,13 +509,6 @@ pub(super) async fn complete_assistant_reply_inner(
     let set_system_prompt = live_set_system_prompt(app, conversation);
     let obsidian_vault_path = (!settings.obsidian_vault_path.trim().is_empty())
         .then_some(settings.obsidian_vault_path.as_str());
-    let himalaya_binary =
-        crate::connectors::himalaya::resolve_himalaya_binary_when_active(&settings.email_accounts)
-            .map(|path| path.display().to_string());
-    let email_accounts_prompt = crate::settings::email_accounts_system_prompt(
-        &settings.email_accounts,
-        himalaya_binary.as_deref(),
-    );
     let knowledge_base_prompt = crate::chat::knowledge_base::mount_system_prompt(
         app,
         &conversation.knowledge_base_ids,
@@ -529,8 +536,7 @@ pub(super) async fn complete_assistant_reply_inner(
         workbench_dir.as_deref(),
         knowledge_base_prompt.as_deref(),
         obsidian_vault_path,
-        &settings.email_accounts,
-        email_accounts_prompt.as_deref(),
+        &conversation.additional_directories,
     );
     // 从未成功连接的 MCP server：工具没法降级进列表，注一行说明让模型知道
     // "配置了但连不上"，而不是回答"没有这个工具"。
@@ -595,8 +601,7 @@ pub(super) async fn complete_assistant_reply_inner(
         workbench_dir.as_deref(),
         knowledge_base_prompt.as_deref(),
         obsidian_vault_path,
-        &settings.email_accounts,
-        email_accounts_prompt.as_deref(),
+        &conversation.additional_directories,
     );
 
     let chat_host = ChatAgentHost {
@@ -629,6 +634,7 @@ pub(super) async fn complete_assistant_reply_inner(
     // 否则模型调用敏感工具或 ask_user 会 await GUI 应答而永久挂起。
     #[cfg(debug_assertions)]
     let probe_host = ProbeAgentHost {
+        app: app.clone(),
         state: state.inner(),
     };
     let host: &dyn crate::chat::agent::AgentHost = {
@@ -650,7 +656,7 @@ pub(super) async fn complete_assistant_reply_inner(
         app: app.clone(),
         state: state.inner(),
     };
-    let max_output_tokens = chat_max_output_tokens_for_model(
+    let max_output_tokens = chat_max_output_tokens_on_wire(
         Some(&provider),
         &resolved_model,
         settings.chat.max_output_tokens,
@@ -679,13 +685,13 @@ pub(super) async fn complete_assistant_reply_inner(
             thinking_enabled,
             thinking_level,
             web_search_mode,
-            stream_enabled,
             max_output_tokens,
             retry_attempts,
             assistant_snapshot: conversation.assistant_snapshot.clone(),
             provider_tools_fallback_system_prompt,
             initial_anchor_total_tokens,
             initial_anchor_trailing_estimate,
+            skill_project_cwd: skill_cwd.clone(),
         },
         host,
         &executor,

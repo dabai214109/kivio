@@ -12,9 +12,8 @@ use base64::{engine::general_purpose, Engine as _};
 /// a unified workbench. Nothing writes here anymore; existing data is migrated
 /// lazily or removed with its conversation.
 const OUTPUTS_ROOT: &str = "Kivio/outputs";
-/// Legacy ephemeral exports tree from prior versions (`run_python` used to write
-/// here under `<conversation>/<message>/`). Still GC'd at startup so old runs go
-/// away; nothing writes here anymore.
+/// Legacy ephemeral exports tree from prior versions. Still GC'd at startup so
+/// old runs go away; nothing writes here anymore.
 const LEGACY_RUNS_ROOT: &str = "Kivio/runs";
 const LEGACY_RUNS_RETENTION_DAYS: u64 = 7;
 const MAX_EXPORT_FILE_BYTES: u64 = 12 * 1024 * 1024;
@@ -228,10 +227,14 @@ fn sanitize_export_filename(name: &str) -> String {
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("output");
+    // Keep Unicode letters/digits (CJK, etc.). NTFS/APFS already accept them.
+    // Only strip path separators, Windows reserved punctuation, and other
+    // non-identifier junk — `is_ascii_alphanumeric` was collapsing 销售报表.xlsx
+    // into ________.xlsx on the no-workspace export path.
     let sanitized = base
         .chars()
         .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
+            if ch.is_alphanumeric() || matches!(ch, '.' | '-' | '_') {
                 ch
             } else {
                 '_'
@@ -269,7 +272,7 @@ fn unique_export_path(dir: &Path, filename: &str) -> PathBuf {
     dir.join(format!("{stem}-{}", uuid::Uuid::new_v4()))
 }
 
-/// Export Pyodide artifacts into the current default workbench. The caller
+/// Export artifacts into the current default workbench. The caller
 /// resolves that directory from the ordinary conversation or bound project.
 pub fn export_sandbox_artifacts(
     ctx: &SandboxExportContext,
@@ -353,6 +356,10 @@ pub fn guess_mime_from_name(name: &str) -> String {
 /// ordinary conversation workbench. The `data_url` (read back) is only populated for files at
 /// or under the export size cap so previews/downloads of small files work; for
 /// larger files only `path`/`size_bytes` are set (the UI can still open it).
+///
+/// 图片是例外：**绝不整张内联**（Kivio 铁律「会话 JSON 不含 base64 整图」——这里生出的
+/// artifact 会原样进 ToolCallRecord 并随会话落盘，曾把 10 条消息的会话撑到 54MB）。
+/// 图片 `data_url` 只放缩略图，前端按 `path` 懒加载原图。
 pub fn build_delivery_artifact_for_path(path: &Path) -> Result<ChatToolArtifact, String> {
     let metadata = fs::metadata(path).map_err(|err| format!("Stat delivery file failed: {err}"))?;
     let size_bytes = metadata.len();
@@ -364,10 +371,14 @@ pub fn build_delivery_artifact_for_path(path: &Path) -> Result<ChatToolArtifact,
     let mime_type = guess_mime_from_name(&name);
     let data_url = if size_bytes <= MAX_EXPORT_FILE_BYTES {
         let bytes = fs::read(path).map_err(|err| format!("Read delivery file failed: {err}"))?;
-        Some(format!(
-            "data:{mime_type};base64,{}",
-            general_purpose::STANDARD.encode(&bytes)
-        ))
+        if mime_type.starts_with("image/") {
+            crate::chat::attachments::make_thumbnail_data_url(&bytes)
+        } else {
+            Some(format!(
+                "data:{mime_type};base64,{}",
+                general_purpose::STANDARD.encode(&bytes)
+            ))
+        }
     } else {
         None
     };
@@ -386,7 +397,7 @@ pub fn format_exported_paths(exports: &[SandboxExportedArtifact]) -> String {
         return String::new();
     }
     let mut lines = vec![
-        "generated files (saved to the current workbench and registered as artifacts; use their returned artifact IDs with present_artifacts to show selected files in chat):"
+        "generated files (saved to the current workbench and registered as artifacts; copy their art_ ids into present_artifacts to show selected files in chat — never file contents):"
             .to_string(),
     ];
     for export in exports {
@@ -554,6 +565,52 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// 图片成果卡绝不整张内联：data_url 只放缩略图，原图靠 path 懒加载。
+    /// （曾因整图内联把 10 条消息的会话 JSON 撑到 54MB。）非图片小文件维持整份内联。
+    #[test]
+    fn delivery_artifact_inlines_thumbnail_not_full_image() {
+        let dir = temp_dir("delivery_artifact");
+        fs::create_dir_all(&dir).expect("mkdir");
+
+        // >32KB 的噪声 PNG（避免被 PNG 压缩到阈值之下）
+        let img = image::RgbImage::from_fn(512, 512, |x, y| {
+            let v = x.wrapping_mul(2654435761).wrapping_add(y.wrapping_mul(40503));
+            image::Rgb([(v & 0xff) as u8, ((v >> 8) & 0xff) as u8, ((v >> 16) & 0xff) as u8])
+        });
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("encode png");
+        let png_bytes = buf.into_inner();
+        let image_path = dir.join("photo.png");
+        fs::write(&image_path, &png_bytes).expect("write png");
+
+        let artifact = build_delivery_artifact_for_path(&image_path).expect("image artifact");
+        assert_eq!(artifact.mime_type, "image/png");
+        assert_eq!(artifact.size_bytes, Some(png_bytes.len() as u64));
+        assert!(artifact.path.is_some());
+        assert!(artifact.data_url.starts_with("data:image/png;base64,"));
+        let payload = artifact.data_url.split_once(',').unwrap().1;
+        assert!(
+            payload.len() / 4 * 3 < png_bytes.len() / 2,
+            "data_url 必须是缩略图而不是整图: {} vs {}",
+            payload.len() / 4 * 3,
+            png_bytes.len()
+        );
+
+        // 非图片小文件保持整份内联（预览/下载依赖它）
+        let text_path = dir.join("report.txt");
+        fs::write(&text_path, b"hello kivio").expect("write txt");
+        let artifact = build_delivery_artifact_for_path(&text_path).expect("text artifact");
+        assert_eq!(artifact.mime_type, "text/plain");
+        assert_eq!(artifact.data_url, format!(
+            "data:text/plain;base64,{}",
+            general_purpose::STANDARD.encode(b"hello kivio")
+        ));
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn directory_membership_is_lenient_but_does_not_allow_escape() {
         let dir = temp_dir("membership");
@@ -602,6 +659,60 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(target.join("keep.txt")).unwrap(), "keep");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn sanitize_export_filename_keeps_unicode_letters() {
+        assert_eq!(sanitize_export_filename("销售报表.xlsx"), "销售报表.xlsx");
+        assert_eq!(sanitize_export_filename("Q1销售.xlsx"), "Q1销售.xlsx");
+        assert_eq!(
+            sanitize_export_filename("C25月度汇总.xlsx"),
+            "C25月度汇总.xlsx"
+        );
+        assert_eq!(sanitize_export_filename("chart.png"), "chart.png");
+    }
+
+    #[test]
+    fn sanitize_export_filename_strips_path_and_reserved_chars() {
+        assert_eq!(sanitize_export_filename("../报表.xlsx"), "报表.xlsx");
+        assert_eq!(sanitize_export_filename("a<>b?.xlsx"), "a__b_.xlsx");
+        assert_eq!(sanitize_export_filename("___"), "output.bin");
+    }
+
+    #[test]
+    fn export_preserves_cjk_filename_on_disk() {
+        let dir = temp_dir("cjk_export");
+        fs::create_dir_all(&dir).expect("mkdir");
+        let png = general_purpose::STANDARD.encode([137u8, 80, 78, 71, 13, 10, 26, 10]);
+        let ctx = SandboxExportContext {
+            conversation_id: "conv_cjk".to_string(),
+            message_id: "msg_cjk".to_string(),
+            tool_call_id: None,
+            output_directory: dir.clone(),
+        };
+        let exported = export_sandbox_artifacts(
+            &ctx,
+            &[ChatToolArtifact {
+                id: None,
+                name: "销售报表.xlsx".to_string(),
+                mime_type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    .to_string(),
+                data_url: format!("data:image/png;base64,{png}"),
+                size_bytes: Some(8),
+                path: None,
+            }],
+        )
+        .expect("export");
+        assert_eq!(exported.len(), 1);
+        assert_eq!(
+            exported[0]
+                .path
+                .file_name()
+                .and_then(|value| value.to_str()),
+            Some("销售报表.xlsx")
+        );
+        assert!(dir.join("销售报表.xlsx").is_file());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

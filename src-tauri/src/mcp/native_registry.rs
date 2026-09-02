@@ -23,6 +23,7 @@
 //! - Table order is the model-facing tool list order; keep it stable.
 
 use std::future::Future;
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use serde_json::Value;
@@ -37,13 +38,16 @@ use crate::state::AppState;
 
 use super::registry::NativeToolContext;
 use super::types::{
-    native_advisor_tool, native_bash_output_tool, native_edit_file_tool, native_glob_files_tool,
-    native_kill_background_tool, native_knowledge_search_tool, native_list_dir_tool,
-    native_memory_modify_tool, native_memory_read_tool, native_memory_search_tool,
-    native_present_artifacts_tool, native_read_file_tool, native_run_command_tool,
-    native_run_python_tool, native_save_assistant_tool, native_search_files_tool,
-    native_web_fetch_tool, native_web_search_tool, native_write_file_tool, ChatToolArtifact,
-    ChatToolDefinition, McpToolCallResult,
+    native_advisor_tool, native_automation_delete_tool, native_automation_get_tool,
+    native_automation_list_tool, native_automation_run_tool, native_automation_runs_tool,
+    native_automation_set_enabled_tool, native_automation_upsert_tool, native_bash_output_tool,
+    native_edit_file_tool, native_glob_files_tool, native_kill_background_tool,
+    native_knowledge_search_tool, native_list_dir_tool, native_memory_modify_tool,
+    native_memory_read_tool, native_memory_search_tool, native_present_artifacts_tool,
+    native_read_file_tool, native_run_command_tool, native_save_assistant_tool,
+    native_search_files_tool, native_web_fetch_tool, native_web_search_tool,
+    native_write_file_tool, ChatToolArtifact, ChatToolDefinition, McpToolCallResult,
+    PRESENT_ARTIFACTS_ARGUMENTS_MAX_CHARS,
 };
 
 /// Gate signature mirrors `list_native_builtin_tool_defs(native,
@@ -77,7 +81,7 @@ pub enum NativeToolCall {
     BlockingText(fn(&NativeToolWorkspace, &Value) -> Result<String, String>),
     /// spawn_blocking, structured `FileMutationResult` (write_file/edit_file).
     BlockingMutation(fn(&NativeToolWorkspace, &Value) -> Result<FileMutationResult, String>),
-    /// Full-context async call (web/memory/shell/python).
+    /// Full-context async call (web/memory/shell).
     Async(for<'a> fn(NativeCallCtx<'a>) -> NativeToolFuture<'a>),
     /// Conversation-scoped call (todo tools): runs before workspace
     /// resolution because it only needs the conversation id, matching the
@@ -147,6 +151,76 @@ pub static NATIVE_TOOLS: &[NativeToolEntry] = &[
         read_only: true,
         requires_session_consent: false,
         call: NativeToolCall::Async(call_knowledge_search),
+    },
+    NativeToolEntry {
+        name: "automation_list",
+        def: native_automation_list_tool,
+        enabled: |native, _, _| native.automation,
+        parallel_safe: true,
+        bypasses_approval: false,
+        read_only: true,
+        requires_session_consent: false,
+        call: NativeToolCall::Async(call_automation_list),
+    },
+    NativeToolEntry {
+        name: "automation_get",
+        def: native_automation_get_tool,
+        enabled: |native, _, _| native.automation,
+        parallel_safe: true,
+        bypasses_approval: false,
+        read_only: true,
+        requires_session_consent: false,
+        call: NativeToolCall::Async(call_automation_get),
+    },
+    NativeToolEntry {
+        name: "automation_upsert",
+        def: native_automation_upsert_tool,
+        enabled: |native, _, _| native.automation,
+        parallel_safe: false,
+        bypasses_approval: false,
+        read_only: false,
+        requires_session_consent: false,
+        call: NativeToolCall::Async(call_automation_upsert),
+    },
+    NativeToolEntry {
+        name: "automation_set_enabled",
+        def: native_automation_set_enabled_tool,
+        enabled: |native, _, _| native.automation,
+        parallel_safe: false,
+        bypasses_approval: false,
+        read_only: false,
+        requires_session_consent: false,
+        call: NativeToolCall::Async(call_automation_set_enabled),
+    },
+    NativeToolEntry {
+        name: "automation_run",
+        def: native_automation_run_tool,
+        enabled: |native, _, _| native.automation,
+        parallel_safe: false,
+        bypasses_approval: false,
+        read_only: false,
+        requires_session_consent: false,
+        call: NativeToolCall::Async(call_automation_run),
+    },
+    NativeToolEntry {
+        name: "automation_runs",
+        def: native_automation_runs_tool,
+        enabled: |native, _, _| native.automation,
+        parallel_safe: true,
+        bypasses_approval: false,
+        read_only: true,
+        requires_session_consent: false,
+        call: NativeToolCall::Async(call_automation_runs),
+    },
+    NativeToolEntry {
+        name: "automation_delete",
+        def: native_automation_delete_tool,
+        enabled: |native, _, _| native.automation,
+        parallel_safe: false,
+        bypasses_approval: false,
+        read_only: false,
+        requires_session_consent: false,
+        call: NativeToolCall::Async(call_automation_delete),
     },
     NativeToolEntry {
         name: "advisor",
@@ -278,16 +352,6 @@ pub static NATIVE_TOOLS: &[NativeToolEntry] = &[
         call: NativeToolCall::Async(call_save_assistant),
     },
     NativeToolEntry {
-        name: "run_python",
-        def: native_run_python_tool,
-        enabled: |native, _, _| native.run_python,
-        parallel_safe: false,
-        bypasses_approval: false,
-        read_only: false,
-        requires_session_consent: false,
-        call: NativeToolCall::Async(call_run_python),
-    },
-    NativeToolEntry {
         name: "present_artifacts",
         def: native_present_artifacts_tool,
         enabled: |_, _, _| true,
@@ -403,11 +467,54 @@ pub fn text_tool_result(content: String) -> McpToolCallResult {
 
 fn call_read_file(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
     Box::pin(async move {
-        let raw_path = ctx
+        let extra_paths = string_list_argument(ctx.arguments, "paths")?;
+        let single_path = ctx
             .arguments
             .get("path")
             .and_then(|value| value.as_str())
-            .unwrap_or_default();
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string);
+
+        let mut requested = extra_paths;
+        if let Some(path) = single_path.clone() {
+            if !requested.iter().any(|existing| existing == &path) {
+                requested.insert(0, path);
+            }
+        }
+
+        let (image_paths, non_image, skipped) =
+            resolve_requested_read_paths(ctx.workspace, &requested);
+        if !image_paths.is_empty() && (requested.len() > 1 || !non_image) {
+            if non_image {
+                return Ok(text_tool_result(
+                    "paths 只能用来读图片。文本文件请用 path 单独 read。".to_string(),
+                ));
+            }
+            if let Some(nc) = ctx.native_ctx {
+                let overview = ctx
+                    .arguments
+                    .get("overview")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
+                let mut result = crate::chat::commands::read_images_as_tool_result(
+                    ctx.app,
+                    ctx.settings,
+                    &nc.conversation_id,
+                    &nc.message_id,
+                    &image_paths,
+                    overview,
+                )
+                .await?;
+                append_skipped_read_notes(&mut result.content, &skipped);
+                return Ok(result);
+            }
+        }
+        if image_paths.is_empty() && !skipped.is_empty() && requested.len() > 1 {
+            return Ok(text_tool_result(skipped.join("\n")));
+        }
+
+        let raw_path = single_path.as_deref().unwrap_or_default();
         if let Ok(path) = crate::native_tools::resolve_tool_read_path(ctx.workspace, raw_path) {
             // 目录 → 列目录（并入原 ls 工具）。offset/limit 对目录忽略，走 list_dir 默认。
             if path.is_dir() {
@@ -431,14 +538,16 @@ fn call_read_file(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
                 return Ok(text_tool_result(hint));
             }
         }
+        if raw_path.is_empty() {
+            return Err("read requires path or paths".to_string());
+        }
         // 文本文件（及无法预解析为图片/文档的路径）→ 原同步文本读取。
         let result = crate::native_tools::read_file(ctx.workspace, ctx.arguments)?;
         super::registry::read_file_tool_result(result)
     })
 }
 
-/// PDF/Word/Excel 由内置 skill + `run_python` 解析（pypdf / python-docx /
-/// openpyxl），read 工具不读二进制文档；命中时返回引导提示而非 UTF-8 报错。
+/// PDF/Word/Excel 由内置 skill + 主机命令解析；read 工具不读二进制文档；命中时返回引导提示而非 UTF-8 报错。
 fn skill_backed_document_hint(path: &std::path::Path) -> Option<String> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     let (skill, kind) = match ext.as_str() {
@@ -452,7 +561,7 @@ fn skill_backed_document_hint(path: &std::path::Path) -> Option<String> {
         .and_then(|name| name.to_str())
         .unwrap_or("file");
     Some(format!(
-        "{name} 是{kind}，read 工具不解析此类文件。请改用「{skill}」skill：调用 run_python，把该文件的绝对路径作为 files 传入，用对应库提取内容。"
+        "{name} 是{kind}，read 工具不解析此类文件。请改用「{skill}」skill：用 bash 在主机上提取内容（若本机有对应 CLI 或 Python）；没有可用工具时如实告诉用户。"
     ))
 }
 
@@ -478,17 +587,38 @@ fn call_web_search(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
             &ctx.settings.lens.web_search,
             &query,
             retry_attempts,
+            Some(ctx.app),
         )
         .await?;
         let raw = serde_json::to_value(&results).unwrap_or(Value::Null);
         // 带上实际使用的搜索服务名，供前端工具卡片显示「Web search · <provider>」。
         let provider = crate::web_search::provider_label(ctx.settings.lens.web_search.provider);
+        // 与内置搜索卡同构的富引用列表（title/url 必有；snippet/published_date 尽力而为），
+        // 前端据此渲染可点来源目录，并把答案里的 [n] 锚到对应来源。
+        let citations: Vec<serde_json::Value> = results
+            .iter()
+            .map(|result| {
+                let snippet = (!result.content.is_empty())
+                    .then(|| result.content.chars().take(400).collect::<String>());
+                serde_json::json!({
+                    "title": result.title,
+                    "url": result.url,
+                    "snippet": snippet,
+                    "published_date": result.published_date,
+                })
+            })
+            .collect();
         Ok(McpToolCallResult {
             content: crate::web_search::format_web_context(&results),
             is_error: false,
             raw,
             artifacts: Vec::new(),
-            structured_content: Some(serde_json::json!({ "provider": provider })),
+            structured_content: Some(serde_json::json!({
+                "type": "third_party_web_search",
+                "provider": provider,
+                "queries": [query],
+                "citations": citations,
+            })),
             follow_up_user_messages: Vec::new(),
         })
     })
@@ -496,6 +626,32 @@ fn call_web_search(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
 
 fn call_web_fetch(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
     Box::pin(async move {
+        let url = ctx
+            .arguments
+            .get("url")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        if url.starts_with("https://") && crate::mcp::registry::web_fetch_configured(ctx.settings) {
+            let retry_attempts = if ctx.settings.retry_enabled {
+                ctx.settings.retry_attempts as usize
+            } else {
+                1
+            };
+            if let Ok(page) = crate::web_search::fetch_web(
+                ctx.state,
+                &ctx.settings.lens.web_search,
+                url,
+                retry_attempts,
+                Some(ctx.app),
+            )
+            .await
+            {
+                if !page.text.trim().is_empty() {
+                    return Ok(text_tool_result(crate::web_search::format_web_fetch(&page)));
+                }
+            }
+        }
         let content = crate::native_tools::web_fetch(&ctx.state.http, ctx.arguments).await?;
         Ok(text_tool_result(content))
     })
@@ -631,6 +787,39 @@ fn call_knowledge_search(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
     })
 }
 
+fn call_automation_list(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
+    Box::pin(async move { crate::automation::tools::list(ctx.app) })
+}
+
+fn call_automation_get(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
+    Box::pin(async move { crate::automation::tools::get(ctx.app, ctx.arguments) })
+}
+
+fn call_automation_upsert(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
+    Box::pin(async move { crate::automation::tools::upsert(ctx.app, ctx.arguments) })
+}
+
+fn call_automation_set_enabled(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
+    Box::pin(async move { crate::automation::tools::set_enabled(ctx.app, ctx.arguments) })
+}
+
+fn call_automation_run(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
+    Box::pin(async move {
+        let generation = ctx
+            .native_ctx
+            .map(|n| (n.conversation_id.as_str(), n.generation));
+        crate::automation::tools::run(ctx.app, ctx.arguments, generation).await
+    })
+}
+
+fn call_automation_runs(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
+    Box::pin(async move { crate::automation::tools::runs(ctx.app, ctx.arguments) })
+}
+
+fn call_automation_delete(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
+    Box::pin(async move { crate::automation::tools::delete(ctx.app, ctx.arguments) })
+}
+
 /// Advisor consultation (executor-advisor pattern). Runs a single-shot chat
 /// completion against the model configured in `default_models.advisor` and
 /// returns its guidance text. No tools, no recursion. If the advisor model is
@@ -686,11 +875,9 @@ fn call_advisor(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
         } else {
             1
         };
-        // Model-aware output cap (matches sub-agents / top-level chat): a small
-        // advisor model may have a real ceiling far below the global chat cap;
-        // sending the raw cap makes strict providers 400. Prefer the model
-        // library / provider override, fall back to the global setting.
-        let max_output_tokens = crate::chat::model_metadata::chat_max_output_tokens_for_model(
+        // Model-aware output cap (matching top-level chat). Unlisted models use
+        // the Pi-style 16k fallback, including OpenAI-compatible endpoints.
+        let max_output_tokens = crate::chat::model_metadata::chat_max_output_tokens_on_wire(
             Some(&provider),
             &model,
             ctx.settings.chat.max_output_tokens,
@@ -778,7 +965,6 @@ fn call_run_command(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
     Box::pin(async move {
         let content = crate::native_tools::run_command(
             ctx.workspace,
-            ctx.settings.chat_tools.tool_timeout_ms,
             ctx.arguments,
             Some(ctx.state),
             ctx.native_ctx.map(|c| c.conversation_id.as_str()),
@@ -799,7 +985,7 @@ fn call_bash_output(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
             .unwrap_or(false);
         let conversation_id = ctx.native_ctx.map(|c| c.conversation_id.as_str());
         let content = if has_job {
-            crate::native_tools::bash_output(ctx.state, ctx.arguments, conversation_id)?
+            crate::native_tools::bash_output(ctx.state, ctx.arguments, conversation_id).await?
         } else {
             crate::native_tools::list_background(ctx.state, ctx.arguments, conversation_id)?
         };
@@ -825,13 +1011,47 @@ fn call_save_assistant(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
     })
 }
 
+fn append_skipped_read_notes(content: &mut String, skipped: &[String]) {
+    if skipped.is_empty() {
+        return;
+    }
+    if !content.is_empty() {
+        content.push_str("\n\n");
+    }
+    content.push_str(&skipped.join("\n"));
+}
+
+fn resolve_requested_read_paths(
+    workspace: &NativeToolWorkspace,
+    requested: &[String],
+) -> (Vec<PathBuf>, bool, Vec<String>) {
+    let mut image_paths = Vec::new();
+    let mut non_image = false;
+    let mut skipped = Vec::new();
+    for raw in requested {
+        match crate::native_tools::resolve_tool_read_path(workspace, raw) {
+            Ok(path) => {
+                if !path.is_file() {
+                    skipped.push(format!("{raw}: not a readable file"));
+                } else if crate::chat::knowledge_base::process::is_image_ext(&path) {
+                    image_paths.push(path);
+                } else {
+                    non_image = true;
+                }
+            }
+            Err(err) => skipped.push(format!("{raw}: {err}")),
+        }
+    }
+    (image_paths, non_image, skipped)
+}
+
 fn string_list_argument(arguments: &Value, name: &str) -> Result<Vec<String>, String> {
     let Some(values) = arguments.get(name) else {
         return Ok(Vec::new());
     };
     let values = values
         .as_array()
-        .ok_or_else(|| format!("present_artifacts {name} must be an array"))?;
+        .ok_or_else(|| format!("{name} must be an array"))?;
     let mut items = Vec::new();
     for value in values {
         let Some(item) = value
@@ -863,6 +1083,13 @@ fn call_present_artifacts(
     workspace: &NativeToolWorkspace,
     arguments: &Value,
 ) -> Result<McpToolCallResult, String> {
+    let encoded = serde_json::to_string(arguments).unwrap_or_default();
+    if encoded.chars().count() > PRESENT_ARTIFACTS_ARGUMENTS_MAX_CHARS {
+        return Err(
+            "present_artifacts arguments are too large. Pass only artifact_ids or paths; never file contents, base64, or data URLs."
+                .to_string(),
+        );
+    }
     let artifact_ids = string_list_argument(arguments, "artifact_ids")?;
     let paths = string_list_argument(arguments, "paths")?;
     if artifact_ids.is_empty() && paths.is_empty() {
@@ -928,20 +1155,6 @@ fn call_present_artifacts(
     })
 }
 
-fn call_run_python(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
-    Box::pin(async move {
-        super::registry::run_python_via_pyodide(
-            ctx.app,
-            ctx.state,
-            ctx.settings,
-            ctx.workspace,
-            ctx.arguments,
-            ctx.native_ctx.cloned(),
-        )
-        .await
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -964,10 +1177,45 @@ mod tests {
         assert!(skill_backed_document_hint(Path::new("/a/shot.png")).is_none());
     }
 
+    #[test]
+    fn resolve_requested_read_paths_reports_unreadable_entries() {
+        let workspace = NativeToolWorkspace::standalone();
+        let (images, non_image, skipped) = resolve_requested_read_paths(
+            &workspace,
+            &[
+                "kivio-missing-read-test-7e2c9a1b.png".to_string(),
+                "kivio-missing-read-test-7e2c9a1b.jpg".to_string(),
+            ],
+        );
+        assert!(images.is_empty());
+        assert!(!non_image);
+        assert_eq!(skipped.len(), 2);
+        assert!(
+            skipped[0].contains("kivio-missing-read-test-7e2c9a1b.png"),
+            "{skipped:?}"
+        );
+        assert!(
+            skipped[1].contains("kivio-missing-read-test-7e2c9a1b.jpg"),
+            "{skipped:?}"
+        );
+
+        let mut content = "已读取 1 张图片".to_string();
+        append_skipped_read_notes(&mut content, &skipped);
+        assert!(content.contains("kivio-missing-read-test-7e2c9a1b.png"));
+        assert!(content.contains("已读取 1 张图片"));
+    }
+
     const EXPECTED_ORDER: &[&str] = &[
         "web_search",
         "web_fetch",
         "knowledge_search",
+        "automation_list",
+        "automation_get",
+        "automation_upsert",
+        "automation_set_enabled",
+        "automation_run",
+        "automation_runs",
+        "automation_delete",
         "advisor",
         "read",
         "ls",
@@ -979,7 +1227,6 @@ mod tests {
         "bash_output",
         "kill_background",
         "save_assistant",
-        "run_python",
         "present_artifacts",
         "memory_read",
         "memory_modify",
@@ -1018,7 +1265,7 @@ mod tests {
         // The predicate agrees with the flag, and non-file tools are excluded.
         assert!(native_tool_requires_session_consent("bash"));
         assert!(!native_tool_requires_session_consent("web_search"));
-        assert!(!native_tool_requires_session_consent("run_python"));
+        assert!(!native_tool_requires_session_consent("present_artifacts"));
         assert!(!native_tool_requires_session_consent("memory_read"));
     }
 
@@ -1050,6 +1297,9 @@ mod tests {
                 "web_search",
                 "web_fetch",
                 "knowledge_search",
+                "automation_list",
+                "automation_get",
+                "automation_runs",
                 "advisor",
                 "read",
                 "ls",
@@ -1102,6 +1352,9 @@ mod tests {
                 "web_search",
                 "web_fetch",
                 "knowledge_search",
+                "automation_list",
+                "automation_get",
+                "automation_runs",
                 "advisor",
                 "read",
                 "ls",
@@ -1126,8 +1379,8 @@ mod tests {
             write_file: true,
             edit_file: true,
             run_command: true,
-            run_python: true,
             knowledge_search: true,
+            automation: true,
             working_directory: String::new(),
             workspace_roots: Vec::new(),
         };
@@ -1175,8 +1428,8 @@ mod tests {
             write_file: false,
             edit_file: false,
             run_command: false,
-            run_python: false,
             knowledge_search: false,
+            automation: false,
             working_directory: String::new(),
             workspace_roots: Vec::new(),
         };
@@ -1208,6 +1461,22 @@ mod tests {
             ["write", "present_artifacts"]
         );
 
+        let mut automation_only = off.clone();
+        automation_only.automation = true;
+        assert_eq!(
+            names(&automation_only, false, false),
+            [
+                "automation_list",
+                "automation_get",
+                "automation_upsert",
+                "automation_set_enabled",
+                "automation_run",
+                "automation_runs",
+                "automation_delete",
+                "present_artifacts",
+            ]
+        );
+
         // memory gate is independent of native toggles.
         assert_eq!(
             names(&off, false, true),
@@ -1228,8 +1497,8 @@ mod tests {
             write_file: true,
             edit_file: true,
             run_command: true,
-            run_python: true,
             knowledge_search: true,
+            automation: true,
             working_directory: String::new(),
             workspace_roots: Vec::new(),
         };
@@ -1239,6 +1508,13 @@ mod tests {
                 "web_search",
                 "web_fetch",
                 "knowledge_search",
+                "automation_list",
+                "automation_get",
+                "automation_upsert",
+                "automation_set_enabled",
+                "automation_run",
+                "automation_runs",
+                "automation_delete",
                 "read",
                 "grep",
                 "glob",
@@ -1247,7 +1523,6 @@ mod tests {
                 "bash",
                 "bash_output",
                 "kill_background",
-                "run_python",
                 "present_artifacts",
                 "memory_read",
                 "memory_modify",
@@ -1373,5 +1648,19 @@ mod tests {
                 "artifactIds": []
             }))
         );
+    }
+
+    #[test]
+    fn present_artifacts_rejects_oversized_payload() {
+        let workspace = NativeToolWorkspace::standalone();
+        let err = call_present_artifacts(
+            &workspace,
+            &serde_json::json!({
+                "artifact_ids": ["art_a"],
+                "caption": "x".repeat(PRESENT_ARTIFACTS_ARGUMENTS_MAX_CHARS),
+            }),
+        )
+        .expect_err("oversized payload");
+        assert!(err.contains("too large"), "{err}");
     }
 }

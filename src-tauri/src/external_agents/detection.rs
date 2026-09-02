@@ -56,6 +56,7 @@ pub async fn detect_availability_single(def: &RuntimeAgentDef) -> DetectedAgent 
         native_providers: native_provider_summaries(def.id),
         disabled: false,
         supports_steering: def.supports_steering,
+        supports_follow_up: def.supports_follow_up,
     }
 }
 
@@ -237,7 +238,7 @@ struct DshDefaultModel {
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct DshDeepseekSettings {
-    /// `None` = 适配器默认 flash/pro；`Some([])` = 用户明确不公布任何模型。
+    /// `None` = 适配器默认 flash / pro / vision-exp；`Some([])` = 用户明确不公布任何模型。
     models: Option<Vec<DshModelEntry>>,
     reasoning_effort: Option<String>,
 }
@@ -309,7 +310,7 @@ impl DshModelEntry {
 
 const DSH_OFFICIAL_PROVIDER_ID: &str = "deepseek-official";
 const DSH_OFFICIAL_PROVIDER_NAME: &str = "DeepSeek";
-const DSH_OFFICIAL_DEFAULT_MODEL_COUNT: usize = 2;
+const DSH_OFFICIAL_DEFAULT_MODEL_COUNT: usize = 3;
 
 /// 设置页「所有供应商」用的摘要。dsh 的官方 DeepSeek 不在 `llm-pi-ai` 里，
 /// 但官方 UI 会单独列它；缓存命中时也要重读，所以 `pub(crate)`。
@@ -320,8 +321,12 @@ pub(crate) fn native_provider_summaries(agent_id: &str) -> Vec<NativeProviderSum
     let text = dsh_settings_path()
         .and_then(|path| std::fs::read_to_string(path).ok())
         .unwrap_or_default();
-    parse_dsh_native_provider_summaries(&text)
-        .unwrap_or_else(|_| vec![official_deepseek_summary(DSH_OFFICIAL_DEFAULT_MODEL_COUNT, true)])
+    parse_dsh_native_provider_summaries(&text).unwrap_or_else(|_| {
+        vec![official_deepseek_summary(
+            DSH_OFFICIAL_DEFAULT_MODEL_COUNT,
+            true,
+        )]
+    })
 }
 
 fn official_deepseek_summary(model_count: usize, is_default: bool) -> NativeProviderSummary {
@@ -353,7 +358,10 @@ fn parse_dsh_native_provider_summaries(text: &str) -> Result<Vec<NativeProviderS
         .as_ref()
         .and_then(|section| section.models.as_ref())
     {
-        Some(entries) => entries.iter().filter(|model| model.parts().is_some()).count(),
+        Some(entries) => entries
+            .iter()
+            .filter(|model| model.parts().is_some())
+            .count(),
         None => DSH_OFFICIAL_DEFAULT_MODEL_COUNT,
     };
     let mut providers = vec![official_deepseek_summary(
@@ -365,26 +373,28 @@ fn parse_dsh_native_provider_summaries(text: &str) -> Result<Vec<NativeProviderS
         .map(|section| section.providers.into_iter().collect())
         .unwrap_or_default();
     extras.sort_by(|(a, _), (b, _)| a.cmp(b));
-    providers.extend(extras.into_iter().map(|(id, config)| NativeProviderSummary {
-        is_default: default_provider == id.as_str(),
-        name: config
-            .display_name
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| id.clone()),
-        base_url: config
-            .base_url
-            .map(|url| url.trim().to_string())
-            .filter(|url| !url.is_empty()),
-        api: config
-            .api
-            .map(|api| api.trim().to_string())
-            .filter(|api| !api.is_empty()),
-        model_count: config
-            .models
-            .iter()
-            .filter(|model| model.parts().is_some())
-            .count(),
-        id,
+    providers.extend(extras.into_iter().map(|(id, config)| {
+        NativeProviderSummary {
+            is_default: default_provider == id.as_str(),
+            name: config
+                .display_name
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| id.clone()),
+            base_url: config
+                .base_url
+                .map(|url| url.trim().to_string())
+                .filter(|url| !url.is_empty()),
+            api: config
+                .api
+                .map(|api| api.trim().to_string())
+                .filter(|api| !api.is_empty()),
+            model_count: config
+                .models
+                .iter()
+                .filter(|model| model.parts().is_some())
+                .count(),
+            id,
+        }
     }));
     Ok(providers)
 }
@@ -406,9 +416,7 @@ fn read_dsh_settings_models() -> Result<ProbeModelsOutput, String> {
     parse_dsh_settings_models(&text)
 }
 
-const DSH_PI_EFFORT_ORDER: &[&str] = &[
-    "off", "minimal", "low", "medium", "high", "xhigh", "max",
-];
+const DSH_PI_EFFORT_ORDER: &[&str] = &["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 fn dsh_effort_option(id: &str) -> RuntimeModelOption {
     RuntimeModelOption {
@@ -430,7 +438,7 @@ fn dsh_effort_option(id: &str) -> RuntimeModelOption {
 }
 
 fn dsh_official_reasoning_options() -> Vec<RuntimeModelOption> {
-    ["default", "off", "high", "max"]
+    ["default", "off", "low", "high", "max"]
         .into_iter()
         .map(dsh_effort_option)
         .collect()
@@ -479,9 +487,9 @@ fn dsh_reasoning_options_from_json(
     match value {
         None => None,
         Some(serde_json::Value::Bool(false)) => Some(Vec::new()),
-        Some(serde_json::Value::Object(map)) => {
-            Some(dsh_reasoning_options_from_keys(map.keys().map(String::as_str)))
-        }
+        Some(serde_json::Value::Object(map)) => Some(dsh_reasoning_options_from_keys(
+            map.keys().map(String::as_str),
+        )),
         _ => Some(Vec::new()),
     }
 }
@@ -496,6 +504,11 @@ fn parse_dsh_settings_models(text: &str) -> Result<ProbeModelsOutput, String> {
     let deepseek_defaults = [
         ("deepseek-v4-flash", "DeepSeek-V4-Flash", Some(1_000_000)),
         ("deepseek-v4-pro", "DeepSeek-V4-Pro", Some(1_000_000)),
+        (
+            "deepseek-v4-flash-vision-exp",
+            "DeepSeek-V4-Flash-Vision-Exp",
+            Some(1_000_000),
+        ),
     ];
     match settings
         .llm_deepseek
@@ -537,8 +550,7 @@ fn parse_dsh_settings_models(text: &str) -> Result<ProbeModelsOutput, String> {
                 push_dsh_model(&mut models, &mut seen, &wire_id, &label, window);
                 reasoning_by_model.insert(
                     wire_id,
-                    dsh_reasoning_options_from_yaml(entry.reasoning_efforts())
-                        .unwrap_or_default(),
+                    dsh_reasoning_options_from_yaml(entry.reasoning_efforts()).unwrap_or_default(),
                 );
             }
         }
@@ -569,12 +581,24 @@ fn parse_dsh_settings_models(text: &str) -> Result<ProbeModelsOutput, String> {
                 .and_then(|section| section.reasoning_effort.clone())
         });
 
-    if let Some(provider) = crate::external_agents::overrides::active_provider("dsh") {
-        merge_kivio_dsh_provider(&mut models, &mut seen, &mut reasoning_by_model, &provider)?;
-        let route = provider.native_provider_id.trim();
-        let model = provider.default_model.trim();
-        if !route.is_empty() && !model.is_empty() {
-            current_model = Some(format!("{route}:{model}"));
+    if let Some(config) = crate::external_agents::overrides::agent_config("dsh") {
+        for provider in config
+            .providers
+            .iter()
+            .filter(|provider| !provider.disabled)
+        {
+            merge_kivio_dsh_provider(&mut models, &mut seen, &mut reasoning_by_model, provider)?;
+        }
+        if let Some(provider) = config
+            .providers
+            .iter()
+            .find(|provider| provider.id == config.current_provider && !provider.disabled)
+        {
+            let route = provider.native_provider_id.trim();
+            let model = provider.default_model.trim();
+            if !route.is_empty() && !model.is_empty() {
+                current_model = Some(format!("{route}:{model}"));
+            }
         }
     }
 
@@ -985,6 +1009,7 @@ pub async fn detect_single_agent(def: &RuntimeAgentDef, cwd: &Path) -> DetectedA
         native_providers: native_provider_summaries(def.id),
         disabled: false,
         supports_steering: def.supports_steering,
+        supports_follow_up: def.supports_follow_up,
     }
 }
 
@@ -1710,9 +1735,11 @@ llm-pi-ai:
     #[test]
     fn dsh_settings_defaults_native_catalog_but_respects_explicit_empty_models() {
         let defaults = parse_dsh_settings_models("{}").expect("default dsh settings");
-        assert_eq!(defaults.models.len(), 3);
+        assert_eq!(defaults.models.len(), 4);
         assert_eq!(defaults.models[1].id, "deepseek-v4-flash");
         assert_eq!(defaults.models[2].id, "deepseek-v4-pro");
+        assert_eq!(defaults.models[3].id, "deepseek-v4-flash-vision-exp");
+        assert_eq!(defaults.models[3].label, "DeepSeek-V4-Flash-Vision-Exp");
         assert_eq!(defaults.current_model.as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(defaults.current_reasoning.as_deref(), Some("high"));
 
@@ -1728,6 +1755,46 @@ llm-pi-ai:
         );
         assert_eq!(empty.current_model.as_deref(), Some("deepseek-v4-flash"));
         assert_eq!(empty.current_reasoning.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn dsh_settings_keep_official_vision_catalog_fields() {
+        let result = parse_dsh_settings_models(
+            r#"
+llm-deepseek:
+  models:
+    - id: deepseek-v4-flash
+      name: DeepSeek-V4-Flash
+    - id: deepseek-v4-flash-vision-exp
+      name: DeepSeek-V4-Flash-Vision-Exp
+      inputModalities: [text, image]
+      imagePixelBudget: 3317760
+      imageMaxBytes: 20971520
+"#,
+        )
+        .expect("parse official vision catalog");
+        assert_eq!(
+            result
+                .models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "default",
+                "deepseek-v4-flash",
+                "deepseek-v4-flash-vision-exp"
+            ]
+        );
+        assert_eq!(
+            result
+                .reasoning_by_model
+                .get("deepseek-v4-flash-vision-exp")
+                .map(|items| items
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<Vec<_>>()),
+            Some(vec!["default", "off", "low", "high", "max"])
+        );
     }
 
     #[test]
@@ -1822,7 +1889,7 @@ llm-pi-ai:
                     .iter()
                     .map(|item| item.id.as_str())
                     .collect::<Vec<_>>()),
-            Some(vec!["default", "off", "high", "max"])
+            Some(vec!["default", "off", "low", "high", "max"])
         );
     }
 
@@ -1850,7 +1917,7 @@ llm-pi-ai:
         assert_eq!(summaries.len(), 2);
         assert_eq!(summaries[0].id, "deepseek-official");
         assert_eq!(summaries[0].name, "DeepSeek");
-        assert_eq!(summaries[0].model_count, 2);
+        assert_eq!(summaries[0].model_count, 3);
         assert!(!summaries[0].is_default);
         assert_eq!(summaries[1].id, "xiaobai");
         assert_eq!(summaries[1].name, "XiaoBai");
@@ -1871,7 +1938,7 @@ llm-pi-ai:
         assert_eq!(empty.len(), 1);
         assert_eq!(empty[0].id, "deepseek-official");
         assert_eq!(empty[0].name, "DeepSeek");
-        assert_eq!(empty[0].model_count, 2);
+        assert_eq!(empty[0].model_count, 3);
         assert!(empty[0].is_default);
 
         let official = parse_dsh_native_provider_summaries(

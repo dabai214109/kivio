@@ -1,6 +1,27 @@
 import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
+
+const openExternal = vi.fn(() => Promise.resolve())
+vi.mock('../api/tauri', () => ({
+  api: {
+    get openExternal() {
+      return openExternal
+    },
+    get openLocalFile() {
+      return vi.fn(() => Promise.resolve())
+    },
+    onAutomationRun: () => Promise.resolve(() => {}),
+  },
+  isTauriRuntime: () => true,
+}))
+
+const PNG = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg'
+vi.mock('./attachmentPreview', () => ({
+  loadAttachmentDataUrl: () => Promise.resolve(PNG),
+  openAttachment: () => Promise.resolve(),
+}))
+
 import { ToolCallBlock } from './ToolCallBlock'
 import type { ToolCallRecord } from './types'
 
@@ -127,6 +148,35 @@ describe('ToolCallBlock', () => {
     expect(within(button).getByText(/正在生成工具参数/)).toBeInTheDocument()
   })
 
+  it('does not dump present_artifacts draft json or character counts', () => {
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'present_artifacts',
+          name: 'present_artifacts',
+          source: 'native',
+          status: 'pending',
+          result_preview: '正在生成工具参数…已收到 92,353 字符',
+          arguments: JSON.stringify({
+            _kivioToolDraft: true,
+            argumentChars: 92353,
+            phase: 'generating_arguments',
+            tool: 'present_artifacts',
+          }),
+          structured_content: {
+            toolDraft: {
+              argumentChars: 92353,
+              phase: 'generating_arguments',
+              toolName: 'present_artifacts',
+            },
+          },
+        })}
+      />,
+    )
+    expect(screen.getByText('present_artifacts')).toBeInTheDocument()
+    expect(screen.queryByText(/92,353|92353|_kivioToolDraft|已收到/)).not.toBeInTheDocument()
+  })
+
   it('shows the command as the bash target', () => {
     render(
       <ToolCallBlock
@@ -211,6 +261,37 @@ describe('ToolCallBlock', () => {
     expect(screen.getByText('这样做')).toBeInTheDocument()
   })
 
+  it('renders an automation_run record as a live progress card', async () => {
+    const user = userEvent.setup()
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'automation_run',
+          source: 'native',
+          status: 'running',
+          arguments: { id: 'auto-1' },
+          structured_content: {
+            type: 'automation_run',
+            automationId: 'auto-1',
+            runId: 'run-9',
+            name: '日报',
+            nodes: [
+              { nodeId: 't1', nodeType: 'trigger.schedule', status: 'success' },
+              { nodeId: 'a1', nodeType: 'action.agent', status: 'running' },
+            ],
+          },
+        })}
+      />,
+    )
+    expect(screen.getByText('AUTOMATION')).toBeInTheDocument()
+    expect(screen.getByText('日报')).toBeInTheDocument()
+    expect(screen.getByText('正在执行: action.agent')).toBeInTheDocument()
+    expect(screen.getByText('action.agent')).toBeInTheDocument()
+    expect(screen.getByText('打开工作流')).toBeInTheDocument()
+    await user.click(screen.getByText('打开工作流'))
+    expect(window.location.hash).toBe('#chat/automations/auto-1')
+  })
+
   it('renders a knowledge_search record as a KNOWLEDGE consult card with query and hits', async () => {
     const user = userEvent.setup()
     render(
@@ -237,50 +318,10 @@ describe('ToolCallBlock', () => {
     expect(screen.getByText('[1]')).toBeInTheDocument()
   })
 
-  it('renders a run_python record as a PYTHON consult card with code and output', async () => {
+  it('renders the built-in web search record as a dedicated source card', async () => {
+    // 内置搜索从「默认工具卡」升级为独立 WEB SEARCH 卡：头部带 provider 与来源计数，
+    // 展开后是编号可点的来源目录（标题 / 域名 / 日期 / 摘要）。
     const user = userEvent.setup()
-    render(
-      <ToolCallBlock
-        toolCall={buildToolCall({
-          toolName: 'run_python',
-          source: 'native',
-          status: 'success',
-          result_preview: 'hello from stdout',
-          arguments: { code: 'print("hello from stdout")' },
-        })}
-      />,
-    )
-    expect(screen.getByText('PYTHON')).toBeInTheDocument()
-    await user.click(screen.getByRole('button'))
-    expect(screen.getByText('Code')).toBeInTheDocument()
-    expect(screen.getByText('print("hello from stdout")')).toBeInTheDocument()
-    expect(screen.getByText('Output')).toBeInTheDocument()
-    expect(screen.getByText('hello from stdout')).toBeInTheDocument()
-  })
-
-  it('preserves newlines/indentation in the PYTHON card code block', async () => {
-    const user = userEvent.setup()
-    const code = 'def f():\n    return 1'
-    const { container } = render(
-      <ToolCallBlock
-        toolCall={buildToolCall({
-          toolName: 'run_python',
-          source: 'native',
-          status: 'success',
-          arguments: { code },
-        })}
-      />,
-    )
-    await user.click(screen.getByRole('button'))
-    // Code must NOT be whitespace-collapsed (regression guard against compactText):
-    // assert the raw newline + indentation survive in the <pre> textContent.
-    const pre = container.querySelector('pre')
-    expect(pre?.textContent).toBe(code)
-  })
-
-  it('renders the built-in web search record via the default compact card (Web search · provider)', () => {
-    // 任务 07-23:内置搜索复用默认 web_search 工具卡渲染(不再单独做卡片),
-    // 头部显示「Web search · <provider>」,provider 取自 structured_content.provider。
     render(
       <ToolCallBlock
         toolCall={buildToolCall({
@@ -292,12 +333,84 @@ describe('ToolCallBlock', () => {
             type: 'builtin_web_search',
             provider: 'OpenAI',
             queries: ['kivio release'],
-            citations: [{ title: 'A 站', url: 'https://a.com' }],
+            citations: [
+              { title: 'A 站', url: 'https://a.com' },
+              {
+                title: 'B 站',
+                url: 'https://www.b.com',
+                snippet: '关于 kivio 的发布说明',
+                published_date: '2025-06-01',
+              },
+            ],
           },
         })}
       />,
     )
-    expect(screen.getByText(/Web search · OpenAI/)).toBeInTheDocument()
+    expect(screen.getByText('WEB SEARCH')).toBeInTheDocument()
+    expect(screen.getByText('OpenAI')).toBeInTheDocument()
+    expect(screen.getByText('2 来源')).toBeInTheDocument()
+    // 展开前来源目录不渲染。
+    expect(screen.queryByText('A 站')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /WEB SEARCH/ }))
+    expect(screen.getByText('A 站')).toBeInTheDocument()
+    expect(screen.getByText('a.com')).toBeInTheDocument()
+    expect(screen.getByText(/b\.com · 2025-06-01/)).toBeInTheDocument() // www 前缀剥离 + 日期
+    expect(screen.getByText('关于 kivio 的发布说明')).toBeInTheDocument()
+    expect(screen.getByText(/2025-06-01/)).toBeInTheDocument()
+    // 点来源行 → 浏览器打开（不导航 webview）。
+    await user.click(screen.getByText('A 站'))
+    expect(openExternal).toHaveBeenCalledWith('https://a.com')
+  })
+
+  it('renders third-party search_web sources via the same card', async () => {
+    const user = userEvent.setup()
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'web_search',
+          source: 'native',
+          status: 'success',
+          arguments: JSON.stringify({ query: '天气' }),
+          structured_content: {
+            type: 'third_party_web_search',
+            provider: 'Tavily',
+            queries: ['天气'],
+            citations: [
+              {
+                title: '气象台',
+                url: 'https://weather.example/1',
+                snippet: '今天晴',
+                published_date: '2025-06-02',
+              },
+            ],
+          },
+        })}
+      />,
+    )
+    expect(screen.getByText('Tavily')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: /WEB SEARCH/ }))
+    expect(screen.getByText(/weather\.example/)).toBeInTheDocument()
+    expect(screen.getByText('今天晴')).toBeInTheDocument()
+  })
+
+  it('falls back to the plain result text when structured citations are absent', async () => {
+    // 旧数据（structured 只有 provider / 外部 CLI 无 structured）→ 结果区原样展示文本。
+    const user = userEvent.setup()
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'web_search',
+          source: 'native',
+          status: 'success',
+          arguments: JSON.stringify({ query: 'x' }),
+          structured_content: { provider: 'Tavily' },
+          result_preview: 'Web search context:\n[1] A\nURL: https://a.com',
+        })}
+      />,
+    )
+    await user.click(screen.getByRole('button', { name: /WEB SEARCH/ }))
+    expect(screen.getByText(/Web search context/)).toBeInTheDocument()
+    expect(screen.getByText(/URL: https:\/\/a\.com/)).toBeInTheDocument()
   })
 
   // ---- 外部 CLI（claude Code）的内置工具：名字 PascalCase + 字段名 file_path ----
@@ -372,6 +485,27 @@ describe('ToolCallBlock', () => {
     expect(screen.queryByText(/started subagent/)).not.toBeInTheDocument()
   })
 
+  it('keeps a dsh one-shot background subagent job receipt as running', () => {
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'subagent',
+          source: 'external_cli',
+          status: 'success',
+          arguments: {
+            description: '搜索最新AI资讯',
+            prompt: '去网上搜最近的模型发布',
+          },
+          result_preview: 'started background subagent job job_9',
+        })}
+      />,
+    )
+    expect(screen.getByText('SUBAGENT')).toBeInTheDocument()
+    expect(screen.getByText('运行中…')).toBeInTheDocument()
+    expect(screen.queryByText('已完成')).not.toBeInTheDocument()
+    expect(screen.queryByText(/started background subagent job/)).not.toBeInTheDocument()
+  })
+
   it('renders a dsh subagent call as a SUBAGENT consult card', () => {
     render(
       <ToolCallBlock
@@ -425,7 +559,23 @@ describe('ToolCallBlock', () => {
     expect(within(button).getByText('job_12')).toBeInTheDocument()
   })
 
-  it('maps dsh run_code to the Python verb, not the raw name', () => {
+  it('renders historical run_python as a generic tool row, not a PYTHON card', () => {
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'run_python',
+          source: 'native',
+          arguments: JSON.stringify({ code: 'print(1)' }),
+          result_preview: '1',
+        })}
+      />,
+    )
+    expect(screen.queryByText('PYTHON')).not.toBeInTheDocument()
+    const button = screen.getByRole('button')
+    expect(within(button).getByText('run_python')).toBeInTheDocument()
+  })
+
+  it('maps dsh run_code to Run, not the raw name', () => {
     render(
       <ToolCallBlock
         toolCall={buildToolCall({
@@ -436,7 +586,7 @@ describe('ToolCallBlock', () => {
       />,
     )
     const button = screen.getByRole('button')
-    expect(within(button).getByText('Python')).toBeInTheDocument()
+    expect(within(button).getByText('Run')).toBeInTheDocument()
     expect(within(button).queryByText(/run_code/)).not.toBeInTheDocument()
   })
 
@@ -763,5 +913,29 @@ describe('ToolCallBlock', () => {
     const button = screen.getByRole('button')
     expect(within(button).getByText('Grep')).toBeInTheDocument()
     expect(within(button).getByText('usage_parts_all_zero')).toBeInTheDocument()
+  })
+
+  it('shows a collapsible thumbnail row for image reads', async () => {
+    const user = userEvent.setup()
+    render(
+      <ToolCallBlock
+        toolCall={buildToolCall({
+          toolName: 'read',
+          arguments: { paths: ['/tmp/a.png', '/tmp/b.jpg'] },
+          structured_content: { type: 'image_read', count: 2 },
+          artifacts: [
+            { name: 'a.png', path: '/tmp/a.png', mime_type: 'image/png', data_url: '' },
+            { name: 'b.jpg', path: '/tmp/b.jpg', mime_type: 'image/jpeg', data_url: '' },
+          ],
+        })}
+      />,
+    )
+    const header = screen.getByRole('button', { name: /已查看 2 张图像/ })
+    expect(header).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('button', { name: '预览图片' })).not.toBeInTheDocument()
+
+    await user.click(header)
+    expect(header).toHaveAttribute('aria-expanded', 'true')
+    expect(await screen.findAllByRole('button', { name: '预览图片' })).toHaveLength(2)
   })
 })

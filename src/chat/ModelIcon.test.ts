@@ -4,6 +4,7 @@ import {
   _matchProviderGlyphForTest as matchProviderGlyph,
   _providerIconMapKeysForTest as providerIconMapKeys,
   PROVIDER_BRANDS,
+  PROVIDER_PICKER_KEYS,
 } from './ModelIcon'
 
 describe('ModelIcon model→brand mapping', () => {
@@ -12,7 +13,7 @@ describe('ModelIcon model→brand mapping', () => {
       'gpt-4o', 'o3-mini', 'claude-3-5-sonnet', 'gemini-2.0-flash', 'gemma-2',
       'deepseek-chat', 'qwen-max', 'grok-3', 'kimi-k2', 'moonshot-v1-8k',
       'glm-4', 'mistral-large', 'llama-3.1-70b', 'yi-large', 'doubao-pro',
-      'ernie-4.0', 'minimax-abab6', 'command-r', 'phi-3-medium', 'step-1v',
+      'ernie-4.0', 'minimax-abab6', 'hy3', 'hy4-preview', 'doubao-seed-2.1-pro', 'seed-2.0-code', 'mimo-v2.5-pro', 'command-r', 'phi-3-medium', 'step-1v',
     ]
     for (const id of cases) {
       expect(matchGlyph(id), `${id} should resolve a brand`).not.toBeNull()
@@ -40,17 +41,47 @@ describe('ProviderIcon provider→brand mapping', () => {
       ['https://api.siliconflow.cn/v1', 'SiliconCloud'],
       ['https://openrouter.ai/api/v1', 'OpenRouter'],
       ['https://integrate.api.nvidia.com/v1', 'Nvidia'],
-      ['https://open.bigmodel.cn/api/paas/v4', 'ChatGLM'],
+      ['https://open.bigmodel.cn/api/paas/v4', 'Zhipu'],
+      ['https://api.kimi.com/coding/v1', 'Kimi'],
+      ['https://api.moonshot.cn/v1', 'Moonshot'],
       ['https://ollama.com/v1', 'Ollama'],
       ['https://generativelanguage.googleapis.com/v1beta', 'Google'],
+      ['https://token-plan-cn.xiaomimimo.com/v1', 'XiaomiMiMo'],
+      ['https://opencode.ai/zen/go/v1', 'OpenCode'],
+      ['https://hezubus.cc/', 'Hezubus'],
     ]
     for (const [url, brand] of cases) {
       expect(matchProviderGlyph(`${url} 小白`), url).toBe(PROVIDER_BRANDS[brand])
     }
   })
 
+  it('uses the product brand when the name is Qwen/Doubao even on a cloud URL', () => {
+    expect(matchProviderGlyph('https://dashscope.aliyuncs.com/compatible-mode/v1 Qwen')).toBe(PROVIDER_BRANDS.Qwen)
+    expect(matchProviderGlyph('https://ark.cn-beijing.volces.com/api/v3 Doubao')).toBe(PROVIDER_BRANDS.Doubao)
+  })
+
   it('resolves by name when the base URL says nothing', () => {
     expect(matchProviderGlyph('https://llm.internal.corp/v1 英伟达')).toBe(PROVIDER_BRANDS.Nvidia)
+  })
+
+  it('maps glm/kimi models to Zhipu/Kimi, not the old ChatGLM/Moonshot marks', () => {
+    expect(matchGlyph('glm-4')).toBe(PROVIDER_BRANDS.Zhipu)
+    expect(matchGlyph('glm-4')).not.toBe(PROVIDER_BRANDS.ChatGLM)
+    expect(matchGlyph('ox-alpha')).toBe(PROVIDER_BRANDS.Zhipu)
+    expect(matchGlyph('stealth/ox-alpha')).toBe(PROVIDER_BRANDS.Zhipu)
+    expect(matchGlyph('hy3')).toBe(PROVIDER_BRANDS.Hunyuan)
+    expect(matchGlyph('hy4-preview')).toBe(PROVIDER_BRANDS.Hunyuan)
+    expect(matchGlyph('tencent/hy4-preview')).toBe(PROVIDER_BRANDS.Hunyuan)
+    expect(matchGlyph('hy-mt2-pro')).toBe(PROVIDER_BRANDS.Hunyuan)
+    expect(matchGlyph('hunyuan-role-latest')).toBe(PROVIDER_BRANDS.Hunyuan)
+    expect(matchGlyph('doubao-seed-2.1-pro')).toBe(PROVIDER_BRANDS.Doubao)
+    expect(matchGlyph('seed-2.0-code')).toBe(PROVIDER_BRANDS.Doubao)
+    expect(matchGlyph('bytedance-seed/seed-2.1-turbo')).toBe(PROVIDER_BRANDS.Doubao)
+    expect(matchGlyph('seedream-5.0-pro')).toBe(PROVIDER_BRANDS.Doubao)
+    expect(matchGlyph('hyperbolic-llama')).not.toBe(PROVIDER_BRANDS.Hunyuan)
+    expect(matchGlyph('kimi-k2')).toBe(PROVIDER_BRANDS.Kimi)
+    expect(matchGlyph('kimi-k2')).not.toBe(PROVIDER_BRANDS.Moonshot)
+    expect(matchGlyph('moonshot-v1-8k')).toBe(PROVIDER_BRANDS.Moonshot)
   })
 
   it('falls back to null for a provider nobody knows', () => {
@@ -64,6 +95,15 @@ describe('ProviderIcon provider→brand mapping', () => {
     for (const key of keys) {
       expect(PROVIDER_BRANDS[key], `PROVIDER_ICON_MAP 里的 ${key} 在 PROVIDER_BRANDS 里不存在`)
         .toBeTruthy()
+    }
+  })
+
+  it('icon picker puts coding brands first, hides ChatGLM, and buries ModelScope/Github', () => {
+    expect(PROVIDER_PICKER_KEYS.slice(0, 6)).toEqual(['Kimi', 'Zhipu', 'XiaomiMiMo', 'Minimax', 'OpenCode', 'Hezubus'])
+    expect(PROVIDER_PICKER_KEYS).not.toContain('ChatGLM')
+    expect(PROVIDER_PICKER_KEYS.slice(-3)).toEqual(['ModelScope', 'GiteeAI', 'Github'])
+    for (const key of PROVIDER_PICKER_KEYS) {
+      expect(PROVIDER_BRANDS[key], `picker key ${key} missing from PROVIDER_BRANDS`).toBeTruthy()
     }
   })
 })

@@ -5,12 +5,12 @@ use tauri::{AppHandle, State};
 
 use crate::chat::agent::prepare as agent_prepare;
 use crate::chat::model::openai_messages_from_model_messages;
-use crate::chat::model_call::session_model_for_conversation;
 use crate::chat::model_metadata::context_window_for_model;
+use crate::chat::session_model_for_conversation;
 use crate::chat::storage::{live_set_system_prompt, load_conversation};
 use crate::chat::{
-    ChatMessage, CompactionBoundaryRecord, ContextUsageSegment, Conversation,
-    ConversationContextState, ConversationContextSummary,
+    ChatMessage, CompactionBoundaryRecord, ContextClearBoundaryRecord, ContextUsageSegment,
+    Conversation, ConversationContextState, ConversationContextSummary,
 };
 use crate::external_agents::detection::{
     EXTERNAL_AGENT_MODELS_CACHE_TTL, EXTERNAL_AGENT_MODELS_FALLBACK_TTL,
@@ -186,23 +186,89 @@ pub(crate) async fn chat_compress_context(
     }))
 }
 
+#[tauri::command]
+pub(crate) async fn chat_clear_context(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    conversation_id: String,
+) -> Result<serde_json::Value, String> {
+    let mut conversation = load_conversation(&app, &conversation_id)?;
+    apply_context_clear(&mut conversation)?;
+    let context_state = compute_context_state(&app, &state, &conversation, None, &[]).await?;
+    conversation.context_state = context_state.clone();
+    conversation = crate::chat::repository::repository(&app)
+        .update_context(
+            &app,
+            &conversation_id,
+            conversation.revision,
+            context_state.clone(),
+        )
+        .await
+        .map_err(crate::chat::repository::repository_error)?;
+    emit_chat_context_state(
+        &app,
+        &conversation.id,
+        conversation.revision,
+        &context_state,
+    );
+    strip_transcripts_for_frontend(&mut conversation);
+    Ok(serde_json::json!({
+        "success": true,
+        "contextState": context_state,
+        "conversation": conversation,
+    }))
+}
+
+pub(super) fn apply_context_clear(conversation: &mut Conversation) -> Result<(), String> {
+    if conversation.agent_runtime.is_external() {
+        return Err("清空上下文仅支持 Kivio Agent 和 Kivio Chat".to_string());
+    }
+    let last_id = conversation
+        .messages
+        .last()
+        .map(|message| message.id.clone())
+        .ok_or_else(|| "没有可清空的上下文".to_string())?;
+    if conversation.context_clear_until_index() == Some(conversation.messages.len() - 1) {
+        return Err("当前已是空上下文".to_string());
+    }
+    let created_at = chrono::Local::now().timestamp();
+    conversation
+        .context_state
+        .clear_boundaries
+        .push(ContextClearBoundaryRecord {
+            id: format!("ctxclr_{}", uuid::Uuid::new_v4()),
+            source_until_message_id: last_id,
+            created_at,
+        });
+    // Drop the live summary: it describes history that is no longer in the
+    // replay window, and later compaction must not chain from it.
+    conversation.context_state.summary = None;
+    conversation.context_state.compressed_message_count = 0;
+    conversation.context_state.warning = None;
+    Ok(())
+}
+
 const CONTEXT_BLOCK_RATIO: f32 = 1.0;
 const IMAGE_ATTACHMENT_TOKEN_ESTIMATE: usize = 1_600;
 const AUXILIARY_VISION_RESULT_TOKEN_ESTIMATE: usize = 800;
 
-fn active_summary(conversation: &Conversation) -> Option<&ConversationContextSummary> {
-    conversation
+pub(crate) fn active_summary(conversation: &Conversation) -> Option<&ConversationContextSummary> {
+    let summary = conversation
         .context_state
         .summary
         .as_ref()
         .filter(|summary| !summary.stale)
-        .filter(|summary| !summary.content.trim().is_empty())
-        .filter(|summary| {
-            conversation
-                .messages
-                .iter()
-                .any(|message| message.id == summary.source_until_message_id)
-        })
+        .filter(|summary| !summary.content.trim().is_empty())?;
+    let until_idx = conversation
+        .messages
+        .iter()
+        .position(|message| message.id == summary.source_until_message_id)?;
+    if let Some(clear_idx) = conversation.context_clear_until_index() {
+        if until_idx <= clear_idx {
+            return None;
+        }
+    }
+    Some(summary)
 }
 
 fn summary_boundary_index(conversation: &Conversation) -> Option<usize> {
@@ -211,6 +277,17 @@ fn summary_boundary_index(conversation: &Conversation) -> Option<usize> {
         .messages
         .iter()
         .position(|message| message.id == summary.source_until_message_id)
+}
+
+/// First UI-message index that still belongs in the live model context.
+/// Messages before this are either discarded by a context clear or covered by
+/// an active compaction summary.
+pub(crate) fn context_replay_start_index(conversation: &Conversation) -> usize {
+    let clear_start = conversation.context_clear_start_index();
+    let summary_start = summary_boundary_index(conversation)
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+    clear_start.max(summary_start)
 }
 
 fn summary_message(summary: &ConversationContextSummary) -> Value {
@@ -234,7 +311,24 @@ fn summary_message(summary: &ConversationContextSummary) -> Value {
     })
 }
 
+fn prune_clear_boundaries_if_needed(conversation: &mut Conversation) {
+    conversation
+        .context_state
+        .clear_boundaries
+        .retain(|boundary| {
+            conversation
+                .messages
+                .iter()
+                .any(|message| message.id == boundary.source_until_message_id)
+                || conversation
+                    .messages
+                    .iter()
+                    .any(|message| message.timestamp > boundary.created_at)
+        });
+}
+
 pub(super) fn mark_summary_stale_if_needed(conversation: &mut Conversation, changed_index: usize) {
+    prune_clear_boundaries_if_needed(conversation);
     let Some(summary) = conversation.context_state.summary.as_mut() else {
         return;
     };
@@ -556,6 +650,12 @@ pub(super) fn resolve_usage_anchor(
             if message.role != "assistant" {
                 return None;
             }
+            if conversation
+                .context_clear_until_index()
+                .is_some_and(|clear_idx| idx <= clear_idx)
+            {
+                return None;
+            }
             let usage = message.anchor_usage.as_ref()?;
             // provider 切换后旧锚点作废：单模型回退会话级 provider_id；多模型每条自带 provider_id。
             let msg_provider = message
@@ -645,19 +745,34 @@ pub(super) async fn compute_context_state(
     let provider_available = provider.is_some();
     let language = crate::settings::resolve_chat_language(&settings);
     let thinking_enabled = settings.chat.thinking_enabled;
-    let skill_registry =
-        skills::build_registry(app, &settings.chat_tools.skill_scan_paths).unwrap_or_default();
+    let skill_cwd = crate::chat::storage::resolve_conversation_working_directory(
+        app,
+        conversation,
+        &settings.chat_tools.native_tools.working_directory,
+    )
+    .ok();
+    let skill_registry = skills::build_registry_in(
+        app,
+        &settings.chat_tools.skill_scan_paths,
+        skill_cwd.as_deref(),
+    )
+    .unwrap_or_default();
     let requested_skill_id = conversation.active_skill_id.as_deref();
     let active_skill_id = resolve_forced_skill_id(
         &settings.chat_tools,
         conversation.assistant_snapshot.as_ref(),
         &skill_registry,
         requested_skill_id,
-        &settings.email_accounts,
         crate::settings::obsidian_connector_configured(&settings.obsidian_vault_path),
     );
     let active_skill_detail = active_skill_id.as_deref().and_then(|id| {
-        skills::read_skill_detail(app, &settings.chat_tools.skill_scan_paths, id).ok()
+        skills::read_skill_detail_in(
+            app,
+            &settings.chat_tools.skill_scan_paths,
+            id,
+            skill_cwd.as_deref(),
+        )
+        .ok()
     });
     let mut effective_chat_tools = settings.chat_tools.clone();
     let (memory_prompt, memory_warning) = chat_memory_prompt_for_request(app, &settings);
@@ -743,13 +858,6 @@ pub(super) async fn compute_context_state(
     );
     let obsidian_vault_path = (!settings.obsidian_vault_path.trim().is_empty())
         .then_some(settings.obsidian_vault_path.as_str());
-    let himalaya_binary =
-        crate::connectors::himalaya::resolve_himalaya_binary_when_active(&settings.email_accounts)
-            .map(|path| path.display().to_string());
-    let email_accounts_prompt = crate::settings::email_accounts_system_prompt(
-        &settings.email_accounts,
-        himalaya_binary.as_deref(),
-    );
     let (system_prompt, mut segments) = agent_prepare::build_chat_system_prompt_with_segments(
         &language,
         !main_image_paths.is_empty(),
@@ -789,8 +897,7 @@ pub(super) async fn compute_context_state(
         .as_deref(),
         knowledge_base_prompt.as_deref(),
         obsidian_vault_path,
-        &settings.email_accounts,
-        email_accounts_prompt.as_deref(),
+        &conversation.additional_directories,
     );
     let last_user_idx = conversation.messages.iter().rposition(|m| m.role == "user");
     let request_messages = build_chat_api_messages(
@@ -863,6 +970,7 @@ pub(super) async fn compute_context_state(
         compression_count,
         summary,
         compaction_boundaries: conversation.context_state.compaction_boundaries.clone(),
+        clear_boundaries: conversation.context_state.clear_boundaries.clone(),
         warning: memory_warning.or_else(|| conversation.context_state.warning.clone()),
         context_source: Some(crate::external_agents::context::CONTEXT_SOURCE_BUILTIN.to_string()),
         token_count_source: if anchored {
@@ -893,10 +1001,16 @@ pub(super) async fn rollback_user_message_after_failed_send(
     state: &State<'_, AppState>,
     conversation: &mut Conversation,
     user_message_id: &str,
+    revert_title: Option<&str>,
 ) -> Result<(), String> {
     conversation
         .messages
         .retain(|message| message.id != user_message_id);
+    if let Some(title) = revert_title {
+        if conversation.title == title {
+            conversation.title = super::title::PLACEHOLDER_CONVERSATION_TITLE.to_string();
+        }
+    }
     conversation.updated_at = chrono::Local::now().timestamp();
     match compute_context_state(app, state, conversation, None, &[]).await {
         Ok(mut context_state) => {
@@ -914,6 +1028,11 @@ pub(super) async fn rollback_user_message_after_failed_send(
                 .messages
                 .retain(|message| message.id != user_message_id);
             latest.context_state = context_state;
+            if let Some(title) = revert_title {
+                if latest.title == title {
+                    latest.title = super::title::PLACEHOLDER_CONVERSATION_TITLE.to_string();
+                }
+            }
             Ok(())
         })
         .await
@@ -1169,14 +1288,11 @@ pub(super) fn build_chat_api_messages(
     // 之后只 replay boundary 之后的原文。boundary 由 token 预算决定（compaction::token_split_chat_messages，
     // recent tail ≤ RECENT_KEEP_TOKENS）；boundary 之前的原文已被摘要覆盖、不重发。
     // 当累计再增长到裸窗口 90% 时会触发再次压缩（auto / agent_loop）。
-    let start_idx = if let Some(summary) = active_summary(conversation) {
+    // 有 clear 切点时：切点及之前的原文不重发、也不注入被切点覆盖的旧摘要。
+    let start_idx = context_replay_start_index(conversation);
+    if let Some(summary) = active_summary(conversation) {
         messages.push(summary_message(summary));
-        summary_boundary_index(conversation)
-            .map(|idx| idx + 1)
-            .unwrap_or_default()
-    } else {
-        0
-    };
+    }
 
     for (idx, message) in conversation.messages.iter().enumerate() {
         if idx < start_idx {

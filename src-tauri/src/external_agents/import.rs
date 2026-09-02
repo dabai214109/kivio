@@ -1011,6 +1011,7 @@ pub async fn import_one_session(
         agent_plan_state: AgentPlanState::default(),
         knowledge_base_ids: Vec::new(),
         force_knowledge_search: false,
+        additional_directories: Vec::new(),
         thinking_level: None,
         web_search_mode: None,
         reply_models: Vec::new(),
@@ -1054,6 +1055,7 @@ pub async fn import_one_session(
                 agent_id: agent_id.to_string(),
                 protocol: protocol_label(def.stream_format).to_string(),
                 native_id: session_id.to_string(),
+                native_path: None,
                 cwd: root.clone(),
             },
         )?;

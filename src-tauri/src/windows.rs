@@ -2,6 +2,10 @@
 // which is deprecated. Migrating to objc2 is out of scope; suppress the lint here.
 #![allow(deprecated)]
 
+use std::fs;
+use std::path::PathBuf;
+
+use serde_json::json;
 use tauri::{
     window::Color, AppHandle, LogicalSize, Manager, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
@@ -306,6 +310,78 @@ pub fn get_chat_window(app: &AppHandle) -> Option<WebviewWindow> {
     app.get_webview_window("chat")
 }
 
+// ---------- 上次聊天路由持久化 ----------
+//
+// 历史：`kivio-chat-last-route` 曾存在 WebView2 localStorage 里（src/chat/persistence.ts）。
+// localStorage 的写入是渲染进程异步提交，应用退出前没有任何 flush 屏障——「切到新对话
+// → 立刻退出」会把最后一次写入丢掉；而挂载恢复又会把旧值原样写回（App.tsx），于是每次
+// 重开都固定恢复到一条旧对话。迁移到 Rust 侧文件：写入走原子落盘，与 WebView2 存储
+// 完全解耦；创建聊天窗口时直接把路由烤进 URL，首帧即正确（前端仅保留一次性旧值迁移）。
+
+/// 相对 app_data 目录的路由持久化文件名。
+const CHAT_LAST_ROUTE_FILE: &str = "chat-last-route.json";
+
+/// 路由校验与前端 `normalizeStoredChatRoute` 保持一致：
+/// 必须是 chat 路由；settings / onboarding 不算「上次对话」。
+fn is_valid_chat_last_route(route: &str) -> bool {
+    let path = route
+        .trim_start_matches('#')
+        .split('?')
+        .next()
+        .unwrap_or("");
+    if path != "chat" && !path.starts_with("chat/") {
+        return false;
+    }
+    if path == "chat/settings" || path.starts_with("chat/settings/") {
+        return false;
+    }
+    if path == "chat/onboarding" || path.starts_with("chat/onboarding/") {
+        return false;
+    }
+    if path == "chat/popout" || path.starts_with("chat/popout/") {
+        return false;
+    }
+    true
+}
+
+fn chat_last_route_path(app: &AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_data_dir()
+        .map(|dir| dir.join(CHAT_LAST_ROUTE_FILE))
+        .map_err(|e| format!("app_data_dir unavailable: {e}"))
+}
+
+fn load_stored_last_chat_route(app: &AppHandle) -> Option<String> {
+    let path = chat_last_route_path(app).ok()?;
+    let content = fs::read_to_string(path).ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let route = parsed.get("route")?.as_str()?.trim().to_string();
+    if route.is_empty() || !is_valid_chat_last_route(&route) {
+        return None;
+    }
+    Some(route)
+}
+
+/// 前端在路由变化时调用：记住（或清除）聊天窗口上次停留的路由。
+/// `route` 为 null / 空串时删除记录（删除对话、新建对话等场景）。
+#[tauri::command]
+pub fn chat_remember_last_route(app: AppHandle, route: Option<String>) -> Result<(), String> {
+    let path = chat_last_route_path(&app)?;
+    let normalized = route.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    match normalized {
+        Some(route) if is_valid_chat_last_route(route) => {
+            let content = serde_json::to_string(&json!({ "route": route }))
+                .map_err(|e| format!("serialize last route: {e}"))?;
+            crate::chat::storage::atomic_write(&path, &content, "chat-last-route")
+        }
+        _ => match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("remove last route: {e}")),
+        },
+    }
+}
+
 /**
  * 确保主窗口存在（不存在则创建）
  * 从 tauri.conf.json 中读取主窗口配置进行创建
@@ -331,9 +407,11 @@ pub fn ensure_main_window(app: &AppHandle) -> Result<WebviewWindow, String> {
 
 /**
  * 确保独立 Chat 窗口存在。
+ * 创建时优先把上次停留的 chat 路由烤进 URL（设置页等显式路由不受影响）。
  */
 pub fn ensure_chat_window(app: &AppHandle) -> Result<WebviewWindow, String> {
-    ensure_chat_window_with_hash(app, "chat")
+    let route = load_stored_last_chat_route(app).unwrap_or_else(|| "chat".to_string());
+    ensure_chat_window_with_hash(app, &route)
 }
 
 /**
@@ -396,6 +474,92 @@ pub fn ensure_chat_window_with_hash(app: &AppHandle, hash: &str) -> Result<Webvi
     }
 
     builder.build().map_err(|e| e.to_string())
+}
+
+const POPOUT_DEFAULT_INNER_WIDTH: f64 = 720.0;
+const POPOUT_DEFAULT_INNER_HEIGHT: f64 = 800.0;
+const POPOUT_MIN_INNER_WIDTH: f64 = 480.0;
+const POPOUT_MIN_INNER_HEIGHT: f64 = 560.0;
+
+/// 一条对话的独立聊天窗。关即销毁，不走主聊天窗的 hide-and-reuse。
+///
+/// 调用方必须是 **async** Tauri command（或事件循环线程），不能是同步 IPC
+/// 命令：Windows 上 `build()` 会在同步命令里和 WebView2 死锁。
+pub fn ensure_chat_popout_window(
+    app: &AppHandle,
+    label: &str,
+    conversation_id: &str,
+) -> Result<WebviewWindow, String> {
+    if let Some(window) = app.get_webview_window(label) {
+        return Ok(window);
+    }
+
+    let url = format!(
+        "index.html#chat/popout/{}",
+        urlencoding_conversation_id(conversation_id)
+    );
+    let (min_width, min_height) =
+        chat_window_size_for_visible_content(POPOUT_MIN_INNER_WIDTH, POPOUT_MIN_INNER_HEIGHT);
+    let (default_width, default_height) = chat_window_size_for_visible_content(
+        POPOUT_DEFAULT_INNER_WIDTH,
+        POPOUT_DEFAULT_INNER_HEIGHT,
+    );
+    let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App(url.into()))
+        .title("Kivio")
+        .inner_size(default_width, default_height)
+        .min_inner_size(min_width, min_height)
+        .resizable(true)
+        .visible_on_all_workspaces(false)
+        .skip_taskbar(false)
+        .visible(false);
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder
+            .decorations(true)
+            .title_bar_style(TitleBarStyle::Overlay)
+            .hidden_title(true)
+            .traffic_light_position(LogicalPosition::new(
+                CHAT_TRAFFIC_LIGHT_X,
+                CHAT_TRAFFIC_LIGHT_INSET_Y,
+            ))
+            .transparent(true)
+            .background_color(Color(0, 0, 0, 0))
+            .shadow(true);
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        builder = builder
+            .decorations(false)
+            .transparent(true)
+            .background_color(Color(0, 0, 0, 0))
+            .shadow(true);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        builder = builder
+            .decorations(false)
+            .transparent(false)
+            .background_color(Color(255, 255, 255, 255))
+            .shadow(false);
+    }
+
+    builder.build().map_err(|e| e.to_string())
+}
+
+fn urlencoding_conversation_id(conversation_id: &str) -> String {
+    conversation_id
+        .chars()
+        .flat_map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                vec![c]
+            } else {
+                format!("%{:02X}", c as u32).chars().collect()
+            }
+        })
+        .collect()
 }
 
 /**
@@ -977,4 +1141,27 @@ pub fn restore_previous_frontmost_app(app: &AppHandle, slot: &std::sync::atomic:
     let _ = app.run_on_main_thread(move || unsafe {
         macos_activate_app(pid);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_chat_last_route;
+
+    #[test]
+    fn accepts_conversation_routes() {
+        assert!(is_valid_chat_last_route("chat/conv_abc123"));
+        assert!(is_valid_chat_last_route("#chat/conv_abc123"));
+        assert!(is_valid_chat_last_route("chat"));
+    }
+
+    #[test]
+    fn rejects_settings_onboarding_and_non_chat() {
+        assert!(!is_valid_chat_last_route("chat/settings"));
+        assert!(!is_valid_chat_last_route("#chat/settings?tab=general"));
+        assert!(!is_valid_chat_last_route("chat/onboarding"));
+        assert!(!is_valid_chat_last_route("chat/popout/conv_abc"));
+        assert!(!is_valid_chat_last_route("#chat/popout/conv_abc"));
+        assert!(!is_valid_chat_last_route("lens"));
+        assert!(!is_valid_chat_last_route(""));
+    }
 }

@@ -1,13 +1,14 @@
-import { useMemo, useState } from 'react'
-import { AlertCircle, CheckCircle2, Eye, EyeOff, ExternalLink, Info, Loader2, Play } from 'lucide-react'
-import { api, type Settings } from '../api/tauri'
+import { useCallback, useMemo, useState } from 'react'
+import { AlertCircle, CheckCircle2, Eye, EyeOff, ExternalLink, Info, Loader2, Play, SlidersHorizontal } from 'lucide-react'
+import { api, type Settings, type WebSearchMcpAuth, type WebSearchProviderId } from '../api/tauri'
 import type { I18n, Lang } from './i18n'
 import { Input, Select, SettingRow, SettingsGroup, TextArea, Toggle } from './components'
 import { Button } from '../components/Button'
+import { isProviderConfigured, providerSupportsFetch, resolvedFetchProvider } from './webSearch'
 
 type WebSearchConfig = NonNullable<Settings['lens']['webSearch']>
 /** 后端已接入的搜索源（settings 的 provider 枚举值）。 */
-type ProviderId = 'tavily' | 'exa' | 'exa_mcp' | 'ollama' | 'grok'
+type ProviderId = WebSearchProviderId
 
 type WebSearchPanelProps = {
   t: I18n
@@ -28,6 +29,26 @@ const DEFAULT_WEB_SEARCH: WebSearchConfig = {
   grokBaseUrl: 'https://api.x.ai/v1',
   grokSystemPrompt:
     "You are a helpful search assistant. Search the web to find accurate and up-to-date information for the user's query. Provide a comprehensive answer with citations.",
+  deepseekApiKey: '',
+  deepseekModel: 'deepseek-v4-flash',
+  deepseekBaseUrl: 'https://api.deepseek.com',
+  deepseekSystemPrompt:
+    "You are a helpful search assistant. Search the web to find accurate and up-to-date information for the user's query. Provide a comprehensive answer with citations.",
+  braveApiKey: '',
+  braveBaseUrl: 'https://api.search.brave.com',
+  serperApiKey: '',
+  serperBaseUrl: 'https://google.serper.dev',
+  bochaApiKey: '',
+  bochaBaseUrl: 'https://api.bochaai.com',
+  zhipuApiKey: '',
+  zhipuBaseUrl: 'https://open.bigmodel.cn/api/paas/v4',
+  tinyfishApiKey: '',
+  tinyfishBaseUrl: 'https://api.search.tinyfish.ai',
+  tinyfishMcpUrl: 'https://agent.tinyfish.ai/mcp',
+  tinyfishMcpAuth: null,
+  searxngBaseUrl: '',
+  kimiApiKey: '',
+  kimiBaseUrl: 'https://api.kimi.com/coding/v1/search',
   maxResults: 5,
   searchDepth: 'basic',
 }
@@ -37,19 +58,48 @@ type ProviderDef = {
   name: string
   site: string
   apiKeyUrl?: string
-  /** 使用哪个密钥字段；ExaMCP 无需密钥则留空。 */
-  keyField?: 'tavilyApiKey' | 'exaApiKey' | 'ollamaApiKey' | 'grokApiKey'
+  /** 使用哪个密钥字段；ExaMCP / SearXNG 无需密钥则留空。 */
+  keyField?:
+    | 'tavilyApiKey'
+    | 'exaApiKey'
+    | 'ollamaApiKey'
+    | 'grokApiKey'
+    | 'deepseekApiKey'
+    | 'braveApiKey'
+    | 'serperApiKey'
+    | 'bochaApiKey'
+    | 'zhipuApiKey'
+    | 'tinyfishApiKey'
+    | 'kimiApiKey'
   /** API Key 输入框占位符。 */
   keyPlaceholder?: string
   /** 可编辑的 API base 字段（代理/自建网关可改）；写入对应 *BaseUrl 设置。 */
-  baseUrlField?: 'tavilyBaseUrl' | 'exaBaseUrl' | 'ollamaBaseUrl'
+  baseUrlField?:
+    | 'tavilyBaseUrl'
+    | 'exaBaseUrl'
+    | 'ollamaBaseUrl'
+    | 'braveBaseUrl'
+    | 'serperBaseUrl'
+    | 'bochaBaseUrl'
+    | 'zhipuBaseUrl'
+    | 'tinyfishBaseUrl'
+    | 'searxngBaseUrl'
+    | 'grokBaseUrl'
+    | 'deepseekBaseUrl'
+    | 'kimiBaseUrl'
   /** base 输入框占位符（也是官方默认值）。 */
   baseUrlPlaceholder?: string
-  /** 可编辑 endpoint（写入 exaMcpUrl，ExaMCP 专用）。 */
-  editableEndpoint?: boolean
+  /** 可编辑 MCP endpoint（写入 exaMcpUrl / tinyfishMcpUrl）。 */
+  endpointField?: 'exaMcpUrl' | 'tinyfishMcpUrl'
+  endpointPlaceholder?: string
+  /** 地址栏下方说明：keyless MCP / 自建实例。 */
+  urlHint?: 'exaMcp' | 'tinyfishMcp' | 'searxng' | 'kimi'
   supportsDepth?: boolean
-  /** 模型驱动搜索（Grok）：额外显示 型号 / 自定义网址 / 系统提示。 */
+  /** 模型驱动搜索（Grok / DeepSeek）：额外显示 型号 / 自定义网址 / 系统提示。 */
   modelBased?: boolean
+  modelField?: 'grokModel' | 'deepseekModel'
+  modelPlaceholder?: string
+  systemPromptField?: 'grokSystemPrompt' | 'deepseekSystemPrompt'
   /** 本地品牌图标路径（public/），无则回退到文字标。 */
   icon?: string
 }
@@ -83,8 +133,95 @@ const PROVIDERS: ProviderDef[] = [
     name: 'ExaMCP',
     site: 'https://docs.exa.ai/reference/exa-mcp',
     // Exa MCP 无需 API Key，只需 endpoint。
-    editableEndpoint: true,
+    endpointField: 'exaMcpUrl',
+    endpointPlaceholder: 'https://mcp.exa.ai/mcp',
+    urlHint: 'exaMcp',
     icon: '/search-icons/exa.png',
+  },
+  {
+    id: 'brave',
+    name: 'Brave',
+    site: 'https://brave.com/search/api/',
+    apiKeyUrl: 'https://api-dashboard.search.brave.com/app/keys',
+    keyField: 'braveApiKey',
+    keyPlaceholder: 'BSA...',
+    baseUrlField: 'braveBaseUrl',
+    baseUrlPlaceholder: 'https://api.search.brave.com',
+    icon: '/search-icons/brave.svg',
+  },
+  {
+    id: 'serper',
+    name: 'Serper',
+    site: 'https://serper.dev',
+    apiKeyUrl: 'https://serper.dev/api-key',
+    keyField: 'serperApiKey',
+    keyPlaceholder: 'serper key',
+    baseUrlField: 'serperBaseUrl',
+    baseUrlPlaceholder: 'https://google.serper.dev',
+    icon: '/search-icons/serper.png',
+  },
+  {
+    id: 'tinyfish',
+    name: 'TinyFish',
+    site: 'https://www.tinyfish.ai',
+    apiKeyUrl: 'https://agent.tinyfish.ai/api-keys',
+    keyField: 'tinyfishApiKey',
+    keyPlaceholder: 'tinyfish key',
+    baseUrlField: 'tinyfishBaseUrl',
+    baseUrlPlaceholder: 'https://api.search.tinyfish.ai',
+    icon: '/search-icons/tinyfish.png',
+  },
+  {
+    id: 'tinyfish_mcp',
+    name: 'TinyFish MCP',
+    site: 'https://docs.tinyfish.ai/mcp-integration',
+    endpointField: 'tinyfishMcpUrl',
+    endpointPlaceholder: 'https://agent.tinyfish.ai/mcp',
+    urlHint: 'tinyfishMcp',
+    icon: '/search-icons/tinyfish.png',
+  },
+  {
+    id: 'bocha',
+    name: 'Bocha',
+    site: 'https://open.bochaai.com',
+    apiKeyUrl: 'https://open.bochaai.com',
+    keyField: 'bochaApiKey',
+    keyPlaceholder: 'bocha key',
+    baseUrlField: 'bochaBaseUrl',
+    baseUrlPlaceholder: 'https://api.bochaai.com',
+    icon: '/search-icons/bocha.png',
+  },
+  {
+    id: 'zhipu',
+    name: 'Zhipu',
+    site: 'https://open.bigmodel.cn',
+    apiKeyUrl: 'https://open.bigmodel.cn/usercenter/apikeys',
+    keyField: 'zhipuApiKey',
+    keyPlaceholder: 'zhipu key',
+    baseUrlField: 'zhipuBaseUrl',
+    baseUrlPlaceholder: 'https://open.bigmodel.cn/api/paas/v4',
+    icon: '/search-icons/zhipu.png',
+  },
+  {
+    id: 'kimi',
+    name: 'Kimi',
+    site: 'https://www.kimi.com/code',
+    apiKeyUrl: 'https://www.kimi.com/code/console',
+    keyField: 'kimiApiKey',
+    keyPlaceholder: 'sk-...',
+    baseUrlField: 'kimiBaseUrl',
+    baseUrlPlaceholder: 'https://api.kimi.com/coding/v1/search',
+    urlHint: 'kimi',
+    icon: '/search-icons/kimi.svg',
+  },
+  {
+    id: 'searxng',
+    name: 'SearXNG',
+    site: 'https://docs.searxng.org/dev/search_api.html',
+    baseUrlField: 'searxngBaseUrl',
+    baseUrlPlaceholder: 'https://searx.example',
+    urlHint: 'searxng',
+    icon: '/search-icons/searxng.svg',
   },
   {
     id: 'ollama',
@@ -105,7 +242,27 @@ const PROVIDERS: ProviderDef[] = [
     keyField: 'grokApiKey',
     keyPlaceholder: 'xai-...',
     modelBased: true,
+    modelField: 'grokModel',
+    modelPlaceholder: 'grok-4-1-fast-non-reasoning',
+    baseUrlField: 'grokBaseUrl',
+    baseUrlPlaceholder: 'https://api.x.ai/v1',
+    systemPromptField: 'grokSystemPrompt',
     icon: '/search-icons/grok.png',
+  },
+  {
+    id: 'deepseek',
+    name: 'DeepSeek',
+    site: 'https://api-docs.deepseek.com/guides/responses_api/',
+    apiKeyUrl: 'https://platform.deepseek.com/api_keys',
+    keyField: 'deepseekApiKey',
+    keyPlaceholder: 'sk-...',
+    modelBased: true,
+    modelField: 'deepseekModel',
+    modelPlaceholder: 'deepseek-v4-flash',
+    baseUrlField: 'deepseekBaseUrl',
+    baseUrlPlaceholder: 'https://api.deepseek.com',
+    systemPromptField: 'deepseekSystemPrompt',
+    icon: '/search-icons/deepseek.svg',
   },
 ]
 
@@ -171,6 +328,95 @@ function ApiKeyField({
       </button>
     </div>
   )
+}
+
+function TinyfishMcpAuthRow({
+  t,
+  url,
+  auth,
+  onChange,
+}: {
+  t: I18n
+  url: string
+  auth: WebSearchMcpAuth | null | undefined
+  onChange: (auth: WebSearchMcpAuth | null) => void
+}) {
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const authorized = (auth?.accessToken ?? '').trim() !== ''
+  const account = auth?.account?.trim()
+
+  const authorize = useCallback(async () => {
+    const endpoint = url.trim() || 'https://agent.tinyfish.ai/mcp'
+    setError(null)
+    setBusy(true)
+    try {
+      const server = await api.connectorOauthConnect({
+        url: endpoint,
+        name: 'TinyFish MCP',
+      })
+      const next = server.auth?.accessToken?.trim()
+        ? server.auth
+        : authFromOauthHeader(server.headers)
+      if (!next) {
+        setError(t.webSearchTinyfishMcpAuthFailed)
+        return
+      }
+      onChange(next)
+    } catch (err) {
+      setError(String(err))
+    } finally {
+      setBusy(false)
+    }
+  }, [onChange, t.webSearchTinyfishMcpAuthFailed, url])
+
+  return (
+    <SettingRow
+      label={t.connectorsAuthOauth}
+      description={
+        authorized
+          ? (account
+            ? t.webSearchTinyfishMcpAuthorizedAs.replace('{account}', account)
+            : t.webSearchTinyfishMcpAuthorized)
+          : t.webSearchTinyfishMcpHint
+      }
+    >
+      <div className="flex flex-col items-end gap-1">
+        <div className="flex items-center gap-2">
+          {authorized ? (
+            <Button
+              onClick={() => {
+                setError(null)
+                onChange(null)
+              }}
+              data-tauri-drag-region="false"
+            >
+              {t.webSearchTinyfishMcpDisconnect}
+            </Button>
+          ) : (
+            <Button
+              variant="primary"
+              disabled={busy}
+              onClick={() => void authorize()}
+              data-tauri-drag-region="false"
+            >
+              {busy ? t.webSearchTinyfishMcpAuthorizing : t.webSearchTinyfishMcpAuthorize}
+            </Button>
+          )}
+        </div>
+        {error && (
+          <p className="max-w-[280px] text-right text-[12px] text-red-500">{error}</p>
+        )}
+      </div>
+    </SettingRow>
+  )
+}
+
+function authFromOauthHeader(headers: Record<string, string>): WebSearchMcpAuth | null {
+  const header = Object.entries(headers).find(([key]) => key.toLowerCase() === 'authorization')?.[1] ?? ''
+  const token = header.replace(/^Bearer\s+/i, '').trim()
+  if (!token) return null
+  return { kind: 'oauth', accessToken: token }
 }
 
 type TestState =
@@ -257,96 +503,236 @@ function TestSearch({ t, config }: { t: I18n; config: WebSearchConfig }) {
   )
 }
 
+const FETCH_FOLLOW = 'follow'
+
+const NAV_ITEM =
+  'flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-sm transition'
+const NAV_ITEM_ACTIVE =
+  'bg-indigo-50 font-medium text-indigo-700 dark:bg-indigo-950/40 dark:text-indigo-300'
+const NAV_ITEM_IDLE =
+  'text-zinc-700 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800'
+
+function ConfigureLink({
+  t,
+  onClick,
+}: {
+  t: I18n
+  onClick: () => void
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className="px-1 text-[12px] text-indigo-500 hover:underline dark:text-indigo-300"
+      data-tauri-drag-region="false"
+    >
+      {t.webSearchConfigureProvider} →
+    </button>
+  )
+}
+
+function DefaultsPage({
+  t,
+  lang,
+  config,
+  onChange,
+  onOpenProvider,
+}: {
+  t: I18n
+  lang: Lang
+  config: WebSearchConfig
+  onChange: (updates: Partial<WebSearchConfig>) => void
+  onOpenProvider: (id: ProviderId) => void
+}) {
+  const searchName = PROVIDERS.find((provider) => provider.id === config.provider)?.name
+    ?? config.provider
+  const followsSearch = !config.fetchProvider || config.fetchProvider === config.provider
+  const resolvedFetch = resolvedFetchProvider(config)
+  const fetchValue = followsSearch ? FETCH_FOLLOW : config.fetchProvider!
+  const searchReady = isProviderConfigured(config, config.provider)
+  const fetchReady = !resolvedFetch || isProviderConfigured(config, resolvedFetch)
+  const fetchOptions = [
+    {
+      value: FETCH_FOLLOW,
+      label: providerSupportsFetch(config.provider)
+        ? t.webSearchFetchFollow.replace('{name}', searchName)
+        : t.webSearchFetchFollowDirect,
+    },
+    ...PROVIDERS
+      .filter((provider) => providerSupportsFetch(provider.id) && provider.id !== config.provider)
+      .map((provider) => ({
+        value: provider.id,
+        label: provider.name,
+      })),
+  ]
+
+  return (
+    <>
+      <div className="mb-5 border-b border-zinc-200/70 pb-4 dark:border-zinc-800">
+        <div className="text-[16px] font-semibold text-zinc-800 dark:text-zinc-100">
+          {t.webSearchDefaultsTitle}
+        </div>
+        <p className="mt-1 text-xs text-zinc-400">{t.webSearchRolesHint}</p>
+      </div>
+
+      <div className="space-y-6">
+        <SettingsGroup title={t.webSearchDefaultsSection}>
+          <SettingRow label={t.webSearchSearchProvider}>
+            <Select
+              className="w-52"
+              value={config.provider}
+              onChange={(value) => onChange({
+                provider: value as ProviderId,
+                ...(config.fetchProvider === value ? { fetchProvider: null } : {}),
+              })}
+              options={PROVIDERS.map((provider) => ({
+                value: provider.id,
+                label: provider.name,
+              }))}
+            />
+          </SettingRow>
+          {!searchReady && (
+            <ConfigureLink t={t} onClick={() => onOpenProvider(config.provider)} />
+          )}
+
+          <SettingRow
+            label={t.webSearchFetchProvider}
+            description={!resolvedFetch ? t.webSearchFetchDirectHint : undefined}
+          >
+            <Select
+              className="w-52"
+              value={fetchValue}
+              onChange={(value) => {
+                if (value === FETCH_FOLLOW || value === config.provider) {
+                  onChange({ fetchProvider: null })
+                  return
+                }
+                onChange({ fetchProvider: value as ProviderId })
+              }}
+              options={fetchOptions}
+            />
+          </SettingRow>
+          {resolvedFetch && !fetchReady && (
+            <ConfigureLink t={t} onClick={() => onOpenProvider(resolvedFetch)} />
+          )}
+        </SettingsGroup>
+
+        <SettingsGroup title={t.webSearchGeneralSection}>
+          <SettingRow label={t.lensWebSearchMaxResults}>
+            <Input
+              type="number"
+              min={1}
+              max={10}
+              className="w-24"
+              value={String(config.maxResults ?? 5)}
+              onChange={(value) => onChange({
+                maxResults: Math.min(10, Math.max(1, Number.parseInt(value, 10) || 1)),
+              })}
+            />
+          </SettingRow>
+        </SettingsGroup>
+
+        <SettingsGroup title={t.webSearchLensSection}>
+          <SettingRow label={t.enabled} description={t.lensWebSearchHint}>
+            <Toggle
+              checked={config.enabled === true}
+              onChange={(enabled) => onChange({ enabled })}
+            />
+          </SettingRow>
+        </SettingsGroup>
+
+        <p className="kv-row-desc px-1">
+          {lang === 'zh'
+            ? 'Chat 联网开关在 MCP → 内置工具。'
+            : 'Chat web toggles: MCP → Built-in tools.'}
+        </p>
+      </div>
+    </>
+  )
+}
+
 export function WebSearchPanel({ t, lang, webSearch, onChange }: WebSearchPanelProps) {
   const config = { ...DEFAULT_WEB_SEARCH, ...(webSearch ?? {}) }
-  const [selectedId, setSelectedId] = useState<ProviderId>(config.provider)
+  const [selectedId, setSelectedId] = useState<ProviderId | null>(null)
 
   const selected = useMemo(
-    () => PROVIDERS.find((p) => p.id === selectedId) ?? PROVIDERS[0],
+    () => (selectedId ? PROVIDERS.find((provider) => provider.id === selectedId) : undefined),
     [selectedId],
   )
-
-  const isDefault = selected.id === config.provider
-  const keyValue = selected.keyField ? config[selected.keyField] || '' : ''
+  const keyValue = selected?.keyField ? config[selected.keyField] || '' : ''
+  const showingDefaults = !selected
 
   return (
     <div className="websearch-panel-root flex min-h-full items-stretch gap-0">
-      {/* 左侧二级侧边栏：搜索服务商 */}
       <nav className="relative flex h-full min-h-full w-44 shrink-0 flex-col self-stretch pr-3">
         <div
           className="pointer-events-none absolute inset-y-0 right-0 w-px bg-zinc-200/80 dark:bg-zinc-800"
           aria-hidden
         />
-        <div className="px-2 pb-1 pt-1 text-[11px] font-medium uppercase tracking-wide text-zinc-400">
+        <div className="space-y-0.5">
+          <button
+            type="button"
+            onClick={() => setSelectedId(null)}
+            className={`${NAV_ITEM} ${showingDefaults ? NAV_ITEM_ACTIVE : NAV_ITEM_IDLE}`}
+            data-tauri-drag-region="false"
+          >
+            <SlidersHorizontal size={16} className="shrink-0 opacity-70" />
+            <span className="min-w-0 flex-1 truncate">{t.webSearchDefaultsNav}</span>
+          </button>
+        </div>
+        <div className="px-2 pb-1 pt-3 text-[11px] font-medium uppercase tracking-wide text-zinc-400">
           {t.webSearchApiSection}
         </div>
         <div className="space-y-0.5">
           {PROVIDERS.map((provider) => {
             const active = provider.id === selectedId
-            const marked = provider.id === config.provider
             return (
               <button
                 key={provider.id}
                 type="button"
                 onClick={() => setSelectedId(provider.id)}
-                className={`flex w-full items-center gap-2.5 rounded-lg px-2 py-1.5 text-left text-sm transition ${
-                  active
-                    ? 'bg-indigo-50 font-medium text-indigo-700 dark:bg-indigo-950/40 dark:text-indigo-300'
-                    : 'text-zinc-700 hover:bg-zinc-100 dark:text-zinc-200 dark:hover:bg-zinc-800'
-                }`}
+                className={`${NAV_ITEM} ${active ? NAV_ITEM_ACTIVE : NAV_ITEM_IDLE}`}
                 data-tauri-drag-region="false"
               >
                 <ProviderMark name={provider.name} icon={provider.icon} size={20} />
                 <span className="min-w-0 flex-1 truncate">{provider.name}</span>
-                {marked && (
-                  <span className="shrink-0 rounded-full border border-emerald-400/60 px-1.5 py-px text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
-                    {t.webSearchDefaultBadge}
-                  </span>
-                )}
               </button>
             )
           })}
         </div>
       </nav>
 
-      {/* 右侧内容 */}
       <div className="min-w-0 flex-1 pl-5">
-        {/* Hero 头部：名称 + 外链 + 默认控制 */}
-        <div className="mb-5 flex items-center gap-3 border-b border-zinc-200/70 pb-4 dark:border-zinc-800">
-          <ProviderMark name={selected.name} icon={selected.icon} size={32} />
-          <div className="min-w-0">
-            <div className="flex items-center gap-1.5">
-              <span className="text-[16px] font-semibold text-zinc-800 dark:text-zinc-100">
-                {selected.name}
-              </span>
-              <button
-                type="button"
-                onClick={() => void api.openExternal(selected.site)}
-                className="text-zinc-400 hover:text-indigo-500"
-                data-tauri-drag-region="false"
-                aria-label="Open site"
-              >
-                <ExternalLink size={13} />
-              </button>
+        {showingDefaults || !selected ? (
+          <DefaultsPage
+            t={t}
+            lang={lang}
+            config={config}
+            onChange={onChange}
+            onOpenProvider={setSelectedId}
+          />
+        ) : (
+          <>
+            <div className="mb-5 flex items-center gap-3 border-b border-zinc-200/70 pb-4 dark:border-zinc-800">
+              <ProviderMark name={selected.name} icon={selected.icon} size={32} />
+              <div className="min-w-0">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[16px] font-semibold text-zinc-800 dark:text-zinc-100">
+                    {selected.name}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void api.openExternal(selected.site)}
+                    className="text-zinc-400 hover:text-indigo-500"
+                    data-tauri-drag-region="false"
+                    aria-label="Open site"
+                  >
+                    <ExternalLink size={13} />
+                  </button>
+                </div>
+                <div className="truncate text-xs text-zinc-400">{hostname(selected.site)}</div>
+              </div>
             </div>
-            <div className="truncate text-xs text-zinc-400">{hostname(selected.site)}</div>
-          </div>
-          <div className="ml-auto shrink-0">
-            {isDefault ? (
-              <span className="inline-flex items-center gap-1 rounded-full border border-emerald-400/50 bg-emerald-50 px-3 py-1 text-xs font-medium text-emerald-600 dark:bg-emerald-950/30 dark:text-emerald-400">
-                {t.webSearchDefaultBadge}
-              </span>
-            ) : (
-              <Button
-                variant="primary"
-                onClick={() => onChange({ provider: selected.id })}
-                data-tauri-drag-region="false"
-              >
-                {t.webSearchSetDefault}
-              </Button>
-            )}
-          </div>
-        </div>
 
         <div className="space-y-6">
           <SettingsGroup title={t.webSearchProviderSection}>
@@ -375,21 +761,31 @@ export function WebSearchPanel({ t, lang, webSearch, onChange }: WebSearchPanelP
             {!selected.modelBased && (
               <SettingRow
                 label={t.webSearchApiUrl}
-                description={selected.editableEndpoint ? t.webSearchExaMcpKeyless : undefined}
+                description={
+                  selected.urlHint === 'searxng'
+                    ? t.webSearchSearxngHint
+                    : selected.urlHint === 'exaMcp'
+                      ? t.webSearchExaMcpKeyless
+                      : selected.urlHint === 'tinyfishMcp'
+                        ? t.webSearchTinyfishMcpHint
+                        : selected.urlHint === 'kimi'
+                          ? t.webSearchKimiHint
+                          : undefined
+                }
                 stack
               >
-                {selected.editableEndpoint ? (
+                {selected.endpointField ? (
                   <Input
-                    value={config.exaMcpUrl || ''}
-                    onChange={(value) => onChange({ exaMcpUrl: value })}
-                    placeholder="https://mcp.exa.ai/mcp"
+                    value={config[selected.endpointField] || ''}
+                    onChange={(value) => onChange({ [selected.endpointField!]: value } as Partial<WebSearchConfig>)}
+                    placeholder={selected.endpointPlaceholder}
                     mono
                     className="w-full"
                   />
                 ) : selected.baseUrlField ? (
                   <Input
                     value={config[selected.baseUrlField] ?? ''}
-                    onChange={(value) => onChange({ [selected.baseUrlField!]: value })}
+                    onChange={(value) => onChange({ [selected.baseUrlField!]: value } as Partial<WebSearchConfig>)}
                     placeholder={selected.baseUrlPlaceholder}
                     mono
                     className="w-full"
@@ -398,30 +794,40 @@ export function WebSearchPanel({ t, lang, webSearch, onChange }: WebSearchPanelP
               </SettingRow>
             )}
 
-            {selected.modelBased && (
+            {selected.urlHint === 'tinyfishMcp' && (
+              <TinyfishMcpAuthRow
+                t={t}
+                url={config.tinyfishMcpUrl || ''}
+                auth={config.tinyfishMcpAuth}
+                onChange={(tinyfishMcpAuth) => onChange({ tinyfishMcpAuth })}
+              />
+            )}
+
+            {selected.modelBased && selected.modelField && selected.systemPromptField && (
               <>
                 <SettingRow label={t.webSearchModel} stack>
                   <Input
-                    value={config.grokModel || ''}
-                    onChange={(value) => onChange({ grokModel: value })}
-                    placeholder="grok-4-1-fast-non-reasoning"
+                    value={String(config[selected.modelField] || '')}
+                    onChange={(value) => onChange({ [selected.modelField!]: value } as Partial<WebSearchConfig>)}
+                    placeholder={selected.modelPlaceholder}
                     mono
                     className="w-full"
                   />
                 </SettingRow>
                 <SettingRow label={t.webSearchCustomUrl} stack>
                   <Input
-                    value={config.grokBaseUrl || ''}
-                    onChange={(value) => onChange({ grokBaseUrl: value })}
-                    placeholder="https://api.x.ai/v1"
+                    value={selected.baseUrlField ? String(config[selected.baseUrlField] ?? '') : ''}
+                    onChange={(value) => selected.baseUrlField
+                      && onChange({ [selected.baseUrlField]: value } as Partial<WebSearchConfig>)}
+                    placeholder={selected.baseUrlPlaceholder}
                     mono
                     className="w-full"
                   />
                 </SettingRow>
                 <SettingRow label={t.webSearchSystemPrompt} stack>
                   <TextArea
-                    value={config.grokSystemPrompt || ''}
-                    onChange={(value) => onChange({ grokSystemPrompt: value })}
+                    value={String(config[selected.systemPromptField] || '')}
+                    onChange={(value) => onChange({ [selected.systemPromptField!]: value } as Partial<WebSearchConfig>)}
                     rows={4}
                   />
                 </SettingRow>
@@ -444,50 +850,17 @@ export function WebSearchPanel({ t, lang, webSearch, onChange }: WebSearchPanelP
               </SettingRow>
             )}
 
-            {selected.keyField && !isDefault && (
-              <p className="flex items-center gap-1.5 px-1 pt-1 text-[12px] text-zinc-400">
-                <Info size={12} /> {t.webSearchApiKeyRequired}
-              </p>
-            )}
-          </SettingsGroup>
+                {selected.keyField && !keyValue.trim() && (
+                  <p className="flex items-center gap-1.5 px-1 pt-1 text-[12px] text-zinc-400">
+                    <Info size={12} /> {t.webSearchApiKeyRequired}
+                  </p>
+                )}
+              </SettingsGroup>
 
-          {/* key 绑定当前查看的服务商：切换时重置测试状态；provider 覆盖为 selected.id，
-              确保测试的是"正在查看"的服务商，而非已保存的默认服务商。 */}
-          <TestSearch key={selected.id} t={t} config={{ ...config, provider: selected.id }} />
-
-          {/* 结果数量对模型驱动搜索（Grok，返回合成答案）无意义，故隐藏。 */}
-          {!selected.modelBased && (
-            <SettingsGroup title={t.webSearchGeneralSection}>
-              <SettingRow label={t.lensWebSearchMaxResults}>
-                <Input
-                  type="number"
-                  min={1}
-                  max={10}
-                  className="w-24"
-                  value={String(config.maxResults ?? 5)}
-                  onChange={(value) => onChange({
-                    maxResults: Math.min(10, Math.max(1, Number.parseInt(value, 10) || 1)),
-                  })}
-                />
-              </SettingRow>
-            </SettingsGroup>
-          )}
-
-          <SettingsGroup title={t.webSearchLensSection}>
-            <SettingRow label={t.enabled} description={t.lensWebSearchHint}>
-              <Toggle
-                checked={config.enabled === true}
-                onChange={(v) => onChange({ enabled: v })}
-              />
-            </SettingRow>
-          </SettingsGroup>
-
-          <p className="kv-row-desc px-1">
-            {lang === 'zh'
-              ? 'Chat 联网开关在 MCP → 内置工具。'
-              : 'Chat web toggles: MCP → Built-in tools.'}
-          </p>
-        </div>
+              <TestSearch key={selected.id} t={t} config={{ ...config, provider: selected.id }} />
+            </div>
+          </>
+        )}
       </div>
     </div>
   )

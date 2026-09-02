@@ -23,15 +23,18 @@ import {
   Square,
   Terminal,
   TextQuote,
+  WandSparkles,
   Wrench,
   X,
 } from 'lucide-react'
 import { ChatAttachments } from './ChatAttachments'
 import { PastedTextEditorModal } from './PastedTextEditorModal'
+import { ComposerAddMenu } from './ComposerAddMenu'
 import { SourcesButton } from './SourcesButton'
 import { onComposerInsert, onComposerTextInsert } from './composerInsert'
 import { draftKey, getComposerDraft, migrateNewChatDraft, setComposerDraft } from './composerDraft'
 import { applyComposerAutoHeight } from './composerAutoHeight'
+import { canOptimizeComposerText } from './promptOptimize'
 import { AssistantPicker } from './AssistantPicker'
 import { MultiModelSelector } from './MultiModelSelector'
 import { GitStatusPill } from './dock/GitStatusPill'
@@ -41,7 +44,7 @@ import { Button, IconButton } from '../components/Button'
 import { useT, type I18n, type Lang } from '../settings/i18n'
 import { api, type ChatToolDefinition, type ChatMcpServer } from '../api/tauri'
 import { chatApi } from './api'
-import type { AgentPlanMode, AgentPlanState, AgentTodoState, ChatAssistant, ChatProject, ChatSet, ModelRef, PendingAttachment, WebSearchMode } from './types'
+import type { AdditionalDirectory, AgentPlanMode, AgentPlanState, AgentTodoState, ChatAssistant, ChatProject, ChatSet, ModelRef, PendingAttachment, WebSearchMode } from './types'
 import {
   buildSlashCommands,
   commandMatches,
@@ -55,6 +58,9 @@ import type { ModeOption, ModeTone } from './permissionModes'
 import { isTauriRuntime } from './utils'
 
 const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif']
+/** 与 `index.css` 问题优化出场 / 入场时长对齐：`--kv-dur-slow`、`slow + fast`。 */
+const OPTIMIZE_OUT_MS = 320
+const OPTIMIZE_IN_MS = 470
 // 粘贴文本超过该字符数时不再写入输入框，转为内存虚拟 txt 附件（默认 3000，可配置阈值）。
 const PASTE_TEXT_ATTACHMENT_THRESHOLD = 3000
 
@@ -423,6 +429,10 @@ export interface InputBarProps {
   /** 多答模型集（会话级 reply_models / replyModels；0/1 个=单模型，≥2=一问多答） */
   replyModels?: ModelRef[]
   onChangeReplyModels?: (models: ModelRef[]) => void | Promise<void>
+  additionalDirectories?: AdditionalDirectory[]
+  onChangeAdditionalDirectories?: (directories: AdditionalDirectory[]) => void | Promise<void>
+  /** 当前项目主目录；附加目录列表会排除它。 */
+  additionalDirectoryPrimaryRoot?: string | null
   /** 上下文用量指示器：由 Chat 注入 <ContextIndicator>，渲染在底栏右侧 Act 右边 */
   contextSlot?: ReactNode
   /** 底栏模式胶囊的档位表，由 Chat 算好传入（内置会话 = Kivio 三档；本地 CLI 会话 =
@@ -493,6 +503,9 @@ export const InputBar = memo(function InputBar({
   builtinWebSearchSupported = false,
   replyModels = [],
   onChangeReplyModels,
+  additionalDirectories = [],
+  onChangeAdditionalDirectories,
+  additionalDirectoryPrimaryRoot = null,
   contextSlot,
   modeOptions = [],
   modeValue = '',
@@ -536,6 +549,12 @@ export const InputBar = memo(function InputBar({
   const [externalCliSlashHint, setExternalCliSlashHint] = useState<string | null>(null)
   const [externalCliSlashLoading, setExternalCliSlashLoading] = useState(false)
   const [slashPanelLeft, setSlashPanelLeft] = useState(0)
+  const [optimizing, setOptimizing] = useState(false)
+  const [optimizeMotion, setOptimizeMotion] = useState<'idle' | 'out' | 'in'>('idle')
+  const [optimizeError, setOptimizeError] = useState('')
+  const [optimizeSnapshot, setOptimizeSnapshot] = useState<{ original: string; result: string } | null>(null)
+  const optimizeRequestRef = useRef(0)
+  const pendingOptimizeTextRef = useRef<string | null>(null)
   const innerRef = useRef<HTMLDivElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const slashHighlightRef = useRef<HTMLDivElement>(null)
@@ -561,10 +580,39 @@ export const InputBar = memo(function InputBar({
     setInput(d?.input ?? '')
     setQuotes(d?.quotes ?? [])
     setAttachments(d?.attachments ?? [])
+    setOptimizeSnapshot(null)
+    setOptimizeError('')
+    setOptimizing(false)
+    setOptimizeMotion('idle')
+    pendingOptimizeTextRef.current = null
+    optimizeRequestRef.current += 1
   }, [draftKeyValue])
   useEffect(() => {
     setComposerDraft(draftKeyRef.current, { input, quotes, attachments })
   }, [input, quotes, attachments])
+  useEffect(() => {
+    if (optimizeMotion !== 'out') return
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    const id = window.setTimeout(() => {
+      const next = pendingOptimizeTextRef.current
+      pendingOptimizeTextRef.current = null
+      if (next != null) setInput(next)
+      setOptimizeMotion('in')
+      requestAnimationFrame(() => {
+        const el = textareaRef.current
+        if (!el) return
+        el.focus({ preventScroll: true })
+        el.selectionStart = el.selectionEnd = el.value.length
+      })
+    }, reduced ? 0 : OPTIMIZE_OUT_MS)
+    return () => window.clearTimeout(id)
+  }, [optimizeMotion])
+  useEffect(() => {
+    if (optimizeMotion !== 'in') return
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    const id = window.setTimeout(() => setOptimizeMotion('idle'), reduced ? 0 : OPTIMIZE_IN_MS)
+    return () => window.clearTimeout(id)
+  }, [optimizeMotion])
   const agentPlanMode = agentPlanState?.mode ?? 'act'
   const agentPlanActive = agentPlanMode === 'plan'
   const agentOrchestrateActive = agentPlanMode === 'orchestrate'
@@ -1147,10 +1195,64 @@ export const InputBar = memo(function InputBar({
     setQuotes([])
     setAttachments([])
     setAttachmentError('')
+    setOptimizeSnapshot(null)
+    setOptimizeError('')
+    setOptimizing(false)
+    setOptimizeMotion('idle')
+    pendingOptimizeTextRef.current = null
     setToolPanelOpen(false)
     closeProjectMenu()
     setSlashPanelOpen(false)
     if (textareaRef.current) applyComposerAutoHeight(textareaRef.current)
+  }
+
+  const canUndoOptimize = Boolean(optimizeSnapshot && input === optimizeSnapshot.result)
+  const optimizeBusy = optimizing || optimizeMotion !== 'idle'
+  const applyOptimizedInput = (next: string) => {
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    if (reduced || next === input) {
+      pendingOptimizeTextRef.current = null
+      setOptimizeMotion('idle')
+      setInput(next)
+      requestAnimationFrame(() => {
+        const el = textareaRef.current
+        if (!el) return
+        el.focus({ preventScroll: true })
+        el.selectionStart = el.selectionEnd = el.value.length
+      })
+      return
+    }
+    pendingOptimizeTextRef.current = next
+    setOptimizeMotion('out')
+  }
+  const handleOptimizePrompt = async () => {
+    if (composerLocked || optimizeBusy) return
+    if (canUndoOptimize && optimizeSnapshot) {
+      const original = optimizeSnapshot.original
+      setOptimizeSnapshot(null)
+      setOptimizeError('')
+      applyOptimizedInput(original)
+      return
+    }
+    if (!canOptimizeComposerText(input)) return
+    const requestId = ++optimizeRequestRef.current
+    const original = input
+    setOptimizing(true)
+    setOptimizeMotion('idle')
+    pendingOptimizeTextRef.current = null
+    setOptimizeError('')
+    try {
+      const result = await chatApi.optimizePrompt(original, conversationId ?? null)
+      if (requestId !== optimizeRequestRef.current) return
+      setOptimizeSnapshot({ original, result })
+      setOptimizing(false)
+      applyOptimizedInput(result)
+    } catch (err) {
+      if (requestId !== optimizeRequestRef.current) return
+      setOptimizeError(err instanceof Error && err.message.trim() ? err.message : t.chatOptimizePromptFailed)
+      setOptimizing(false)
+      setOptimizeMotion('idle')
+    }
   }
 
   const handleSend = async () => {
@@ -1932,6 +2034,11 @@ export const InputBar = memo(function InputBar({
               {attachmentError}
             </div>
           )}
+          {optimizeError && !attachmentError && (
+            <div className="chat-motion-fade-up mb-2 px-1 text-[12px] text-red-500 dark:text-red-400">
+              {optimizeError}
+            </div>
+          )}
           {quotes.length > 0 && (
             <div className="chat-motion-fade-up mb-2 flex flex-col gap-1.5">
               {quotes.map((q, i) => (
@@ -1980,13 +2087,19 @@ export const InputBar = memo(function InputBar({
               <textarea
                 ref={textareaRef}
                 value={input}
-                readOnly={sendPending}
-                aria-busy={sendPending}
+                readOnly={sendPending || optimizeBusy}
+                aria-busy={sendPending || optimizeBusy}
                 onChange={handleInput}
                 onPaste={(e) => void handlePaste(e)}
                 onKeyDown={handleKeyDown}
                 onSelect={handleSelect}
                 onScroll={syncSlashHighlightScroll}
+                onAnimationEnd={(event) => {
+                  if (event.target !== event.currentTarget) return
+                  if (event.animationName === 'chat-composer-optimize-in') {
+                    setOptimizeMotion('idle')
+                  }
+                }}
                 autoCapitalize="off"
                 autoCorrect="off"
                 autoComplete="off"
@@ -2006,7 +2119,7 @@ export const InputBar = memo(function InputBar({
                   slashHighlight
                     ? 'is-slash-highlight'
                     : 'text-neutral-900 dark:text-neutral-100'
-                }`}
+                } ${optimizing ? 'is-optimizing' : ''} ${optimizeMotion === 'out' ? 'is-optimize-out' : ''} ${optimizeMotion === 'in' ? 'is-optimize-reveal' : ''}`}
               />
             </div>
 
@@ -2052,17 +2165,22 @@ export const InputBar = memo(function InputBar({
         {/* ③ 功能栏：移出输入框，裸露坐在窗口底色上（无背景无边框）。
             这样输入框高度只由文本决定，能收到单行 —— 原来图标在盒内，盒子被撑到 ~100px。 */}
         <div className="chat-composer-tools" data-tauri-drag-region="false">
-            <IconButton
-              size="sm"
-              shape="circle"
-              label={t.chatAddAttachment}
-              onClick={() => void openAttachmentPicker()}
+            <ComposerAddMenu
+              onAddAttachment={() => void openAttachmentPicker()}
+              directories={additionalDirectories}
+              onChangeAdditionalDirectories={onChangeAdditionalDirectories}
+              primaryRootPath={additionalDirectoryPrimaryRoot}
+              externalAgentId={usesExternalRuntime ? externalAgentName : null}
               disabled={disabled}
-              tabIndex={-1}
-              className="shrink-0 disabled:opacity-40"
-            >
-              <Plus size={18} strokeWidth={1.75} />
-            </IconButton>
+              layout={layout}
+              onBeforeOpen={() => {
+                setSlashPanelOpen(false)
+                setToolPanelOpen(false)
+                closeProjectMenu()
+                closeModeMenu()
+                closePresetMenu()
+              }}
+            />
 
             {onChangeKnowledgeBaseIds && onSetWebSearchMode && (
               <SourcesButton
@@ -2138,6 +2256,33 @@ export const InputBar = memo(function InputBar({
               </div>
             )}
 
+            <IconButton
+              size="sm"
+              shape="circle"
+              label={
+                optimizing
+                  ? t.chatOptimizePrompt
+                  : canUndoOptimize
+                    ? t.chatOptimizePromptUndo
+                    : !input.trim()
+                      ? t.chatOptimizePromptEmpty
+                      : input.trim().startsWith('/')
+                        ? t.chatOptimizePromptSlash
+                        : t.chatOptimizePrompt
+              }
+              onClick={() => void handleOptimizePrompt()}
+              disabled={composerLocked || optimizeBusy || (!canUndoOptimize && !canOptimizeComposerText(input))}
+              className={`shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-neutral-300/60 disabled:opacity-50 dark:focus-visible:ring-neutral-600 ${
+                optimizing ? 'is-prompt-optimizing' : ''
+              } ${
+                canUndoOptimize
+                  ? 'text-emerald-600 dark:text-emerald-400'
+                  : 'text-neutral-500 dark:text-neutral-400'
+              }`}
+            >
+              <WandSparkles size={18} strokeWidth={1.75} />
+            </IconButton>
+
             {/* Git 分支胶囊 + diff 徽标（ml-auto 把徽标顶到右侧、挨着上下文指示器）。 */}
             {gitStatusEnabled && gitWorkdir && gitLang && onOpenGitPanel && (
               <GitStatusPill
@@ -2166,11 +2311,6 @@ export const InputBar = memo(function InputBar({
                   aria-haspopup="menu"
                   title={presetLocked && presetLockedReason ? presetLockedReason : t.chatSwitchAgentPreset}
                 >
-                  <activePresetOption.icon
-                    size={13}
-                    strokeWidth={1.9}
-                    className={`shrink-0 ${activePresetPillClass.iconColor}`}
-                  />
                   <span className="min-w-0 truncate">{activePresetOption.label}</span>
                   <ChevronDown
                     size={12}
@@ -2191,7 +2331,6 @@ export const InputBar = memo(function InputBar({
                     >
                       {presetOptions.map((option) => {
                         const active = option.value === presetValue
-                        const Icon = option.icon
                         return (
                           <button
                             key={option.value}
@@ -2206,11 +2345,6 @@ export const InputBar = memo(function InputBar({
                                 : 'text-neutral-800 hover:bg-neutral-100 dark:text-neutral-200 dark:hover:bg-neutral-800'
                             } disabled:cursor-default disabled:opacity-50`}
                           >
-                            <Icon
-                              size={14}
-                              strokeWidth={1.8}
-                              className={`shrink-0 ${MODE_PILL_CLASS[option.tone].iconColor}`}
-                            />
                             <span className="min-w-0 flex-1 leading-tight">
                               <span className="block truncate text-[12px] font-semibold">{option.label}</span>
                               {option.description && (

@@ -2,7 +2,7 @@
 //!
 //! 设计（调研 Paseo `getpaseo/paseo` 得出，见任务 07-19 research/）：
 //! - **图片**：支持原生图片块的协议（Claude base64 / ACP image / Codex localImage）直接注入；
-//!   不支持的协议（pi/kimi）或超出 mime 白名单的图片，降级为在 prompt 文本里写出绝对路径。
+//!   不支持的协议（kimi）或超出 mime/大小限制的图片，降级为在 prompt 文本里写出绝对路径。
 //! - **文件**：所有协议一律渲染成「文件名/路径/MIME/大小」文本块（对齐 Paseo `uploaded_file`），
 //!   不 inline 内容——CLI 用自己的 read 工具读该路径（附件目录会加进 allowed-dir）。
 
@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use base64::{engine::general_purpose, Engine as _};
 
+const MAX_NATIVE_IMAGE_BYTES: u64 = 12 * 1024 * 1024;
 /// 一张图片编码后的原生块载荷（各协议 adapter 再包成自己的形状）。
 #[derive(Clone)]
 pub struct ImageBlock {
@@ -19,19 +20,20 @@ pub struct ImageBlock {
     pub path: PathBuf,
 }
 
-/// 按扩展名推断图片 MIME（与 GUI 的 `image_mime_for_path` 一致）。
-pub fn image_mime_for_path(path: &Path) -> &'static str {
+/// 按扩展名推断图片 MIME。未知扩展名必须降级，不能把任意字节伪装成 PNG。
+pub fn image_mime_for_path(path: &Path) -> Option<&'static str> {
     let ext = path
         .extension()
         .and_then(|ext| ext.to_str())
         .map(|ext| ext.to_ascii_lowercase())
         .unwrap_or_default();
     match ext.as_str() {
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "bmp" => "image/bmp",
-        _ => "image/png",
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        _ => None,
     }
 }
 
@@ -69,8 +71,18 @@ pub fn load_image_blocks(paths: &[PathBuf], whitelist: &[&str]) -> (Vec<ImageBlo
     let mut native = Vec::new();
     let mut degraded = Vec::new();
     for path in paths {
-        let mime = image_mime_for_path(path);
+        let Some(mime) = image_mime_for_path(path) else {
+            degraded.push(path.clone());
+            continue;
+        };
         if !mime_allowed(mime, whitelist) {
+            degraded.push(path.clone());
+            continue;
+        }
+        if std::fs::metadata(path)
+            .map(|metadata| metadata.len() > MAX_NATIVE_IMAGE_BYTES)
+            .unwrap_or(false)
+        {
             degraded.push(path.clone());
             continue;
         }
@@ -121,15 +133,32 @@ fn prompt_path(path: &Path) -> String {
     text.into_owned()
 }
 
+fn prompt_path_for_cli(cli_bin: Option<&Path>, path: &Path) -> String {
+    let host = prompt_path(path);
+    let Some(bin) = cli_bin else {
+        return host;
+    };
+    crate::external_agents::wsl::path_for_cli(bin, Path::new(&host))
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// 降级：把图片绝对路径拼成一段可追加到 prompt 的文本（协议不支持原生图片时用）。
 /// 空输入返回空串。格式对齐 Paseo 的 `[Image available at: {path}]`。
 pub fn image_paths_note(paths: &[PathBuf]) -> String {
+    image_paths_note_for(None, paths)
+}
+
+pub fn image_paths_note_for(cli_bin: Option<&Path>, paths: &[PathBuf]) -> String {
     if paths.is_empty() {
         return String::new();
     }
     let mut out = String::from("\n\n# 附带图片（用你的读取工具查看）\n");
     for path in paths {
-        out.push_str(&format!("[Image available at: {}]\n", prompt_path(path)));
+        out.push_str(&format!(
+            "[Image available at: {}]\n",
+            prompt_path_for_cli(cli_bin, path)
+        ));
     }
     out
 }
@@ -137,6 +166,10 @@ pub fn image_paths_note(paths: &[PathBuf]) -> String {
 /// 非图片文件说明块（所有协议通用，对齐 Paseo `uploaded_file`）：文件名/路径/MIME/大小。
 /// 不 inline 内容，CLI 自读路径。空输入返回空串。
 pub fn file_attachments_note(paths: &[PathBuf]) -> String {
+    file_attachments_note_for(None, paths)
+}
+
+pub fn file_attachments_note_for(cli_bin: Option<&Path>, paths: &[PathBuf]) -> String {
     if paths.is_empty() {
         return String::new();
     }
@@ -150,7 +183,7 @@ pub fn file_attachments_note(paths: &[PathBuf]) -> String {
         let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         out.push_str(&format!(
             "Attached file: {name}\nPath: {}\nMIME: {mime}\nSize: {size} bytes\n\n",
-            prompt_path(path)
+            prompt_path_for_cli(cli_bin, path)
         ));
     }
     out
@@ -162,10 +195,10 @@ mod tests {
 
     #[test]
     fn mime_for_path_covers_image_extensions() {
-        assert_eq!(image_mime_for_path(Path::new("a.png")), "image/png");
-        assert_eq!(image_mime_for_path(Path::new("a.JPG")), "image/jpeg");
-        assert_eq!(image_mime_for_path(Path::new("a.webp")), "image/webp");
-        assert_eq!(image_mime_for_path(Path::new("a.bin")), "image/png");
+        assert_eq!(image_mime_for_path(Path::new("a.png")), Some("image/png"));
+        assert_eq!(image_mime_for_path(Path::new("a.JPG")), Some("image/jpeg"));
+        assert_eq!(image_mime_for_path(Path::new("a.webp")), Some("image/webp"));
+        assert_eq!(image_mime_for_path(Path::new("a.bin")), None);
     }
 
     #[test]
@@ -206,6 +239,20 @@ mod tests {
     }
 
     #[test]
+    fn oversized_native_image_degrades_without_base64_allocation() {
+        let dir = std::env::temp_dir().join(format!("kivio-ext-att-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("large.png");
+        let file = std::fs::File::create(&path).expect("create image");
+        file.set_len(MAX_NATIVE_IMAGE_BYTES + 1)
+            .expect("set sparse length");
+        let (native, degraded) = load_image_blocks(std::slice::from_ref(&path), &["image/png"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(native.is_empty());
+        assert_eq!(degraded, vec![path]);
+    }
+
+    #[test]
     fn notes_empty_inputs_are_blank() {
         assert!(image_paths_note(&[]).is_empty());
         assert!(file_attachments_note(&[]).is_empty());
@@ -216,6 +263,28 @@ mod tests {
         let note = image_paths_note(&[PathBuf::from("/tmp/a.png")]);
         assert!(note.contains("/tmp/a.png"));
         assert!(note.contains("Image available at"));
+    }
+
+    #[test]
+    fn image_note_translates_windows_path_for_wsl_cli() {
+        let note = image_paths_note_for(
+            Some(Path::new(r"\\wsl$\Ubuntu\usr\bin\claude")),
+            &[PathBuf::from(r"E:\ZM database\kivioC\shot.png")],
+        );
+        assert!(
+            note.contains("/mnt/e/ZM database/kivioC/shot.png"),
+            "{note}"
+        );
+        assert!(!note.contains(r"E:\"));
+    }
+
+    #[test]
+    fn image_note_keeps_windows_path_for_win32_cli() {
+        let note = image_paths_note_for(
+            Some(Path::new(r"C:\Users\me\AppData\Roaming\npm\claude.cmd")),
+            &[PathBuf::from(r"E:\ZM database\kivioC\shot.png")],
+        );
+        assert!(note.contains(r"E:\ZM database\kivioC\shot.png"), "{note}");
     }
 
     #[test]

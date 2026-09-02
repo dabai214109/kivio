@@ -47,7 +47,8 @@ pub(crate) fn apply_launch_at_startup(app: &AppHandle, enabled: bool) -> Result<
 
 /// 获取当前应用设置
 #[tauri::command]
-pub(crate) fn get_settings(state: State<AppState>) -> Settings {
+pub(crate) fn get_settings(app: AppHandle, state: State<AppState>) -> Settings {
+    crate::plugins::heal_and_persist_disabled_plugin_mcp(&app, &state);
     state.settings_read().clone()
 }
 
@@ -74,8 +75,12 @@ pub(crate) fn get_default_prompt_templates() -> serde_json::Value {
         "zh": default_chat_system_prompt(false),
         "en": default_chat_system_prompt(false)
       },
-      // Single English source — same string the Chat runtime injects when system_prompt is empty.
-      "chatRuntimePrompt": crate::chat::plan::chat_runtime_prompt()
+      // Chat has no built-in identity essay; empty preview matches runtime.
+      "chatRuntimePrompt": crate::chat::plan::chat_runtime_prompt(),
+      "promptOptimizePrompts": {
+        "zh": crate::chat::commands::prompt_optimize::default_system_prompt("zh"),
+        "en": crate::chat::commands::prompt_optimize::default_system_prompt("en")
+      }
     })
 }
 
@@ -88,7 +93,7 @@ pub(crate) async fn save_settings(
     state: State<'_, AppState>,
     settings: Settings,
 ) -> Result<Settings, String> {
-    apply_settings(&app, &state, settings).await
+    apply_settings(&app, &state, settings, true).await
 }
 
 /// trim + 去空 + 去重（保序）。
@@ -141,8 +146,8 @@ pub(crate) fn set_translate_card_size(
         guard.clone()
     };
     persist_settings(&app, &snapshot)?;
-    // 通知可能开着的设置窗口同步草稿里的宽度，避免其随后 save_settings 用陈旧草稿覆盖掉这次拖拽。
-    let _ = tauri::Emitter::emit_to(&app, "settings", "translate-card-width", clamped);
+    // 通知可能开着的设置页同步草稿里的宽度，避免其随后 save_settings 用陈旧草稿覆盖掉这次拖拽。
+    let _ = tauri::Emitter::emit_to(&app, "chat", "translate-card-width", clamped);
     Ok(())
 }
 
@@ -151,9 +156,13 @@ async fn apply_settings(
     app: &AppHandle,
     state: &State<'_, AppState>,
     settings: Settings,
+    preserve_oauth: bool,
 ) -> Result<Settings, String> {
     let previous_settings = state.settings_read().clone();
-    let sanitized = sanitize_settings(settings);
+    let mut sanitized = sanitize_settings(settings);
+    if preserve_oauth {
+        crate::mcp::manager::preserve_live_oauth(&mut sanitized, &previous_settings);
+    }
     apply_launch_at_startup(app, sanitized.launch_at_startup)?;
     {
         let mut guard = state.settings_write();
@@ -203,14 +212,10 @@ async fn apply_settings(
         return Err(err);
     }
 
-    let had_email = !previous_settings.email_accounts.is_empty();
-    let has_email = !sanitized.email_accounts.is_empty();
-    if has_email || had_email {
-        if let Err(err) =
-            crate::connectors::himalaya::sync_himalaya_config(&sanitized.email_accounts)
-        {
-            eprintln!("himalaya config sync: {err}");
-        }
+    state.sync_preferred_api_keys(&previous_settings, &sanitized);
+
+    if previous_settings.keep_chat_window_alive && !sanitized.keep_chat_window_alive {
+        crate::shortcuts::destroy_hidden_chat_window(app);
     }
 
     if let Err(err) = setup_tray(app) {
@@ -256,7 +261,7 @@ pub(crate) async fn import_settings(
         .ok_or_else(|| "备份文件缺少 settings 字段".to_string())?;
     let settings: Settings = serde_json::from_value(settings_value.clone())
         .map_err(|e| format!("备份内容无法解析: {e}"))?;
-    apply_settings(&app, &state, settings).await
+    apply_settings(&app, &state, settings, false).await
 }
 
 #[tauri::command]
@@ -643,7 +648,7 @@ pub(crate) async fn rapidocr_install(
     Ok(client.install(tier).await)
 }
 
-/// 查询替换翻译完整离线包（ONNX Runtime + RapidOCR + MI-GAN）的校验状态与实际字节数。
+/// 查询替换翻译完整离线包（ONNX Runtime + RapidOCR）的校验状态与实际字节数。
 /// async + spawn_blocking:同 rapidocr_status,SHA-256 校验不能占用主线程。
 #[tauri::command]
 pub(crate) async fn replace_translation_pack_status(
@@ -694,6 +699,7 @@ fn effective_request_provider(
             model_overrides: Default::default(),
             compress_request_body: false,
             request: Default::default(),
+            active_key_index: 0,
         });
     if let Some(request) = request_override {
         provider.request = request;
@@ -820,9 +826,7 @@ fn model_item_is_listable(item: &serde_json::Value) -> bool {
     methods.iter().any(|method| {
         matches!(
             method.as_str(),
-            Some("generateContent")
-                | Some("streamGenerateContent")
-                | Some("bidiGenerateContent")
+            Some("generateContent") | Some("streamGenerateContent") | Some("bidiGenerateContent")
         )
     })
 }
@@ -836,12 +840,16 @@ pub(crate) async fn fetch_models(
     let settings = state.settings_read().clone();
     let api_format = resolve_api_format(&settings, &provider_id, provider.as_ref());
     let request_override = provider.as_ref().and_then(|p| p.request.clone());
+    let preferred_idx = provider.as_ref().and_then(|p| p.active_key_index);
     let (base_url, api_keys) = resolve_provider_credentials(&settings, &provider_id, provider)?;
     let retry_attempts = effective_retry_attempts(&settings);
     let effective = effective_request_provider(&settings, &provider_id, request_override);
 
     if api_keys.is_empty() {
         return Err("Missing API Key".to_string());
+    }
+    if let Some(idx) = preferred_idx {
+        state.prefer_key(&provider_id, idx.min(api_keys.len() - 1));
     }
 
     let base = base_url.trim_end_matches('/');
@@ -882,8 +890,8 @@ pub(crate) async fn fetch_models(
 }
 
 /// 测试供应商连接是否可用
-/// 多 key：测试时只用第一个 key（避免一次连接测试遍历多 key 让用户困惑）
-/// 有 model 时发一条极小对话请求，比 /models 更能反映“能不能调模型”，
+/// 多 key：测试时只用用户点选的当前 Key（避免一次连接测试遍历多 key 让用户困惑）
+/// 有 model 时发一条短对话请求（固定 prompt，不是 hi），比 /models 更能反映“能不能调模型”，
 /// 也不依赖供应商支持 /models；无 model 时回退到 /models 探测。
 /// 请求按供应商的 api_format 走对应协议（URL + 鉴权 + body），
 /// 否则 Anthropic/Gemini/Responses 供应商会对本可用的模型误报失败。
@@ -898,11 +906,20 @@ pub(crate) async fn test_provider_connection(
     // 协议优先取前端传入（未保存的编辑中配置），缺省回退 settings 里已保存的。
     let api_format = resolve_api_format(&settings, &provider_id, provider.as_ref());
     let request_override = provider.as_ref().and_then(|p| p.request.clone());
+    let preferred_idx = provider
+        .as_ref()
+        .and_then(|p| p.active_key_index)
+        .or_else(|| {
+            settings
+                .get_provider(&provider_id)
+                .map(|p| p.clamped_active_key_index())
+        })
+        .unwrap_or(0);
     let (base_url, api_keys) = resolve_provider_credentials(&settings, &provider_id, provider)?;
 
-    let api_key = match api_keys.first() {
-        Some(k) if !k.trim().is_empty() => k.clone(),
-        _ => {
+    let api_key = match crate::api::pick_key_at(&api_keys, preferred_idx) {
+        Some(k) => k,
+        None => {
             return Ok(serde_json::json!({
               "success": false,
               "error": "Missing API Key"
@@ -923,44 +940,7 @@ pub(crate) async fn test_provider_connection(
 
     let result = match model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
         Some(model) => {
-            let (url, body) = match api_format {
-                ProviderApiFormat::AnthropicMessages => (
-                    format!("{base}/messages"),
-                    serde_json::json!({
-                        "model": model,
-                        "messages": [{ "role": "user", "content": "hi" }],
-                        "max_tokens": 1,
-                    }),
-                ),
-                ProviderApiFormat::Gemini => (
-                    format!(
-                        "{base}/models/{}:generateContent",
-                        model.trim_start_matches("models/")
-                    ),
-                    serde_json::json!({
-                        "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
-                        "generationConfig": { "maxOutputTokens": 1 },
-                    }),
-                ),
-                // xAI 与 OpenAI 的 Responses 端点同形，测试请求体本来就只有这三个字段，
-                // 都不在 xAI 的拒收名单上，无需分叉。
-                ProviderApiFormat::OpenAiResponses | ProviderApiFormat::XaiResponses => (
-                    format!("{base}/responses"),
-                    serde_json::json!({
-                        "model": model,
-                        "input": "hi",
-                        "max_output_tokens": 16,
-                    }),
-                ),
-                ProviderApiFormat::OpenAiChat => (
-                    format!("{base}/chat/completions"),
-                    serde_json::json!({
-                        "model": model,
-                        "messages": [{ "role": "user", "content": "hi" }],
-                        "max_tokens": 1,
-                    }),
-                ),
-            };
+            let (url, body) = connection_test_url_and_body(api_format, base, model);
             send_with_retry("Provider API", retry_attempts, || {
                 let request = apply_provider_auth(
                     with_request_config(client.post(url.clone())).json(&body),
@@ -992,10 +972,61 @@ pub(crate) async fn test_provider_connection(
     }
 }
 
+/// 连接探测用的用户消息。不用 "hi" / "hello"：不少网关把极短问候当无效请求直接吞掉或不回。
+const CONNECTION_TEST_PROMPT: &str = "Reply with exactly: kivio-ok";
+/// 给推理模型留一点思考预算；连通性测试不需要长回答。
+const CONNECTION_TEST_MAX_OUTPUT_TOKENS: u32 = 64;
+
+fn connection_test_url_and_body(
+    api_format: ProviderApiFormat,
+    base: &str,
+    model: &str,
+) -> (String, serde_json::Value) {
+    match api_format {
+        ProviderApiFormat::AnthropicMessages => (
+            format!("{base}/messages"),
+            serde_json::json!({
+                "model": model,
+                "messages": [{ "role": "user", "content": CONNECTION_TEST_PROMPT }],
+                "max_tokens": CONNECTION_TEST_MAX_OUTPUT_TOKENS,
+            }),
+        ),
+        ProviderApiFormat::Gemini => (
+            format!(
+                "{base}/models/{}:generateContent",
+                model.trim_start_matches("models/")
+            ),
+            serde_json::json!({
+                "contents": [{ "role": "user", "parts": [{ "text": CONNECTION_TEST_PROMPT }] }],
+                "generationConfig": { "maxOutputTokens": CONNECTION_TEST_MAX_OUTPUT_TOKENS },
+            }),
+        ),
+        // xAI 与 OpenAI 的 Responses 端点同形，测试请求体本来就只有这三个字段，
+        // 都不在 xAI 的拒收名单上，无需分叉。
+        ProviderApiFormat::OpenAiResponses | ProviderApiFormat::XaiResponses => (
+            format!("{base}/responses"),
+            serde_json::json!({
+                "model": model,
+                "input": CONNECTION_TEST_PROMPT,
+                "max_output_tokens": CONNECTION_TEST_MAX_OUTPUT_TOKENS,
+            }),
+        ),
+        ProviderApiFormat::OpenAiChat => (
+            format!("{base}/chat/completions"),
+            serde_json::json!({
+                "model": model,
+                "messages": [{ "role": "user", "content": CONNECTION_TEST_PROMPT }],
+                "max_tokens": CONNECTION_TEST_MAX_OUTPUT_TOKENS,
+            }),
+        ),
+    }
+}
+
 /// 测试网络搜索：用传入的（可能未保存的）配置真实跑一次搜索，返回结果或错误。
 /// 供设置页「测试搜索」用，验证 key/endpoint 是否可用。
 #[tauri::command]
 pub(crate) async fn test_web_search(
+    app: AppHandle,
     state: State<'_, AppState>,
     config: crate::settings::LensWebSearchConfig,
     query: String,
@@ -1006,7 +1037,7 @@ pub(crate) async fn test_web_search(
     }
     let settings = state.settings_read().clone();
     let retry_attempts = effective_retry_attempts(&settings);
-    match crate::web_search::search_web(&state, &config, query, retry_attempts).await {
+    match crate::web_search::search_web(&state, &config, query, retry_attempts, Some(&app)).await {
         Ok(results) => Ok(serde_json::json!({
             "success": true,
             "provider": crate::web_search::provider_label(config.provider),
@@ -1073,9 +1104,13 @@ pub(crate) fn open_permission_settings(kind: String) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
+    use super::connection_test_url_and_body;
     use super::dedup_preserve_order;
     use super::local_file_path_from_href;
     use super::parse_model_list_ids;
+    use super::CONNECTION_TEST_MAX_OUTPUT_TOKENS;
+    use super::CONNECTION_TEST_PROMPT;
+    use crate::settings::ProviderApiFormat;
     use serde_json::json;
 
     /// 旧 artifact（无 path）落临时文件时的文件名清洗：只取 basename，挡目录穿越。
@@ -1261,5 +1296,36 @@ mod tests {
     fn parse_model_list_rejects_unknown_shape() {
         let err = parse_model_list_ids(&json!({ "hello": "world" })).unwrap_err();
         assert!(err.contains("data") && err.contains("models"), "{err}");
+    }
+
+    #[test]
+    fn connection_test_prompt_is_not_a_trivial_greeting() {
+        let prompt = CONNECTION_TEST_PROMPT.to_lowercase();
+        assert!(!prompt.contains("hi"));
+        assert!(!prompt.contains("hello"));
+        assert!(CONNECTION_TEST_MAX_OUTPUT_TOKENS >= 16);
+
+        let (url, body) = connection_test_url_and_body(
+            ProviderApiFormat::OpenAiChat,
+            "https://api.example/v1",
+            "qwen/qwen3-max",
+        );
+        assert_eq!(url, "https://api.example/v1/chat/completions");
+        assert_eq!(body["messages"][0]["content"], CONNECTION_TEST_PROMPT);
+        assert_eq!(body["max_tokens"], CONNECTION_TEST_MAX_OUTPUT_TOKENS);
+
+        let (_, gemini) = connection_test_url_and_body(
+            ProviderApiFormat::Gemini,
+            "https://generativelanguage.googleapis.com/v1beta",
+            "models/gemini-2.5-flash",
+        );
+        assert_eq!(
+            gemini["contents"][0]["parts"][0]["text"],
+            CONNECTION_TEST_PROMPT
+        );
+        assert_eq!(
+            gemini["generationConfig"]["maxOutputTokens"],
+            CONNECTION_TEST_MAX_OUTPUT_TOKENS
+        );
     }
 }

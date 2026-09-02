@@ -50,7 +50,7 @@ function FontPicker({ value, systemFonts, placeholder, defaultLabel, emptyText, 
             <button
               key={f}
               type="button"
-              className={`kv-menu-row truncate hover:bg-black/[0.05] dark:hover:bg-white/[0.08] ${value === f ? 'bg-black/[0.04] font-semibold dark:bg-white/[0.06]' : 'text-neutral-700 dark:text-neutral-300'}`}
+              className={`kv-menu-row truncate hover:bg-black/[0.05] dark:hover:bg-white/[0.08] ${value === f ? 'bg-black/[0.04] font-semibold text-neutral-900 dark:bg-white/[0.06] dark:text-neutral-100' : 'text-neutral-700 dark:text-neutral-300'}`}
               style={{ fontFamily: `"${f}"` }}
               onMouseDown={(e) => { e.preventDefault(); select(f) }}
             >
@@ -211,7 +211,7 @@ export function AppearanceGroup({
   )
 }
 
-/** 行为：开机自启 / 启动后最小化到托盘 / 失败重试。 */
+/** 行为：开机自启 / 启动后最小化到托盘 / 关闭时保持聊天窗口 / 失败重试。 */
 export function BehaviorGroup({
   settings,
   t,
@@ -241,6 +241,13 @@ export function BehaviorGroup({
         <Toggle
           checked={settings.launchMinimizedToTray ?? false}
           onChange={(v) => onUpdateSettings({ launchMinimizedToTray: v })}
+        />
+      </SettingRow>
+      <SettingRow label={t.keepChatWindowAlive} description={t.keepChatWindowAliveDesc}>
+        <Toggle
+          checked={settings.keepChatWindowAlive ?? false}
+          onChange={(v) => onUpdateSettings({ keepChatWindowAlive: v })}
+          ariaLabel={t.keepChatWindowAlive}
         />
       </SettingRow>
       <SettingRow label={t.retryEnabled}>

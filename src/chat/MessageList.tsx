@@ -18,9 +18,11 @@ import { copyToClipboard } from '../utils/clipboard'
 import { CompactionDivider } from './CompactionDivider'
 import { CompactionInProgress } from './CompactionInProgress'
 import { CompactionSummaryPanel } from './CompactionSummaryPanel'
+import { ContextClearDivider } from './ContextClearDivider'
 import { resolveCompactionBoundaries, resolvePendingCompactionAfterIndex, type CompactionBoundaryView } from './compactionBoundary'
+import { resolveClearBoundaries, type ContextClearBoundaryView } from './contextClearBoundary'
 import { isExecutableAgentPlanText } from './agentPlan'
-import { foldMessageGroups } from './messageGroups'
+import { foldMessageGroups, isLastAssistantTurn, occupiedReplyModels } from './messageGroups'
 import {
   activeMessageNavigatorNodeId,
   buildMessageNavigatorNodes,
@@ -48,14 +50,13 @@ import {
 } from './messageListVirtualization'
 import type { Lang } from '../settings/i18n'
 import { measureChatSurface, recordChatPerfSample, useChatPerfRenderProbe } from './chatPerformanceProbe'
-import { getChatPerformanceFlags } from './chatPerformanceFlags'
 import {
   beginMessageNavigationHydrate,
   beginStreamSettleEagerHydrate,
   endMessageNavigationHydrate,
   resetMessageNavigationStore,
 } from './messageNavigationStore'
-import { createLiveRowModel, extractLiveRange } from './liveRowModel'
+import { createLiveRowModel } from './liveRowModel'
 
 
 export interface AssistantStreamStats {
@@ -74,6 +75,9 @@ export interface MessageListProps {
   assistantStreamStatsByMessageId?: Record<string, AssistantStreamStats>
   onUpdateMessage?: (messageId: string, content: string) => Promise<void>
   onRegenerateMessage?: (messageId: string, newContent?: string) => Promise<void>
+  onReplyWithModel?: (messageId: string, providerId: string, model: string) => Promise<void>
+  sessionProviderId?: string
+  sessionModel?: string
   onForkMessage?: (messageId: string) => Promise<void>
   onRewindMessage?: (messageId: string) => Promise<void>
   onDeleteMessage?: (messageId: string) => Promise<void>
@@ -87,6 +91,7 @@ export interface MessageListProps {
   contextState?: ConversationContextState | null
   compactionInProgress?: boolean
   animateCompactionBoundaryId?: string | null
+  animateClearBoundaryId?: string | null
   lang?: Lang
   /** 全局搜索：打开会话后滚到该消息并短暂高亮。 */
   focusMessageId?: string | null
@@ -141,6 +146,7 @@ type RenderItem =
   | { kind: 'compaction-divider'; key: string; boundary: CompactionBoundaryView; animate: boolean }
   | { kind: 'compaction-summary'; key: string; boundary: CompactionBoundaryView }
   | { kind: 'compaction-progress'; key: string; afterIndex: number }
+  | { kind: 'context-clear-divider'; key: string; boundary: ContextClearBoundaryView; animate: boolean }
 
 function measurementKey(item: RenderItem): string {
   if (item.kind === 'message') {
@@ -174,6 +180,8 @@ function streamErrorDegraded(error: string): DegradedAnswer {
       || normalized.includes('timed out')
       || normalized.includes('连接')
       || normalized.includes('网络')
+      || normalized.includes('without terminal')
+      || normalized.includes('stream ended')
       ? 'timeout'
       : normalized.includes('context') || normalized.includes('上下文')
         ? 'context_overflow'
@@ -198,6 +206,9 @@ function MessageListBase({
   assistantStreamStatsByMessageId = {},
   onUpdateMessage,
   onRegenerateMessage,
+  onReplyWithModel,
+  sessionProviderId = '',
+  sessionModel = '',
   onForkMessage,
   onRewindMessage,
   onDeleteMessage,
@@ -209,13 +220,11 @@ function MessageListBase({
   contextState = null,
   compactionInProgress = false,
   animateCompactionBoundaryId = null,
+  animateClearBoundaryId = null,
   lang = 'zh',
   focusMessageId = null,
   onFocusMessageHandled,
 }: MessageListProps) {
-  const chatPerfFlags = getChatPerformanceFlags()
-  const useTanStackVirtualizer = chatPerfFlags.tanstackVirtualizer
-  const externalizeLiveRow = chatPerfFlags.liveRowExternalization
   useChatPerfRenderProbe('MessageList', {
     conversationId,
     messages: messages.length,
@@ -490,7 +499,7 @@ function MessageListBase({
     { anchor: MessageMenuAnchor; selectionText: string; messageText: string | null } | null
   >(null)
 
-  // 底部跟随：外置 live（默认）时 document-flow 高度变化 → RO contentGrowth 钉底。
+  // 底部跟随：外置 live 时 document-flow 高度变化 → RO contentGrowth 钉底。
   // growthSignal 在 scrollHeight 真变且 RO 未投递时补一枪（jsdom）。
   const streamGrowthSignal = streaming || streamFrozen
     ? `${streamingContent.length}:${streamingReasoning.length}:${streamingToolCalls.length}:${streamingSegments.length}`
@@ -535,6 +544,11 @@ function MessageListBase({
     [contextState, messages],
   )
 
+  const clearBoundaries = useMemo(
+    () => resolveClearBoundaries(messages, contextState),
+    [contextState, messages],
+  )
+
   const boundariesByAfterIndex = useMemo(() => {
     const map = new Map<number, CompactionBoundaryView[]>()
     for (const boundary of boundaries) {
@@ -544,6 +558,16 @@ function MessageListBase({
     }
     return map
   }, [boundaries])
+
+  const clearBoundariesByAfterIndex = useMemo(() => {
+    const map = new Map<number, ContextClearBoundaryView[]>()
+    for (const boundary of clearBoundaries) {
+      const existing = map.get(boundary.afterIndex) ?? []
+      existing.push(boundary)
+      map.set(boundary.afterIndex, existing)
+    }
+    return map
+  }, [clearBoundaries])
 
   const folded = useMemo(() => foldMessageGroups(historyMessages), [historyMessages])
 
@@ -596,9 +620,22 @@ function MessageListBase({
       return
     }
     appendCompactionItems(list, afterIndex)
+    const clears = clearBoundariesByAfterIndex.get(afterIndex)
+    if (!clears) return
+    for (const boundary of clears) {
+      const recordId = boundary.record.id
+      list.push({
+        kind: 'context-clear-divider',
+        key: `context-clear-divider-${recordId}`,
+        boundary,
+        animate: animateClearBoundaryId === recordId,
+      })
+    }
   }, [
     appendCompactionItems,
+    animateClearBoundaryId,
     boundariesByAfterIndex,
+    clearBoundariesByAfterIndex,
     compactionInProgress,
     pendingCompactionAfterIndex,
   ])
@@ -657,7 +694,7 @@ function MessageListBase({
   }
 
   // 历史项只在消息/压缩边界/组模型身份变化时重建。高频流式文本不进入依赖；
-  // live 行单独挂在 virtualizer 尾部（或外置 rollback 路径）。
+  // live 行单独挂在 virtualizer 外的文档流尾部。
   const historyItems = useMemo<RenderItem[]>(() => {
     const list: RenderItem[] = [
       { kind: 'spacer', key: 'padding-top', size: LIST_EDGE_PADDING_PX },
@@ -722,13 +759,9 @@ function MessageListBase({
   // not rebuild committed rows.
   }, [appendCompactionSlot, folded, liveGroupModels, liveRowModel, messageIndexById])
 
-  // Default: live rides the chrome tail outside the virtualizer
-  // (`liveRowExternalization=true`). Token growth only moves scrollHeight →
-  // contentGrowth pin. In-virtualizer live (flag false) is an A/B experiment
-  // that reuses a stable live key via liveRowModel + extractLiveRange.
-  // Without TanStack there is no virtualizer: live always rides the chrome tail.
-  const liveInVirtualizer = Boolean(liveItem) && !externalizeLiveRow && useTanStackVirtualizer
-  const dynamicItem = liveItem && !liveInVirtualizer ? liveItem : null
+  // Live rides the chrome tail outside the virtualizer. Token growth only
+  // moves scrollHeight → contentGrowth pin.
+  const dynamicItem = liveItem
 
   const errorItem = useMemo<RenderItem | null>(() => {
     if (!error) return null
@@ -822,27 +855,12 @@ function MessageListBase({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- liveEndingThisFrame 刻意入依赖：settle 帧种子写入后强制重建，重读缓存
   }, [contentWidth, historyItems, layoutKey, liveEndingThisFrame, tailMeasurementKey])
 
-  // Default externalization: live is NOT a virtualizer row — chrome tail below
-  // carries live + status/error/send-reserve. In-list experiment (flag false)
-  // puts live as the last virtualizer row with a stable key; chrome stays outside
-  // so token growth never remeasures a combined tail.
-  const flowLiveOutsideVirtualizer = useTanStackVirtualizer && externalizeLiveRow
-  const liveItemRef = useRef<RenderItem | null>(liveItem)
-  liveItemRef.current = liveItem
-  const itemCount = useTanStackVirtualizer
-    ? historyItems.length + (liveInVirtualizer ? 1 : 0)
-    : 0
+  // Live is not a virtualizer row — chrome tail below carries live +
+  // status/error/send-reserve, so token growth never remeasures a combined tail.
+  const itemCount = historyItems.length
   const historyItemsRef = useRef<RenderItem[]>(historyItems)
   historyItemsRef.current = historyItems
-  const liveStartIndex = liveInVirtualizer ? historyItems.length : -1
-  const liveStartIndexRef = useRef(liveStartIndex)
-  liveStartIndexRef.current = liveStartIndex
-  const itemAt = useCallback((index: number) => {
-    const history = historyItemsRef.current
-    if (index < history.length) return history[index]
-    if (liveItemRef.current && index === history.length) return liveItemRef.current
-    return undefined
-  }, [])
+  const itemAt = useCallback((index: number) => historyItemsRef.current[index], [])
   const estimateSizeRef = useRef(estimatedSizeByKey)
   estimateSizeRef.current = estimatedSizeByKey
   const observeRect: ReactVirtualizerOptions<HTMLDivElement, HTMLDivElement>['observeElementRect'] = useCallback((instance, callback) => {
@@ -857,8 +875,8 @@ function MessageListBase({
     [conversationId, layoutKey, measurementRevision],
   )
   const virtualizer = useVirtualizer<HTMLDivElement, HTMLDivElement>({
-    count: useTanStackVirtualizer ? itemCount : 0,
-    enabled: useTanStackVirtualizer,
+    count: itemCount,
+    enabled: true,
     getScrollElement: () => scrollRef.current,
     // Share scroll authority with follow pinning (source-classified writes).
     // LiveAgent keeps anchorTo:end always on; the follow corrector re-pins any
@@ -902,8 +920,7 @@ function MessageListBase({
         const logicalKey = Number.isInteger(index) ? itemAt(index)?.key : undefined
         const previousSize = instance.itemSizeCache.get(virtualKey)
         if (previousSize === undefined || Math.abs(previousSize - size) > 0.5) {
-          // Remeasure compensation. Default external live never hits this for
-          // token growth; in-list experiment can remeasure the live tail.
+          // Remeasure compensation. External live never hits this for token growth.
           followHandle.markLayoutCompensation()
         }
         // 行内还有未 hydrate 的 heavy island（Mermaid/HTML 预览等 fallback 与真身
@@ -918,9 +935,7 @@ function MessageListBase({
       return measured
     },
     rangeExtractor: useCallback((range: Range) => {
-      // LiveAgent extractLiveRange: force-mount the live tail for the whole run
-      // so Streamdown/shiki state is never dropped mid-stream.
-      let indexes = extractLiveRange(defaultRangeExtractor(range), liveStartIndexRef.current, itemCount)
+      let indexes = defaultRangeExtractor(range)
       // 消息导航：目标行附近强制挂载渲染测高，再一次性跳转。
       const forced = forceMountRenderIndex
       if (forced != null && itemCount > 0) {
@@ -948,31 +963,15 @@ function MessageListBase({
     useAnimationFrameWithResizeObserver: false,
     useFlushSync: false,
   })
-  // 对齐 LiveAgent createLiveRowScrollAdjustPolicy（仅 fallback：live 仍在列表内）。
-  // 外置路径下 virtualizer 只有历史行，流式增长不再进这个谓词。
-  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, delta, instance) => {
+  virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, _delta, instance) => {
     // 导航 prepare/hold 期间禁止测高改 scrollTop：那是点导航后上下抽的主因。
     if (navigationLockRef.current) return false
-    const shouldAdjust = shouldAdjustChatItemSizeChange(item, {
+    return shouldAdjustChatItemSizeChange(item, {
       scrollOffset: instance.scrollOffset ?? 0,
       scrollAdjustments: instance.scrollAdjustments,
       itemSizeCache: instance.itemSizeCache,
       scrollDirection: instance.scrollDirection,
     })
-    if (!shouldAdjust) return false
-    if (flowLiveOutsideVirtualizer) return true
-    const viewportTop = (instance.scrollOffset ?? 0) + instance.scrollAdjustments
-    const liveRowIndex = liveStartIndexRef.current
-    if (
-      liveRowIndex >= 0
-      && item.index >= liveRowIndex
-      && delta > 0
-      && item.end > viewportTop
-      && !followHandle.isFollowing()
-    ) {
-      return false
-    }
-    return true
   }
 
   const virtualItems = virtualizer.getVirtualItems()
@@ -982,7 +981,7 @@ function MessageListBase({
 
   const saveMeasurementSnapshotRef = useRef<() => void>(() => {})
   saveMeasurementSnapshotRef.current = () => {
-    if (!useTanStackVirtualizer || !viewportEl) return
+    if (!viewportEl) return
     saveMeasurementSnapshot(
       conversationId,
       layoutKey,
@@ -1006,8 +1005,8 @@ function MessageListBase({
   const navigatorNodes = useMemo(() => {
     // targetRenderIndex 仍是「全历史逻辑下标」，导航时用 data-chat-row-index 查找。
     const renderIndexByKey = new Map(historyItems.map((item, index) => [item.key, index]))
-    return buildMessageNavigatorNodes({ folded, boundaries, renderIndexByKey })
-  }, [boundaries, folded, historyItems])
+    return buildMessageNavigatorNodes({ folded, boundaries, clearBoundaries, renderIndexByKey })
+  }, [boundaries, clearBoundaries, folded, historyItems])
   navigatorNodesRef.current = navigatorNodes
   const navigatorTurnCount = navigatorNodes.reduce(
     (count, node) => count + (node.kind === 'turn' ? 1 : 0),
@@ -1248,7 +1247,7 @@ function MessageListBase({
     hold.frames += 1
 
     const metrics = readNavigatorTargetMetrics(hold.targetIndex)
-    const totalSize = useTanStackVirtualizer ? virtualizer.getTotalSize() : 0
+    const totalSize = virtualizer.getTotalSize()
     const geometryStable = metrics.ready
       && metrics.offsetPx <= NAVIGATOR_ALIGN_EPSILON_PX
       && metrics.height === hold.lastHeight
@@ -1280,7 +1279,6 @@ function MessageListBase({
     navigatorHoldEpoch,
     readNavigatorTargetMetrics,
     setNavigationLock,
-    useTanStackVirtualizer,
     virtualItems,
     virtualizer,
   ])
@@ -1414,7 +1412,7 @@ function MessageListBase({
     setNavigationLock(true)
 
     // 强制挂载尾部邻域（含 live 行），让代码块在钉底前就按真高度量好。
-    const tailIndex = historyItems.length + (liveInVirtualizer ? 1 : 0) - 1
+    const tailIndex = historyItems.length - 1
     if (tailIndex >= 0) {
       setForceMountRenderIndex(tailIndex)
     }
@@ -1431,7 +1429,6 @@ function MessageListBase({
     cancelNavigatorSettle,
     followHandle,
     historyItems.length,
-    liveInVirtualizer,
     setNavigationLock,
   ])
 
@@ -1653,7 +1650,7 @@ function MessageListBase({
 
   const closeMsgMenu = useCallback(() => setMsgMenu(null), [])
 
-  // 尾部：外置时是 virtualizer 下方的文档流块；回退时仍是 virtualizer 最后一行。
+  // 尾部：virtualizer 下方的文档流块。
   // 流式气泡 / 错误 / 状态线 / 发送预留都在这里，历史行不因 token 重测。
   const tailWrapRef = useRef<HTMLDivElement | null>(null)
   const tailSpacerRef = useRef<HTMLDivElement | null>(null)
@@ -1857,6 +1854,19 @@ function MessageListBase({
               // 本地取消后 send invoke 尚未返回，此窗口内触发只会被 in-flight 兜底静默吞掉
               // （编辑文本会被无声丢弃），所以从入口处直接收起。
               onRegenerateMessage={streaming || streamFrozen ? undefined : onRegenerateMessage}
+              onReplyWithModel={
+                onReplyWithModel
+                  && !streaming
+                  && !streamFrozen
+                  && isLastAssistantTurn(messages, msg.id)
+                  ? onReplyWithModel
+                  : undefined
+              }
+              replyOccupiedModels={
+                isLastAssistantTurn(messages, msg.id)
+                  ? occupiedReplyModels(messages, msg.id, sessionProviderId, sessionModel)
+                  : undefined
+              }
               onForkMessage={streaming || streamFrozen ? undefined : onForkMessage}
               onRewindMessage={streaming || streamFrozen ? undefined : onRewindMessage}
               onDeleteMessage={onDeleteMessage}
@@ -1877,6 +1887,19 @@ function MessageListBase({
               onSelectColumn={onSetGroupSelection}
               onUpdateMessage={onUpdateMessage}
               onRegenerateMessage={streaming || streamFrozen ? undefined : onRegenerateMessage}
+              onReplyWithModel={
+                onReplyWithModel
+                  && !streaming
+                  && !streamFrozen
+                  && item.messages.some((message) => isLastAssistantTurn(messages, message.id))
+                  ? onReplyWithModel
+                  : undefined
+              }
+              replyOccupiedModels={
+                item.messages[0]
+                  ? occupiedReplyModels(messages, item.messages[0].id, sessionProviderId, sessionModel)
+                  : undefined
+              }
               onForkMessage={streaming || streamFrozen ? undefined : onForkMessage}
               onDeleteMessage={onDeleteMessage}
               onSaveMessageToNote={onSaveMessageToNote}
@@ -1920,6 +1943,14 @@ function MessageListBase({
           )
         case 'compaction-progress':
           return <CompactionInProgress lang={lang} />
+        case 'context-clear-divider':
+          return (
+            <ContextClearDivider
+              boundary={item.boundary}
+              lang={lang}
+              animate={item.animate}
+            />
+          )
         case 'error':
           return (
             <div className="chat-motion-fade-up flex flex-col items-start gap-2 py-3">
@@ -1945,6 +1976,9 @@ function MessageListBase({
       legacyPlanMessageId,
       onUpdateMessage,
       onRegenerateMessage,
+      onReplyWithModel,
+      sessionProviderId,
+      sessionModel,
       onForkMessage,
       onRewindMessage,
       onDeleteMessage,
@@ -1953,6 +1987,7 @@ function MessageListBase({
       onRetryLastUser,
       streaming,
       streamFrozen,
+      messages,
       groupSelections,
       onSetGroupSelection,
       streamingReasoningDurationMs,
@@ -2006,14 +2041,11 @@ function MessageListBase({
         <div ref={setContentEl} className="chat-message-list-inner mx-auto w-full max-w-4xl px-6">
           <div
             className="relative w-full"
-            style={useTanStackVirtualizer ? { height: virtualizer.getTotalSize() } : undefined}
+            style={{ height: virtualizer.getTotalSize() }}
           >
-            {useTanStackVirtualizer ? virtualItems.map((virtualItem) => {
+            {virtualItems.map((virtualItem) => {
               const item = itemAt(virtualItem.index)
               if (!item) return null
-              const logicalIndex = virtualItem.index < historyItems.length
-                ? virtualItem.index
-                : undefined
               const messageId = item.kind === 'message'
                 ? item.message.id
                 : item.kind === 'streaming'
@@ -2025,7 +2057,7 @@ function MessageListBase({
                   ref={import.meta.env.MODE === 'test' ? undefined : virtualizer.measureElement}
                   data-index={virtualItem.index}
                   data-chat-item-key={measurementKey(item)}
-                  data-chat-row-index={logicalIndex}
+                  data-chat-row-index={virtualItem.index}
                   data-message-id={messageId}
                   data-chat-message-list-item={item.kind}
                   className="absolute left-0 top-0 w-full pb-0.5"
@@ -2034,33 +2066,12 @@ function MessageListBase({
                   {renderItem(item)}
                 </div>
               )
-            }) : (
-              <>
-                {historyItems.map((item, index) => (
-                  <div
-                    key={item.key}
-                    data-index={index}
-                    data-chat-row-index={index}
-                    data-message-id={item.kind === 'message' ? item.message.id : undefined}
-                    data-chat-message-list-item={item.kind}
-                    className="w-full pb-0.5"
-                  >
-                    {renderItem(item)}
-                  </div>
-                ))}
-                <div data-chat-message-list-item="tail" className="w-full pb-0.5">
-                  {renderTail()}
-                </div>
-              </>
-            )}
+            })}
           </div>
-          {/* Chrome always outside. Default externalization also mounts live here;
-              in-list experiment keeps live in the virtualizer and only chrome here. */}
-          {useTanStackVirtualizer && (
-            <div data-chat-message-list-item="tail" className="w-full pb-0.5">
-              {renderTail()}
-            </div>
-          )}
+          {/* Chrome always outside: live + status/error/send-reserve. */}
+          <div data-chat-message-list-item="tail" className="w-full pb-0.5">
+            {renderTail()}
+          </div>
         </div>
       </div>
       {/* 上下边界渐变遮罩，纯覆盖层。颜色必须跟 .chat-main-pane 的底色走（浅色 --theme-surface-soft，暗色 #262629）——

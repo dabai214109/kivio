@@ -215,12 +215,16 @@ const DUPLICATE_IMAGE_PLACEHOLDER: &str = "[与后文同一张图片，此处省
 
 /// 发送视图里所有图片 base64 的总字节预算。超出后从**最旧**的图片开始换占位符。
 ///
-/// 4MB base64 ≈ 3MB 原始字节，够放四五张全分辨率截图；再多的历史图片对当前一步几乎
-/// 没有价值，却每轮都要重传。参照 Codex 的实测事故：图片 base64 反复重放把请求打到
-/// 8.34MB，多家 OpenAI 兼容中转直接 502/524 或返回空流。
+/// 与入口降采样（`chat/image_prep.rs`）分工：入口把每张图收敛到 ≤2000px / ≤2MB 原始
+/// 字节（base64 ≈ 2.7MB，典型只有几百 KB），所以这里是**保险不是主力**——16MB 对齐
+/// pi 的溢出恢复预算（Anthropic 32MB 请求体上限的一半），装得下几十张典型缩放图。
+/// 曾经是 4MB：入口不缩放时它每轮必砍，会把模型**上一轮刚读、还没看到**的图挤出
+/// 上下文，模型按占位符提示重读 → 再挤掉别的图，原地绕圈（实测于电商 9 图核验会话）。
+/// 参照 Codex 的实测事故（openai/codex#28316）：无预算时图片 base64 反复重放把请求
+/// 打到 8.34MB+，多家 OpenAI 兼容中转直接 502/524 或返回空流——预算本身必须保留。
 ///
 /// ponytail: 固定常量，不做设置项。真有人需要不同额度再提成 `chat_tools` 配置。
-const IMAGE_BYTES_BUDGET: usize = 4 * 1024 * 1024;
+const IMAGE_BYTES_BUDGET: usize = 16 * 1024 * 1024;
 
 /// 收敛发送视图里的图片体积：**倒序**（新→旧）遍历，重复的图片只留最新那份，
 /// 累计 base64 字节超过 [`IMAGE_BYTES_BUDGET`] 后把更早的图片换成占位文本。
@@ -773,7 +777,11 @@ fn extract_summary_text(response: &str) -> String {
 }
 
 /// 摘要调用的最大输出 token：`min(config.max_output_tokens, SUMMARY_OUTPUT_TOKENS)`（R9）。
+/// `0` 仍用本常数封顶（适配器层 0=省略字段；摘要路径不要产出 0）。
 fn summary_output_tokens(config_max: u32) -> u32 {
+    if config_max == 0 {
+        return SUMMARY_OUTPUT_TOKENS;
+    }
     config_max.min(SUMMARY_OUTPUT_TOKENS)
 }
 
@@ -848,7 +856,11 @@ fn estimate_model_messages_tokens(messages: &[ModelMessage]) -> usize {
                     } => estimate_tokens(name) + estimate_tokens(arguments_raw),
                     MessagePart::ToolResult { content, .. } => estimate_tokens(content),
                     // 图片部件记 0（与 estimate_value_tokens 同口径，不把 base64 算进 token）。
-                    MessagePart::Image { .. } | MessagePart::ImageUrl { .. } => 0,
+                    // reasoning item 同理：encrypted_content 是密文 base64，按字符估算会
+                    // 数倍虚高；其真实占用由 usage 锚点覆盖。
+                    MessagePart::Image { .. }
+                    | MessagePart::ImageUrl { .. }
+                    | MessagePart::ReasoningItem { .. } => 0,
                 })
                 .sum();
             parts + 4
@@ -1379,11 +1391,28 @@ pub(crate) async fn maybe_compact_send_view(env: &LoopEnv<'_>, state: &mut RunSt
     // Kivio footer 也含 `estimate_tool_segments`）。工具定义随每次请求发送、provider 会计入，漏算会
     // 让无锚点的首轮低估数千 token、压缩过晚——故这里补上（与 footer `count_tokens_in_value` 同口径，
     // 都基于 `estimate_value_tokens(tool.to_openai_tool())`）。
-    let tool_schema_tokens: usize = state
-        .tools
-        .iter()
-        .map(|tool| estimate_value_tokens(&tool.to_openai_tool()))
-        .sum();
+    // 按「工具名集合哈希」做轮间缓存：每轮为上百个工具重建整份 schema JSON 只为估个
+    // token 数太浪费；工具集只在 Skill 激活时变（同名工具的 schema run 内稳定）。
+    let tool_schema_tokens = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for tool in &state.tools {
+            tool.name.hash(&mut hasher);
+        }
+        let fingerprint = hasher.finish();
+        match state.tool_schema_tokens_cache {
+            Some((cached_fingerprint, cached)) if cached_fingerprint == fingerprint => cached,
+            _ => {
+                let estimated: usize = state
+                    .tools
+                    .iter()
+                    .map(|tool| estimate_value_tokens(&tool.to_openai_tool()))
+                    .sum();
+                state.tool_schema_tokens_cache = Some((fingerprint, estimated));
+                estimated
+            }
+        }
+    };
     let estimate_full =
         estimate_messages_tokens(&state.runtime_messages).saturating_add(tool_schema_tokens);
     let (anchor_prompt, trailing) = if let Some(usage) = &state.last_step_usage {
@@ -1470,11 +1499,8 @@ pub(crate) async fn maybe_compact_send_view(env: &LoopEnv<'_>, state: &mut RunSt
         window,
         // 用模型真实 max output（而非 run 的 config.max_output_tokens），与持久化路径
         // compact_conversation 口径统一——否则 run 配的小输出会把摘要卡短、9 段产出被截。
-        chat_max_output_tokens_for_model(
-            Some(&config.provider),
-            &config.model,
-            config.max_output_tokens,
-        ),
+        chat_max_output_tokens_for_model(Some(&config.provider), &config.model)
+            .unwrap_or(SUMMARY_OUTPUT_TOKENS),
         config.retry_attempts,
         &config.conversation_id,
         &config.message_id,
@@ -1644,23 +1670,11 @@ fn context_included_indices(conversation: &Conversation, summary_start: usize) -
 /// 与 L2 run 结束写回（commands.rs）**共用**，防止两处累积口径分叉。
 /// 找不到 `until_id` → 仅返回旧 ids（防御，不 panic）。
 pub(crate) fn accumulate_source_ids(conversation: &Conversation, until_id: &str) -> Vec<String> {
-    let prev = conversation
-        .context_state
-        .summary
-        .as_ref()
-        .filter(|s| !s.stale);
+    let prev = crate::chat::commands::context::active_summary(conversation);
     let mut ids = prev
         .map(|s| s.source_message_ids.clone())
         .unwrap_or_default();
-    let summary_start = prev
-        .and_then(|s| {
-            conversation
-                .messages
-                .iter()
-                .position(|m| m.id == s.source_until_message_id)
-        })
-        .map(|idx| idx + 1)
-        .unwrap_or(0);
+    let summary_start = crate::chat::commands::context::context_replay_start_index(conversation);
     let Some(until_idx) = conversation.messages.iter().position(|m| m.id == until_id) else {
         return ids;
     };
@@ -1699,20 +1713,8 @@ async fn compact_conversation_inner(
     trigger: &str,
     focus: Option<&str>,
 ) -> Result<(), String> {
-    // 上一份落盘 summary 之后才进 old_segment；其之前已被摘要覆盖，不重复进。
-    let summary_start = conversation
-        .context_state
-        .summary
-        .as_ref()
-        .filter(|s| !s.stale)
-        .and_then(|s| {
-            conversation
-                .messages
-                .iter()
-                .position(|m| m.id == s.source_until_message_id)
-        })
-        .map(|idx| idx + 1)
-        .unwrap_or(0);
+    // 上一份落盘 summary / 清空切点之后才进 old_segment；其之前不重复进。
+    let summary_start = crate::chat::commands::context::context_replay_start_index(conversation);
 
     // 参与压缩的消息：summary_start 之后、且**未被多答组排除**的原始下标（与
     // build_chat_api_messages 同谓词——排除臂不进 replay，也不该进摘要输入/token 预算）。
@@ -1755,12 +1757,8 @@ async fn compact_conversation_inner(
     };
     let window = context_window_for_model(Some(&provider), &model).0;
 
-    let previous_summary = conversation
-        .context_state
-        .summary
-        .as_ref()
-        .filter(|s| !s.stale)
-        .map(|s| s.content.clone());
+    let previous_summary =
+        crate::chat::commands::context::active_summary(conversation).map(|s| s.content.clone());
     let serialized_head = serialize_chat_messages_for_summary(&old_segment);
     let message_id = source_until_message_id.clone();
     let summary_text = match compact_with_summary_model(
@@ -1774,7 +1772,7 @@ async fn compact_conversation_inner(
         // 一轮，边界天然不劈开 turn，无需 TurnPrefix。
         SummaryKind::History,
         window,
-        chat_max_output_tokens_for_model(Some(&provider), &model, settings.chat.max_output_tokens),
+        chat_max_output_tokens_for_model(Some(&provider), &model).unwrap_or(SUMMARY_OUTPUT_TOKENS),
         retry_attempts,
         &conversation.id,
         &message_id,
@@ -1861,19 +1859,7 @@ fn session_model_for(conversation: &Conversation) -> crate::settings::SessionMod
 /// 落盘路径「是否有可压缩旧段」判定（供 `should_auto_compress_context` 用）：
 /// 在上一份未过期 summary 之后、按 `RECENT_KEEP_TOKENS` 尾窗切分后，是否还存在 old_segment。
 pub(crate) fn has_compressible_old_segment(conversation: &Conversation) -> bool {
-    let summary_start = conversation
-        .context_state
-        .summary
-        .as_ref()
-        .filter(|s| !s.stale)
-        .and_then(|s| {
-            conversation
-                .messages
-                .iter()
-                .position(|m| m.id == s.source_until_message_id)
-        })
-        .map(|idx| idx + 1)
-        .unwrap_or(0);
+    let summary_start = crate::chat::commands::context::context_replay_start_index(conversation);
     // 与 compact_conversation_inner 同口径：过滤多答排除臂后再判断是否还有可摘要旧段。
     let included = context_included_indices(conversation, summary_start);
     token_split_over_indices(&conversation.messages, &included, RECENT_KEEP_TOKENS).is_some()
@@ -1945,6 +1931,7 @@ mod tests {
             agent_plan_state: Default::default(),
             knowledge_base_ids: Vec::new(),
             force_knowledge_search: false,
+            additional_directories: Vec::new(),
             thinking_level: None,
             web_search_mode: None,
             reply_models: Vec::new(),
@@ -2840,6 +2827,23 @@ mod tests {
         assert_eq!(accumulate_source_ids(&conversation, "b"), vec!["a", "b"]);
     }
 
+    #[test]
+    fn accumulate_source_ids_starts_after_context_clear() {
+        let messages: Vec<ChatMessage> = ["a", "b", "c"]
+            .iter()
+            .map(|id| chat_msg(id, "user", "x"))
+            .collect();
+        let mut conversation = test_conversation(messages);
+        conversation.context_state.clear_boundaries.push(
+            crate::chat::types::ContextClearBoundaryRecord {
+                id: "clr".to_string(),
+                source_until_message_id: "a".to_string(),
+                created_at: 1,
+            },
+        );
+        assert_eq!(accumulate_source_ids(&conversation, "c"), vec!["b", "c"]);
+    }
+
     /// 构造带一个多答组（选中臂 A、排除臂 B）的会话，供批次 C 排除测试复用。
     fn conversation_with_excluded_arm() -> Conversation {
         let mut arm_a = chat_msg("a_sel", "assistant", "SELECTED_ARM_ANSWER");
@@ -3120,6 +3124,7 @@ mod tests {
         // 大 config_max → 封顶到 SUMMARY_OUTPUT_TOKENS；小 config_max → 保留 min() 语义。
         assert_eq!(summary_output_tokens(100_000), SUMMARY_OUTPUT_TOKENS);
         assert_eq!(summary_output_tokens(1_000), 1_000);
+        assert_eq!(summary_output_tokens(0), SUMMARY_OUTPUT_TOKENS);
     }
 
     #[test]

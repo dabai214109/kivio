@@ -1,8 +1,6 @@
-import { invoke } from '@tauri-apps/api/core'
-import { listen } from '@tauri-apps/api/event'
+import { Channel, invoke } from '@tauri-apps/api/core'
 import Ajv2020 from 'ajv/dist/2020'
 import schema from '../generated/chatProtocol.schema.json'
-import pythonSchema from '../generated/chatPython.schema.json'
 import syncSchema from '../generated/chatSync.schema.json'
 import {
   CHAT_PROTOCOL_VERSION,
@@ -11,7 +9,6 @@ import {
   type ChatRunEventEnvelope,
   type ChatRunSnapshot,
   type ChatSyncResult,
-  type ChatRunPythonPayload,
 } from '../generated/chatProtocol'
 
 export type ChatProtocolIssue = 'version_mismatch' | 'invalid_event' | 'resync_required'
@@ -33,10 +30,7 @@ const ajv = new Ajv2020({
   formats: { float: true, uint8: true, uint32: true, uint64: true, int64: true },
 })
 const validateEvent = ajv.compile(schema)
-const validatePython = ajv.compile(pythonSchema)
 const validateSync = ajv.compile(syncSchema)
-const seenPythonRequests = new Set<string>()
-const pythonSubscribers = new Set<(request: ChatRunPythonPayload) => void>()
 const subscribers = new Set<Subscriber>()
 const issueSubscribers = new Set<(issue: ChatProtocolIssue, conversationId?: string) => void>()
 const runs = new Map<string, RunState>()
@@ -45,8 +39,32 @@ const liveDuringSync = new Map<string, ChatRunEventEnvelope[]>()
 const conversationRevisions = new Map<string, number>()
 const syncRetryAttempts = new Map<string, number>()
 const syncRetryTimers = new Map<string, ReturnType<typeof setTimeout>>()
-let nativeListener: Promise<() => void> | null = null
-let nativePythonListener: Promise<() => void> | null = null
+const exclusiveConversationIds = new Set<string>()
+let nativeListener: Promise<void> | null = null
+let subscribeConversationId: string | null = null
+let subscribeGeneration = 0
+let channelResetHooked = false
+
+const CHAT_PROTOCOL_CHANNEL_RESET_EVENT = 'chat-protocol-channel-reset'
+
+/** 弹出窗在订阅前调用：该 WebView 的通道只收这一条对话。主窗不要调。 */
+export function configureChatProtocolFilter(conversationId: string | null) {
+  if (subscribeConversationId === conversationId) return
+  subscribeConversationId = conversationId
+  // 已经订过 All 的话必须重订，否则 nativeListener 单例会把错误的 filter 钉死到窗口关掉。
+  if (nativeListener) {
+    nativeListener = null
+    void ensureListener()
+  }
+}
+
+/** 主窗 All 订阅者：这些对话的高频帧被独占路由跳过，seq 缺口不要当丢包去 sync。 */
+export function setExclusiveConversationIds(ids: Iterable<string>) {
+  exclusiveConversationIds.clear()
+  for (const id of ids) {
+    if (id) exclusiveConversationIds.add(id)
+  }
+}
 
 function reportIssue(issue: ChatProtocolIssue, conversationId?: string) {
   for (const subscriber of issueSubscribers) subscriber(issue, conversationId)
@@ -82,6 +100,18 @@ function isTerminal(
   return event.type === 'run_completed'
     || event.type === 'run_failed'
     || event.type === 'run_cancelled'
+}
+
+/** 独占路由仍会发给主窗 All 的低频边沿。它们和被跳过的 token 共用 seq，不能当缺口去 sync。 */
+function isExclusiveSparseLifecycle(type: ChatRunEventEnvelope['type']): boolean {
+  return type === 'run_started'
+    || type === 'run_completed'
+    || type === 'run_failed'
+    || type === 'run_cancelled'
+    || type === 'session_consent_requested'
+    || type === 'tool_approval_requested'
+    || type === 'tool_approval_withdrawn'
+    || type === 'user_prompt_requested'
 }
 
 function advanceTerminalRevision(event: ChatRunEventEnvelope) {
@@ -120,8 +150,26 @@ function retrySync(conversationId: string) {
 
 function applyRunEvent(event: ChatRunEventEnvelope) {
   const state = runState(event)
+  // HookFailed 是旁路警告，可在 run 已终态、甚至 hub 已 prune（seq=0 直播帧）之后到达。
+  // 不当成内容序列的缺口，也不因 terminal 丢弃——否则黄条永远出不来。
+  if (event.type === 'hook_failed') {
+    if (event.seq > state.lastSeq) state.lastSeq = event.seq
+    dispatch(event)
+    return
+  }
   if (event.seq <= state.lastSeq) return
   if (state.terminal) return
+  // 主窗 All：弹出窗独占时 token 不进这条 Channel，run_started 之后直接到审批/终态。
+  // 把中间 seq 当缺口会 chat_sync_state 把整段流再拉回主窗，独占路由白做。
+  // 弹出窗（订了 Conversation）仍应把缺口当丢包，走 sync。
+  if (
+    event.seq > state.lastSeq + 1
+    && !subscribeConversationId
+    && exclusiveConversationIds.has(event.conversationId)
+    && isExclusiveSparseLifecycle(event.type)
+  ) {
+    state.lastSeq = event.seq - 1
+  }
   if (event.seq > state.lastSeq + 1) {
     if (state.pending.size >= MAX_PENDING_EVENTS) {
       // 缺口补不上时 pending 会把整个回答（几千个 delta）攒进内存且永不派发。
@@ -237,12 +285,6 @@ function syntheticEnvelope(snapshot: ChatRunSnapshot, event: ChatRunEvent): Chat
   }
 }
 
-function dispatchPython(payload: unknown) {
-  const request = acceptChatPythonPayload(payload)
-  if (!request) return
-  for (const subscriber of pythonSubscribers) subscriber(request)
-}
-
 function applySnapshot(snapshot: ChatRunSnapshot) {
   const state: RunState = {
     conversationId: snapshot.conversationId,
@@ -301,39 +343,97 @@ function applySnapshot(snapshot: ChatRunSnapshot) {
   for (const pending of snapshot.pendingInteractions) {
     dispatch(syntheticEnvelope(snapshot, pending), restored)
   }
-  for (const request of snapshot.pendingPythonRequests) dispatchPython(request)
   for (const warning of snapshot.warnings) {
     dispatch(syntheticEnvelope(snapshot, warning), restored)
   }
   if (snapshot.terminal) dispatch(syntheticEnvelope(snapshot, snapshot.terminal), restored)
 }
 
+function handleLiveEvent(payload: unknown) {
+  if (typeof payload !== 'object' || payload === null) {
+    reportIssue('invalid_event')
+    return
+  }
+  const version = (payload as { protocolVersion?: unknown }).protocolVersion
+  if (version !== CHAT_PROTOCOL_VERSION) {
+    reportIssue('version_mismatch')
+    return
+  }
+  // Ajv 全量校验只在 dev 跑：事件由同进程 Rust 端生成（protocol.rs 是唯一源），
+  // 生产环境每条 live 事件 ~10µs 的 schema 校验是纯税,多对话并发时全落在主线程。
+  // 低频的 sync 快照仍始终校验（syncChatProtocol 里的 validateSync）。
+  if (import.meta.env.DEV && !validateEvent(payload)) {
+    console.error('Rejected invalid chat protocol event', validateEvent.errors, payload)
+    const conversationId = (payload as { conversationId?: unknown }).conversationId
+    reportIssue('invalid_event', typeof conversationId === 'string' ? conversationId : undefined)
+    if (typeof conversationId === 'string') void syncChatProtocol(conversationId)
+    return
+  }
+  applyEvent(payload as ChatProtocolEvent)
+}
+
+function hookChannelResetListener() {
+  if (channelResetHooked) return
+  channelResetHooked = true
+  // 必须绑当前 WebView：全局 listen 会收到其它窗口的 emit_to（见 App.tsx chat-open-request）。
+  void import('@tauri-apps/api/window').then(({ getCurrentWindow }) => (
+    getCurrentWindow().listen(CHAT_PROTOCOL_CHANNEL_RESET_EVENT, () => {
+      void resubscribeChatProtocol()
+    })
+  )).catch(() => {
+    channelResetHooked = false
+  })
+}
+
+function conversationIdsToResync(): string[] {
+  if (subscribeConversationId) return [subscribeConversationId]
+  const ids = new Set<string>()
+  for (const state of runs.values()) {
+    if (state.terminal) continue
+    if (exclusiveConversationIds.has(state.conversationId) && state.pending.size === 0) continue
+    if (state.pending.size > 0 || state.lastSeq > 1) ids.add(state.conversationId)
+  }
+  return [...ids]
+}
+
+async function startListener() {
+  const generation = ++subscribeGeneration
+  const channel = new Channel<unknown>()
+  channel.onmessage = handleLiveEvent
+  const conversationId = subscribeConversationId
+  await invoke('chat_protocol_subscribe', {
+    channel,
+    conversationId,
+  })
+  hookChannelResetListener()
+  if (generation !== subscribeGeneration) return
+}
+
 async function ensureListener() {
-  nativeListener ??= listen<unknown>('chat-protocol', ({ payload }) => {
-    if (typeof payload !== 'object' || payload === null) {
-      reportIssue('invalid_event')
-      return
-    }
-    const version = (payload as { protocolVersion?: unknown }).protocolVersion
-    if (version !== CHAT_PROTOCOL_VERSION) {
-      reportIssue('version_mismatch')
-      return
-    }
-    if (!validateEvent(payload)) {
-      console.error('Rejected invalid chat protocol event', validateEvent.errors, payload)
-      const conversationId = (payload as { conversationId?: unknown }).conversationId
-      reportIssue('invalid_event', typeof conversationId === 'string' ? conversationId : undefined)
-      if (typeof conversationId === 'string') void syncChatProtocol(conversationId)
-      return
-    }
-    applyEvent(payload as ChatProtocolEvent)
+  // 实时协议走 Tauri ipc Channel（点对点、保序），不再经过全局事件总线的
+  // 广播 + 逐 WebView 反序列化。WebView 重载后模块级单例归零，重新订阅即替换
+  // 该窗口 label 的槽；弹出窗带 conversationId 只收自己那条对话。
+  // 订阅空窗期丢掉的事件由挂载时的 chat_sync_state 对账补齐。
+  nativeListener ??= startListener().catch((error) => {
+    nativeListener = null
+    throw error
   })
   await nativeListener
 }
 
-async function ensurePythonListener() {
-  nativePythonListener ??= listen<unknown>('chat-run-python', ({ payload }) => dispatchPython(payload))
-  await nativePythonListener
+/** Channel 投递失败或 filter 订错后重建通道，再对已知会话 sync。 */
+let resubscribeInFlight = false
+export async function resubscribeChatProtocol() {
+  if (resubscribeInFlight) return
+  resubscribeInFlight = true
+  try {
+    subscribeGeneration += 1
+    nativeListener = null
+    await ensureListener()
+    await Promise.all(conversationIdsToResync().map((id) => syncChatProtocol(id)))
+  } finally {
+    resubscribeInFlight = false
+  }
 }
 
 export async function subscribeChatProtocol(subscriber: Subscriber) {
@@ -347,12 +447,6 @@ export function subscribeChatProtocolIssues(
 ) {
   issueSubscribers.add(subscriber)
   return () => issueSubscribers.delete(subscriber)
-}
-
-export async function subscribeChatPython(subscriber: (request: ChatRunPythonPayload) => void) {
-  pythonSubscribers.add(subscriber)
-  await ensurePythonListener()
-  return () => pythonSubscribers.delete(subscriber)
 }
 
 export async function syncChatProtocol(conversationId: string) {
@@ -439,47 +533,34 @@ export async function syncChatProtocol(conversationId: string) {
   }
 }
 
-export function acceptChatPythonPayload(payload: unknown): ChatRunPythonPayload | null {
-  if (!validatePython(payload)) {
-    console.error('Rejected invalid chat Python request', validatePython.errors, payload)
-    return null
-  }
-  const request = payload as ChatRunPythonPayload
-  if (seenPythonRequests.has(request.runId)) return null
-  seenPythonRequests.add(request.runId)
-  return request
-}
-
 export const chatProtocolTesting = {
   reset() {
     runs.clear()
     syncing.clear()
     liveDuringSync.clear()
     conversationRevisions.clear()
+    exclusiveConversationIds.clear()
     syncRetryAttempts.clear()
     for (const timer of syncRetryTimers.values()) clearTimeout(timer)
     syncRetryTimers.clear()
     subscribers.clear()
     issueSubscribers.clear()
-    pythonSubscribers.clear()
-    seenPythonRequests.clear()
+    subscribeConversationId = null
+    resubscribeInFlight = false
+  },
+  resetNativeListener() {
+    nativeListener = null
+    subscribeGeneration += 1
   },
   subscribe(subscriber: Subscriber) {
     subscribers.add(subscriber)
     return () => subscribers.delete(subscriber)
-  },
-  subscribePython(subscriber: (request: ChatRunPythonPayload) => void) {
-    pythonSubscribers.add(subscriber)
-    return () => pythonSubscribers.delete(subscriber)
   },
   ingest(event: ChatProtocolEvent) {
     applyEvent(event)
   },
   applySnapshot(snapshot: ChatRunSnapshot) {
     applySnapshot(snapshot)
-  },
-  ingestPython(payload: unknown) {
-    dispatchPython(payload)
   },
   validate(payload: unknown) {
     return validateEvent(payload)
@@ -489,4 +570,5 @@ export const chatProtocolTesting = {
   },
   isContinuousReplay,
   isSemanticallyValidSnapshot,
+  conversationIdsToResync,
 }

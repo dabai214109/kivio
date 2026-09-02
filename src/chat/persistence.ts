@@ -1,11 +1,19 @@
 import type { Window } from '@tauri-apps/api/window'
+import { api } from '../api/tauri'
 import { isWindows } from './platform'
 
 export const CHAT_DEFAULT_SIZE = { width: 1280, height: 800 }
 /** 侧栏收起时可缩到的最小尺寸 */
 export const CHAT_MIN_SIZE_COLLAPSED = { width: 400, height: 400 }
-/** 侧栏展开时整窗最小尺寸（240px 侧栏 + 主内容区） */
-export const CHAT_MIN_SIZE_EXPANDED = { width: 640, height: 400 }
+/** 左侧栏默认 / 拖拽上下限（与 `.chat-sidebar-shell` 的 CSS 变量同步）。 */
+export const SIDEBAR_DEFAULT_WIDTH = 240
+export const SIDEBAR_MIN_WIDTH = 200
+export const SIDEBAR_MAX_WIDTH = 400
+/** 侧栏展开时整窗最小尺寸（默认侧栏宽 + 主内容区） */
+export const CHAT_MIN_SIZE_EXPANDED = {
+  width: CHAT_MIN_SIZE_COLLAPSED.width + SIDEBAR_DEFAULT_WIDTH,
+  height: 400,
+}
 export const CHAT_MIN_SIZE = CHAT_MIN_SIZE_COLLAPSED
 
 export type ChatWindowGeometry = {
@@ -72,23 +80,78 @@ export function normalizeStoredChatRoute(value: string | null): string | null {
   if (!value) return null
   const route = value.startsWith('#') ? value : `#${value}`
   const path = route.replace('#', '').split('?')[0]
-  if (!isChatPath(path) || isChatSettingsPath(path) || isChatOnboardingPath(path)) return null
+  if (!isChatPath(path) || isChatSettingsPath(path) || isChatOnboardingPath(path) || path === 'chat/popout' || path.startsWith('chat/popout/')) return null
   return route
 }
 
+/**
+ * 上次聊天路由的当前权威值由 Rust 持久化（app_data/chat-last-route.json，创建窗口时烤进
+ * URL，见 src-tauri/src/windows.rs）。本模块只负责把路由变化同步给 Rust，并在内存里缓存
+ * 一份供「已存在窗口被再次打开」时恢复。localStorage 的 `kivio-chat-last-route` 是旧版
+ * 遗留：首次调用 getRememberedChatRoute() 时自动迁移到 Rust 并删除旧 key。
+ * 
+ * 历史教训：localStorage 写入是异步落盘且错误被静默吞掉，退出前没有 flush 屏障，导致
+ * 「每次重开固定恢复到一条旧对话」。
+ * 
+ * 校验逻辑（is_valid_chat_last_route / normalizeStoredChatRoute）在 Rust 和 TypeScript
+ * 两侧各有一份，必须保持一致：chat 路由有效，settings / onboarding 无效。
+ */
+let lastRouteCache: string | null = null
+
+
 export function rememberCurrentChatRoute() {
   const path = hashPath()
-  if (!path.startsWith('chat/') || isChatSettingsPath(path) || isChatOnboardingPath(path)) return
-  setLocalStorageItem(CHAT_LAST_ROUTE_KEY, window.location.hash || '#chat')
+  if (!path.startsWith('chat/') || isChatSettingsPath(path) || isChatOnboardingPath(path) || path === 'chat/popout' || path.startsWith('chat/popout/')) return
+  const route = window.location.hash || '#chat'
+  lastRouteCache = route
+  api.rememberChatLastRoute(route).catch((err) => {
+    if (import.meta.env.DEV) {
+      console.warn('[persistence] Failed to remember chat route:', err)
+    }
+  })
 }
+
 
 export function getRememberedChatRoute(): string | null {
-  return normalizeStoredChatRoute(getLocalStorageItem(CHAT_LAST_ROUTE_KEY))
+  if (lastRouteCache) return lastRouteCache
+  
+  // 自动迁移 localStorage 遗留值（仅首次调用时触发一次）
+  const legacy = normalizeStoredChatRoute(getLocalStorageItem(CHAT_LAST_ROUTE_KEY))
+  if (legacy) {
+    adoptLegacyRememberedChatRoute(legacy)
+    return legacy
+  }
+  
+  return null
 }
 
+
 export function forgetRememberedChatRoute() {
+  lastRouteCache = null
   removeLocalStorageItem(CHAT_LAST_ROUTE_KEY)
+  api.rememberChatLastRoute(null).catch((err) => {
+    if (import.meta.env.DEV) {
+      console.warn('[persistence] Failed to forget chat route:', err)
+    }
+  })
 }
+
+
+/** 
+ * 一次性迁移：把旧版 localStorage 里的路由搬进 Rust 持久化，然后清掉旧 key。
+ * @internal 仅供 getRememberedChatRoute 内部调用，外部不应直接使用。
+ */
+function adoptLegacyRememberedChatRoute(route: string) {
+  lastRouteCache = route
+  removeLocalStorageItem(CHAT_LAST_ROUTE_KEY)
+  api.rememberChatLastRoute(route).catch((err) => {
+    if (import.meta.env.DEV) {
+      console.warn('[persistence] Failed to adopt legacy chat route:', err)
+    }
+  })
+
+}
+
 
 export function getRememberedChatSidebarCollapsed(): boolean {
   return getLocalStorageItem(CHAT_SIDEBAR_COLLAPSED_KEY) === '1'
@@ -96,6 +159,31 @@ export function getRememberedChatSidebarCollapsed(): boolean {
 
 export function rememberChatSidebarCollapsed(collapsed: boolean) {
   setLocalStorageItem(CHAT_SIDEBAR_COLLAPSED_KEY, collapsed ? '1' : '0')
+}
+
+const CHAT_SIDEBAR_WIDTH_KEY = 'kivio-chat-sidebar-width'
+
+/** 左侧栏宽度夹紧：绝对上下限，再按视口给主区留出最小宽度。 */
+export function clampSidebarWidth(width: number, viewportWidth?: number): number {
+  if (!Number.isFinite(width)) return SIDEBAR_DEFAULT_WIDTH
+  const rounded = Math.round(width)
+  const viewportMax =
+    viewportWidth !== undefined && Number.isFinite(viewportWidth)
+      ? Math.max(SIDEBAR_MIN_WIDTH, Math.round(viewportWidth - CHAT_MIN_SIZE_COLLAPSED.width))
+      : SIDEBAR_MAX_WIDTH
+  return Math.min(SIDEBAR_MAX_WIDTH, viewportMax, Math.max(SIDEBAR_MIN_WIDTH, rounded))
+}
+
+export function getRememberedSidebarWidth(): number {
+  const parsed = Number(getLocalStorageItem(CHAT_SIDEBAR_WIDTH_KEY))
+  const raw = Number.isFinite(parsed) && parsed > 0 ? parsed : SIDEBAR_DEFAULT_WIDTH
+  const viewportWidth = typeof window === 'undefined' ? undefined : window.innerWidth
+  return clampSidebarWidth(raw, viewportWidth)
+}
+
+export function rememberSidebarWidth(width: number) {
+  if (!Number.isFinite(width) || width <= 0) return
+  setLocalStorageItem(CHAT_SIDEBAR_WIDTH_KEY, String(clampSidebarWidth(width)))
 }
 
 // ---------- Right Dock 持久化 ----------
@@ -130,7 +218,9 @@ export function rememberDockWidth(width: number) {
 
 export function getRememberedDockTab(): RememberedDockTab {
   const raw = getLocalStorageItem(CHAT_DOCK_TAB_KEY)
-  return raw === 'git' || raw === 'terminal' || raw === 'tasks' ? raw : 'files'
+  return raw === 'git' || raw === 'terminal' || raw === 'tasks'
+    ? raw
+    : 'files'
 }
 
 export function rememberDockTab(tab: RememberedDockTab) {

@@ -3,6 +3,7 @@
 pub mod agents;
 pub mod api;
 pub mod app_data;
+pub mod automation;
 pub mod capture_geometry;
 pub mod chat;
 pub mod commands;
@@ -11,7 +12,6 @@ pub mod dock;
 pub mod external_agents;
 pub mod fonts;
 pub mod im_gateway;
-pub mod inpainting;
 pub mod lens;
 pub mod lens_commands;
 #[cfg(target_os = "macos")]
@@ -59,8 +59,8 @@ use settings::load_settings;
 #[cfg(target_os = "macos")]
 use shortcuts::set_macos_regular_activation_policy;
 use shortcuts::{
-    display_hotkey_errors, open_chat_window, open_settings_window_for_activation, register_hotkeys,
-    setup_tray,
+    display_hotkey_errors, hide_chat_window, open_chat_window, open_settings_window_for_activation,
+    register_hotkeys, setup_tray,
 };
 use state::AppState;
 use updates::check_github_latest_release;
@@ -77,10 +77,13 @@ const USER_WINDOW_LABELS: &[&str] = &["chat", "main"];
 
 #[cfg(target_os = "macos")]
 fn first_visible_user_window(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
-    USER_WINDOW_LABELS.iter().find_map(|label| {
-        app.get_webview_window(label)
-            .filter(|window| window.is_visible().ok().unwrap_or(false))
-    })
+    USER_WINDOW_LABELS
+        .iter()
+        .find_map(|label| {
+            app.get_webview_window(label)
+                .filter(|window| window.is_visible().ok().unwrap_or(false))
+        })
+        .or_else(|| crate::chat::popout::first_visible_popout(app))
 }
 
 /// Windows：让本进程退出 EcoQoS 执行速度节流，使其在无窗口/后台空闲时仍保持正常调度，
@@ -117,11 +120,16 @@ pub fn run() {
     // inherited from Finder/Dock. Windows: explorer's PATH is a stale login-time
     // snapshot, so read the current value from the registry, then also run the
     // user's PowerShell profile to pick up version-manager dirs (fnm/nvm) that
-    // never touch the registry. No-op on Linux. See `path_env` module docs.
+    // never touch the registry. No-op on Linux. Locale is the other half of
+    // the same gap (see ensure_utf8_locale below). See `path_env` module docs.
     #[cfg(target_os = "macos")]
     path_env::enrich_path_macos();
     #[cfg(target_os = "windows")]
     path_env::enrich_path_windows();
+    // Same GUI-launch gap as PATH: Finder/Dock often hands us no LANG, so libc
+    // stays in C and BSD `ls` prints `?` for CJK filenames. One process-wide
+    // fix is inherited by the dock PTY, run_command, MCP, and CLI probes.
+    path_env::ensure_utf8_locale();
 
     let autostart_plugin = {
         #[cfg(target_os = "macos")]
@@ -152,6 +160,22 @@ pub fn run() {
         .plugin(autostart_plugin)
         .on_window_event(|window, event| match event {
             tauri::WindowEvent::CloseRequested { api, .. } => {
+                if window.label() == "chat" {
+                    let keep_alive = window
+                        .app_handle()
+                        .state::<AppState>()
+                        .settings_read()
+                        .keep_chat_window_alive;
+                    if keep_alive {
+                        api.prevent_close();
+                        hide_chat_window(window.app_handle(), window);
+                    }
+                    return;
+                }
+                if crate::chat::popout::is_popout_label(window.label()) {
+                    // 弹出窗关即销毁，不走主聊天窗 keep-alive。
+                    return;
+                }
                 if window.label() == "lens" || window.label() == "translate" {
                     api.prevent_close();
                     // Windows：原生关闭（Alt+F4 等 WM_CLOSE）也要走完整清理 + destroy，回收内存，
@@ -194,15 +218,18 @@ pub fn run() {
                 }
             }
             tauri::WindowEvent::Destroyed => {
-                // macOS：Dock 图标身份由 Chat 窗口撑起（open/reveal 时切 Regular）。Chat
-                // 销毁后切回 Accessory 隐藏 Dock 图标，回到后台常驻形态；其余窗口
-                // （translator/lens/translate）本就是 Accessory 友好的浮层，不占 Dock。
-                // 下次打开 Chat 时 open_chat_window/reveal_chat_window 会再切回 Regular。
+                let label = window.label();
+                if crate::chat::popout::is_popout_label(label) {
+                    crate::chat::popout::on_popout_destroyed(window.app_handle(), label);
+                } else if label == "chat" {
+                    crate::chat::protocol::unsubscribe_label(
+                        &window.app_handle().state::<AppState>(),
+                        "chat",
+                    );
+                }
                 #[cfg(target_os = "macos")]
-                if window.label() == "chat" {
-                    let _ = window
-                        .app_handle()
-                        .set_activation_policy(tauri::ActivationPolicy::Accessory);
+                if label == "chat" || crate::chat::popout::is_popout_label(label) {
+                    crate::chat::popout::sync_macos_activation_policy(window.app_handle());
                 }
             }
             _ => {}
@@ -210,10 +237,9 @@ pub fn run() {
         .setup(|app| {
             let launched_from_autostart = std::env::args().any(|arg| arg == AUTOSTART_ARG);
 
-            // Windows：退出后台执行速度节流（EcoQoS）。本应用所有窗口都可关闭（关闭即销毁,
-            // 空闲降到 ~50MB），无窗口时进程会被 Win11 当后台空闲进程节流,饿死全局热键的
-            // WM_HOTKEY 消息泵 → 热键失灵（托盘点击是 shell 唤醒故仍可用）。退出 EXECUTION_SPEED
-            // 节流后,即便无窗口空闲也保持正常调度,热键消息泵持续工作。
+            // Windows：退出后台执行速度节流（EcoQoS）。无可见窗口时进程会被 Win11 当后台空闲
+            // 进程节流,饿死全局热键的 WM_HOTKEY 消息泵 → 热键失灵（托盘点击是 shell 唤醒故仍
+            // 可用）。退出 EXECUTION_SPEED 节流后,即便无窗口空闲也保持正常调度,热键消息泵持续工作。
             #[cfg(target_os = "windows")]
             disable_process_power_throttling();
 
@@ -235,8 +261,8 @@ pub fn run() {
             // `conv_*` 目录，非空的孤儿工作区只报数不删（里面是用户产物）。
             chat::gc::sweep_conversation_side_artifacts(app.handle());
 
-            // 周期性回收闲置的持久外部 CLI 会话（10 分钟无活动即丢弃 → actor 关闭其子进程），
-            // 避免长时间挂着空转进程占内存。注册时也会做一次清扫 + LRU 限流，这里覆盖纯闲置场景。
+            // 周期性回收闲置的持久外部 CLI **进程**（10 分钟无活动即丢弃 → actor 关闭子进程）。
+            // 原生会话 id 仍落在 disk 上，下一轮（或重新打开这条对话）必须 resume，不是开新会话。
             {
                 let sweeper = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -247,7 +273,9 @@ pub fn run() {
                         let Some(state) = sweeper.try_state::<AppState>() else {
                             continue;
                         };
-                        state.sweep_idle_external_live_sessions(std::time::Duration::from_secs(600));
+                        state.sweep_idle_external_live_sessions(
+                            crate::external_agents::session::live::LIVE_SESSION_IDLE_TTL,
+                        );
                     }
                 });
             }
@@ -289,6 +317,23 @@ pub fn run() {
                     Err(err) => eprintln!("Failed to merge built-in assistants v2: {err}"),
                 }
             }
+            // 非破坏性内置专家迁移（v3）：按 id upsert 补齐产品/法务/财务/教学/审查/求职，
+            // 保留用户自建。已 seed v2 的老用户靠它拿到新专家；新装用户 v1 已装全套，此处为幂等 no-op。
+            if !settings.builtin_assistants_seeded_v3 {
+                let now = chrono::Local::now().timestamp();
+                match chat::storage::merge_builtin_assistants_v3(&app.handle(), now) {
+                    Ok(()) => {
+                        settings.builtin_assistants_seeded_v3 = true;
+                        if let Err(err) = settings::persist_settings(&app.handle(), &settings) {
+                            eprintln!(
+                                "Failed to persist settings after merging built-in assistants v3: {err}"
+                            );
+                            settings.builtin_assistants_seeded_v3 = false;
+                        }
+                    }
+                    Err(err) => eprintln!("Failed to merge built-in assistants v3: {err}"),
+                }
+            }
             if let Err(err) = apply_launch_at_startup(&app.handle(), settings.launch_at_startup) {
                 eprintln!("Failed to apply launch-at-startup setting: {err}");
             }
@@ -309,7 +354,6 @@ pub fn run() {
 
             let offline_models =
                 offline_models::OfflineModelManager::new(&app.handle(), build_http_client());
-            let inpainting = inpainting::InpaintingClient::new(offline_models.clone());
             app.manage(AppState::base(
                 settings,
                 usage_dir,
@@ -318,9 +362,19 @@ pub fn run() {
                 macos_ocr::MacOcrClient::new(&app.handle()),
                 offline_models.clone(),
                 rapidocr::RapidOcrClient::new(offline_models),
-                inpainting,
             ));
             app.manage(chat::repository::ConversationRepository::default());
+
+            // 崩溃残留的中断草稿日志:按每个 message_id 的最后一行合并回会话文件后删除。
+            // setup 阶段不可能有活跃 run,没有并发写冲突。
+            // 必须放在 ConversationRepository manage 之后：恢复路径要取仓库状态，
+            // 曾在 manage 之前 spawn，有草稿残留且调度赶巧时直接 state() panic、启动即崩。
+            {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    chat::draft_journal::recover_orphan_drafts(&handle).await;
+                });
+            }
             // Dock 的 workspace 文件监听服务（文件树 / Git 面板的秒级刷新源）。
             app.manage(std::sync::Arc::new(dock::watch::WorkspaceWatchService::new(
                 app.handle().clone(),
@@ -361,6 +415,7 @@ pub fn run() {
                     display_hotkey_errors(&err)
                 );
             }
+            crate::automation::spawn_scheduler(app.handle().clone());
             if let Err(err) = setup_tray(&app.handle()) {
                 eprintln!("Failed to setup tray: {err}");
             }
@@ -389,8 +444,9 @@ pub fn run() {
                 }
             });
 
-            // MCP 持久连接空闲回收 reaper：每 60s 扫描连接池，回收 last_used 超过
-            // 设置 mcp_idle_timeout_ms 的会话（Drop 杀子进程），发 Disconnected 事件。
+            // MCP 持久连接空闲回收 + HTTP 保活：每 60s 扫描连接池。stdio 空闲会话
+            // Drop 杀子进程；活着的 HTTP 会话不收，改发 ping（失败则按握手配置重连，
+            // 含 OAuth 刷新）。
             {
                 let app_handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
@@ -412,6 +468,7 @@ pub fn run() {
                                 }),
                             );
                         }
+                        state.mcp_keepalive_http(Some(&app_handle)).await;
                     }
                 });
             }
@@ -486,6 +543,7 @@ pub fn run() {
             windows::chat_window_apply_mica,
             windows::chat_window_set_opaque,
             windows::chat_traffic_light_center_y,
+            windows::chat_remember_last_route,
             fonts::list_system_fonts,
             commands::get_default_prompt_templates,
             commands::save_settings,
@@ -541,6 +599,11 @@ pub fn run() {
             chat::commands::interaction::get_request_debug_records,
             chat::commands::interaction::clear_request_debug_records,
             chat::protocol::chat_sync_state,
+            chat::protocol::chat_protocol_subscribe,
+            chat::popout::chat_open_conversation_popout,
+            chat::popout::chat_focus_conversation_popout,
+            chat::popout::chat_close_conversation_popout,
+            chat::popout::chat_list_conversation_popouts,
             // Chat 模块命令
             chat::commands::catalog::chat_get_conversations,
             chat::commands::interaction::chat_list_background_tasks,
@@ -574,6 +637,7 @@ pub fn run() {
             chat::commands::catalog::chat_delete_set,
             chat::commands::context::chat_get_context_stats,
             chat::commands::context::chat_compress_context,
+            chat::commands::context::chat_clear_context,
             chat::commands::interaction::chat_take_external_sends,
             chat::commands::interaction::chat_set_agent_plan_mode,
             chat::commands::interaction::chat_execute_agent_plan,
@@ -588,7 +652,7 @@ pub fn run() {
             chat::commands::interaction::chat_respond_session_consent,
             chat::commands::interaction::chat_submit_user_choice,
             chat::commands::interaction::chat_steer_message,
-            chat::commands::interaction::chat_python_complete,
+            chat::commands::interaction::chat_follow_up_message,
             chat::commands::attachments::chat_read_attachment,
             chat::commands::attachments::chat_open_attachment,
             chat::commands::attachments::chat_open_generated_artifact,
@@ -598,12 +662,15 @@ pub fn run() {
             chat::commands::attachments::chat_read_clipboard_files,
             chat::commands::mutations::chat_delete_conversation,
             chat::commands::mutations::chat_update_conversation,
+            chat::commands::title::chat_regenerate_title,
+            chat::commands::prompt_optimize::chat_optimize_prompt,
             chat::commands::mutations::chat_bulk_update_conversations,
             chat::commands::mutations::chat_bulk_delete_conversations,
             chat::commands::reasoning::chat_reasoning_efforts_for_model,
             chat::commands::mutations::chat_update_message,
             chat::commands::mutations::chat_delete_message,
             chat::commands::mutations::chat_set_group_selection,
+            chat::commands::mutations::chat_reply_with_model,
             chat::commands::mutations::chat_regenerate_message,
             chat::commands::mutations::chat_rewind_to_message,
             chat::commands::mutations::chat_fork_conversation,
@@ -617,6 +684,21 @@ pub fn run() {
             external_agents::installer::chat_external_cli_install_info,
             external_agents::installer::chat_external_cli_install,
             external_agents::installer::chat_external_cli_open_config_dir,
+            external_agents::pi_extensions::chat_pi_extensions_inventory,
+            external_agents::pi_extensions::chat_pi_extension_set_enabled,
+            external_agents::pi_extensions::chat_pi_extension_install,
+            external_agents::pi_extensions::chat_pi_extension_update,
+            external_agents::pi_extensions::chat_pi_extension_remove,
+            external_agents::pi_extensions::chat_pi_extension_open,
+            external_agents::pi_extensions::chat_pi_extensions_open_dir,
+            external_agents::pi_skills::chat_pi_skills_inventory,
+            external_agents::pi_skills::chat_pi_skill_set_enabled,
+            external_agents::pi_skills::chat_pi_skill_commands_set_enabled,
+            external_agents::pi_skills::chat_pi_skill_add_path,
+            external_agents::pi_skills::chat_pi_skill_remove_path,
+            external_agents::pi_skills::chat_pi_skill_remove,
+            external_agents::pi_skills::chat_pi_skill_open,
+            external_agents::pi_skills::chat_pi_skills_open_dir,
             external_agents::dsh_plugins::chat_dsh_plugin_settings_get,
             external_agents::dsh_plugins::chat_dsh_plugin_settings_save,
             external_agents::dsh_plugins::chat_dsh_plugin_inventory,
@@ -625,10 +707,12 @@ pub fn run() {
             external_agents::dsh_plugins::chat_dsh_official_credential_save,
             external_agents::dsh_plugins::chat_dsh_native_provider_get,
             external_agents::dsh_plugins::chat_dsh_native_provider_delete,
+            external_agents::dsh_profile::chat_dsh_list_agent_presets,
             external_agents::commands::chat_set_agent_runtime,
             external_agents::commands::chat_list_importable_cli_sessions,
             external_agents::commands::chat_import_cli_sessions,
             external_agents::commands::chat_imported_history_stale,
+            external_agents::commands::chat_external_native_session_id,
             chat::memory::chat_memory_get,
             chat::memory::chat_memory_save,
             chat::memory::chat_memory_open_folder,
@@ -642,13 +726,10 @@ pub fn run() {
             mcp::registry::chat_mcp_warmup,
             connectors::connector_oauth_connect,
             connectors::obsidian::list_obsidian_vaults_cmd,
-            connectors::himalaya::list_email_provider_presets,
-            connectors::himalaya::himalaya_status_cmd,
-            connectors::himalaya::himalaya_install_cmd,
-            connectors::himalaya::test_himalaya_email_cmd,
             plugins::plugins_list,
             plugins::plugins_list_cached,
             plugins::plugins_install_brief,
+            plugins::plugins_run_official_install,
             plugins::plugins_set_enabled,
             plugins::plugins_uninstall,
             notes::notes_list,
@@ -662,6 +743,17 @@ pub fn run() {
             notes::notes_folder_delete,
             notes::notes_open_folder,
             notes::notes_dir_path,
+            automation::commands::automation_list,
+            automation::commands::automation_get,
+            automation::commands::automation_save,
+            automation::commands::automation_delete,
+            automation::commands::automation_set_enabled,
+            automation::commands::automation_run,
+            automation::commands::automation_cancel,
+            automation::commands::automation_export,
+            automation::commands::automation_import,
+            automation::commands::automation_runs_list,
+            automation::commands::automation_run_get,
             skills::chat_skills_list,
             skills::chat_skills_read,
             skills::chat_skills_import,
@@ -726,6 +818,23 @@ pub fn run() {
                     crate::im_gateway::request_shutdown();
                     crate::remote_bridge::request_shutdown();
                     let state: State<AppState> = app_handle.state();
+                    // 自动化先于 MCP：运行中的图可能正跑 agent loop（依赖 MCP/供应商）或
+                    // 命令节点（Child 靠 kill_on_drop 收尸）。先标记取消、限时等收尾，
+                    // 此时运行时还活着，select! 的取消分支才来得及 drop 掉 Child。
+                    let cancelled = crate::automation::cancel_all_runs(app_handle);
+                    if cancelled > 0 {
+                        // 同上：timeout 必须在 async 块里构造。
+                        let finished = tauri::async_runtime::block_on(async {
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(3),
+                                crate::automation::wait_runs_finished(app_handle),
+                            )
+                            .await
+                        });
+                        if finished.is_err() {
+                            eprintln!("Automation runs did not finish in time on exit.");
+                        }
+                    }
                     // 带超时：一个卡在握手里的 server 会占着会话锁不放，没有这层
                     // 上限的话退出钩子会永久阻塞在主线程上 —— 表现是「点关闭没反应、
                     // 进程不退」，连带其余所有 MCP 子进程全留在系统里。

@@ -1,10 +1,11 @@
 import { useState } from 'react'
-import { Check, Copy, Gauge, GitBranch, NotebookPen, RotateCcw, Trash2 } from 'lucide-react'
+import { Check, Copy, Gauge, GitBranch, NotebookPen, RotateCcw } from 'lucide-react'
 import { IconButton } from '../components/Button'
 import { copyToClipboard } from '../utils/clipboard'
 import { estimateTokens, formatTokensK } from '../utils/tokens'
 import { formatAssistantMessageTime } from './messageFormat'
-import type { MessageUsage } from './types'
+import { ReplyWithModelButton } from './ReplyWithModelButton'
+import type { MessageUsage, ModelRef } from './types'
 
 interface AssistantMessageMetaProps {
   content: string
@@ -15,8 +16,9 @@ interface AssistantMessageMetaProps {
   streamOutcome?: string | null
   usage?: MessageUsage | null
   onRegenerate?: () => void
+  onReplyWithModel?: (providerId: string, model: string) => void
+  replyOccupiedModels?: ModelRef[]
   onFork?: () => void
-  onDelete?: () => void
   onSaveToNote?: () => Promise<boolean> | boolean
 }
 
@@ -48,8 +50,9 @@ export function AssistantMessageMeta({
   streamOutcome,
   usage,
   onRegenerate,
+  onReplyWithModel,
+  replyOccupiedModels = [],
   onFork,
-  onDelete,
   onSaveToNote,
 }: AssistantMessageMetaProps) {
   const [copied, setCopied] = useState(false)
@@ -129,6 +132,12 @@ export function AssistantMessageMeta({
         >
           <RotateCcw size={13} strokeWidth={2} />
         </IconButton>
+        {onReplyWithModel && (
+          <ReplyWithModelButton
+            occupied={replyOccupiedModels}
+            onSelect={onReplyWithModel}
+          />
+        )}
         <IconButton
           size="xs"
           onClick={onFork}
@@ -137,14 +146,6 @@ export function AssistantMessageMeta({
           title="从这里建分支（复制到新对话）"
         >
           <GitBranch size={13} strokeWidth={2} />
-        </IconButton>
-        <IconButton
-          size="xs"
-          onClick={onDelete}
-          disabled={!onDelete}
-          label="删除"
-        >
-          <Trash2 size={13} strokeWidth={2} />
         </IconButton>
       </div>
 

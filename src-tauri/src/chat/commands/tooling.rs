@@ -24,7 +24,6 @@ pub(super) fn try_apply_skill_slash_trigger(
     chat_tools: &crate::settings::ChatToolsConfig,
     assistant_snapshot: Option<&crate::chat::types::ChatAssistantSnapshot>,
     content: &str,
-    email_accounts: &[crate::settings::EmailAccountConfig],
     obsidian_vault_configured: bool,
 ) -> Option<(String, String)> {
     let trimmed = content.trim_start();
@@ -40,7 +39,6 @@ pub(super) fn try_apply_skill_slash_trigger(
         chat_tools,
         assistant_snapshot,
         &record.meta.id,
-        email_accounts,
         obsidian_vault_configured,
     ) {
         // A disabled or out-of-allow-list skill's slash command is left as ordinary text.
@@ -66,7 +64,6 @@ pub(super) fn resolve_forced_skill_id(
     assistant_snapshot: Option<&crate::chat::types::ChatAssistantSnapshot>,
     registry: &skills::SkillRegistry,
     requested: Option<&str>,
-    email_accounts: &[crate::settings::EmailAccountConfig],
     obsidian_vault_configured: bool,
 ) -> Option<String> {
     let requested = requested.map(str::trim).filter(|id| !id.is_empty())?;
@@ -78,7 +75,6 @@ pub(super) fn resolve_forced_skill_id(
                 chat_tools,
                 assistant_snapshot,
                 &record.meta.id,
-                email_accounts,
                 obsidian_vault_configured,
             )
         })
@@ -100,7 +96,7 @@ pub(super) struct ChatToolList {
     pub unavailable_mcp_servers: Vec<String>,
 }
 
-pub(super) async fn list_tools_for_chat(
+pub(crate) async fn list_tools_for_chat(
     app: &AppHandle,
     state: &AppState,
     settings: &Settings,
@@ -171,7 +167,7 @@ pub(super) fn apply_agent_plan_tool_filter(
 
 /// Chat mode: conversational research tools only — gated by `ChatModeConfig` toggles.
 /// Blocks local fs mutation, shell, sub-agents, skills, todos, and write-capable MCP.
-pub(super) fn apply_chat_mode_tool_filter(
+pub(crate) fn apply_chat_mode_tool_filter(
     tools: &mut Vec<ChatToolDefinition>,
     chat_mode: bool,
     config: &crate::settings::ChatModeConfig,
@@ -207,6 +203,7 @@ fn chat_mode_allows_tool(
         "web_search" | "search_web" => config.web_search,
         "web_fetch" => config.web_fetch,
         "knowledge_search" => config.knowledge_search,
+        "automation_list" | "automation_get" | "automation_runs" => true,
         "memory_read" | "memory_search" => config.memory_tools,
         _ => false,
     }

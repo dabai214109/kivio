@@ -71,14 +71,12 @@ pub struct ChatToolDefinition {
 
 impl ChatToolDefinition {
     pub fn openai_tool_name(&self) -> String {
-        match self.source.as_str() {
-            // Native and Skill tools are model-facing APIs owned by Kivio. Keep their names
-            // aligned with the system prompt so models can call exactly what we instruct.
-            "native" | "skill" | "mixer" => {
-                apply_reserved_wire_alias(&sanitize_openai_tool_name(&self.name))
-            }
-            _ => sanitize_openai_tool_name(&self.id),
-        }
+        wire_tool_name(
+            &self.source,
+            &self.name,
+            &self.id,
+            self.server_id.as_deref(),
+        )
     }
 
     pub fn to_openai_tool(&self) -> serde_json::Value {
@@ -149,15 +147,6 @@ pub struct ChatToolArtifact {
     pub size_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PythonRunResult {
-    pub content: String,
-    #[serde(alias = "isError")]
-    pub is_error: bool,
-    #[serde(default)]
-    pub artifacts: Vec<ChatToolArtifact>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -257,7 +246,7 @@ pub fn native_skill_activate_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "skill__activate".to_string(),
         name: "skill".to_string(),
-        description: "Load a specialized skill when the task at hand matches one of the skills listed in the system prompt. Injects the skill's instructions and resources into the current conversation — the output may contain detailed workflow guidance plus references to scripts and files in the skill directory (read them with `read`, run scripts with `run_python` or `run_command`). The skill name must match one listed in available_skills.".to_string(),
+        description: "Load a specialized skill when the task at hand matches one of the skills listed in the system prompt. Injects the skill's instructions and resources into the current conversation — the output may contain detailed workflow guidance plus references to scripts and files in the skill directory (read them with `read`, run scripts with `run_command`). The skill name must match one listed in available_skills.".to_string(),
         source: "skill".to_string(),
         server_id: None,
         server_name: Some("Skill".to_string()),
@@ -285,7 +274,7 @@ pub fn native_read_file_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "native__read_file".to_string(),
         name: "read".to_string(),
-        description: "Read a local file or directory. For a file: text is line-numbered as `N<TAB>line` for easy reference; the numbers are display-only and are NOT part of the file — never include them in edit old_string. Output is capped at 2000 lines or 50KB, whichever is hit first, so a single read can never flood the context; when the cap or your own limit stops the read early the result says so and reports total_lines and next_offset — continue with offset until you have what you need. Optional offset/limit select a 1-based line window (the cap still applies on top). For a directory path: returns its entries (folded in the former `ls` tool); offset/limit are ignored. Image files (png/jpg/webp/…) are also supported: the image is shown to you directly when your model has vision, otherwise it is described or OCR'd to text — so you can `read` screenshots and photos by path. For PDF/Word/Excel, use the matching skill instead.".to_string(),
+        description: "Read a local file or directory. For a file: text is line-numbered as `N<TAB>line` for easy reference; the numbers are display-only and are NOT part of the file — never include them in edit old_string. Output is capped at 2000 lines or 50KB, whichever is hit first, so a single read can never flood the context; when the cap or your own limit stops the read early the result says so and reports total_lines and next_offset — continue with offset until you have what you need. Optional offset/limit select a 1-based line window (the cap still applies on top). For a directory path: returns its entries (folded in the former `ls` tool); offset/limit are ignored. Image files (png/jpg/webp/…) are also supported: the image is shown to you directly when your model has vision, otherwise it is described or OCR'd to text. To inspect several images at once, pass `paths` (up to 12). Images are read individually by default — always do that for analysis, QA, spelling, logos, or any per-image detail. A numbered contact sheet is used only for a first-pass overview of 6–12 similar images when the user asked to skim the set, or when you set overview=true for that skim; never for analysis. Re-read a single path for fine text. For PDF/Word/Excel, use the matching skill instead.".to_string(),
         source: "native".to_string(),
         server_id: None,
         server_name: Some("Kivio".to_string()),
@@ -293,10 +282,20 @@ pub fn native_read_file_tool() -> ChatToolDefinition {
             "type": "object",
             "properties": {
                 "path": { "type": "string", "description": "File path to read. Relative paths resolve from the project root/current workspace; absolute and ~/ paths are also accepted when allowed by workspace mode." },
+                "paths": {
+                    "type": "array",
+                    "description": "Several image files to inspect in one call (png/jpg/webp/gif, max 12). Default is one image each. Do not use this for text files.",
+                    "items": { "type": "string", "minLength": 1 },
+                    "minItems": 1,
+                    "maxItems": 12
+                },
+                "overview": {
+                    "type": "boolean",
+                    "description": "If true, combine 6–12 images into one numbered contact sheet for a first-pass skim. Ignored when the user asked to analyze, verify, read text, or inspect each image — those always stay separate. Omit this (or false) unless you only need a coarse overview."
+                },
                 "offset": { "type": "integer", "description": "1-based start line (optional)" },
                 "limit": { "type": "integer", "description": "Max lines to return (optional)" }
-            },
-            "required": ["path"]
+            }
         }),
         sensitive: false,
         annotations: None,
@@ -447,7 +446,7 @@ pub fn native_run_command_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "native__run_command".to_string(),
         name: "bash".to_string(),
-        description: format!("Run a host shell command (build, test, etc.).{shell_hint} In a project conversation, the command starts from the bound project root by default; any explicit cwd is only a startup directory and is validated as workspace-local. Do not use `cd path && command` when the path contains spaces—pass `cwd` and run only the remaining command. Do not combine `cwd` with a leading `cd ... &&` prefix. Long-running dev servers such as `npm run dev`, `npm run tauri dev`, and `vite` are started in the background automatically and return immediately with a pid. This is a sensitive host-shell capability, not the same boundary as the file tools: obey user constraints and explain or seek confirmation before cross-directory, destructive, network, or environment-changing commands. A non-zero exit code is returned as a tool error with stdout/stderr. Do not use pip to bypass run_python sandbox failures; host Python package installs require an explicit user request and allow_host_python_package_install=true."),
+        description: format!("Run a host shell command (build, test, etc.).{shell_hint} In a project conversation, the command starts from the bound project root by default; any explicit cwd is only a startup directory and is validated as workspace-local. Do not use `cd path && command` when the path contains spaces—pass `cwd` and run only the remaining command. Do not combine `cwd` with a leading `cd ... &&` prefix. Foreground commands wait until they exit — omit timeout_ms unless you want the process killed at a deadline. Do not background finite jobs (builds, tests, image-generation batches); put parallel work inside one command. Long-running never-ending servers such as `npm run dev`, `npm run tauri dev`, and `vite` are started in the background automatically and return immediately with a job_id. This is a sensitive host-shell capability, not the same boundary as the file tools: obey user constraints and explain or seek confirmation before cross-directory, destructive, network, or environment-changing commands. A non-zero exit code is returned as a tool error with stdout/stderr. Host Python package installs require an explicit user request and allow_host_python_package_install=true."),
         source: "native".to_string(),
         server_id: None,
         server_name: Some("Kivio".to_string()),
@@ -456,8 +455,8 @@ pub fn native_run_command_tool() -> ChatToolDefinition {
             "properties": {
                 "command": { "type": "string", "description": "Shell command" },
                 "cwd": { "type": "string", "description": "Working directory (required when the path contains spaces; do not use `cd ... &&` for that)" },
-                "background": { "type": "boolean", "description": "Run in background and return immediately (auto-enabled for common dev servers)" },
-                "timeout_ms": { "type": "integer", "description": "Timeout in ms (optional)" },
+                "background": { "type": "boolean", "description": "Run in background and return a job_id immediately. Auto-enabled for never-ending dev servers. Do not use this for finite jobs that will exit." },
+                "timeout_ms": { "type": "integer", "description": "Optional kill deadline in ms (max 600000). Omit to wait until the command exits. Timeout kills the process and returns partial output; it does not background the job." },
                 "allow_host_python_package_install": { "type": "boolean", "description": "Only true when the user explicitly asked to modify the host Python environment; installs must use --user or a virtual environment." }
             },
             "required": ["command"]
@@ -472,7 +471,7 @@ pub fn native_bash_output_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "native__bash_output".to_string(),
         name: "bash_output".to_string(),
-        description: "Inspect background commands started by bash (background:true). With a job_id: returns that job's captured stdout/stderr since since_offset (default 0), the current status (running / exited with exit_code / killed / error), and next_offset for incremental reads. With NO job_id: lists all background commands tracked in this app session (job_id, status, command, working directory, age) — background commands survive across turns until killed or the app exits. After dispatching a background command, do NOT poll immediately — keep working, then poll a bounded number of times (≤20). Always refresh once with bash_output before reporting a background command's result to the user.".to_string(),
+        description: "Inspect background commands started by bash (background:true / auto-detected never-ending servers). With a job_id: waits until that process exits or wait_ms elapses (default 30000; 0 = return immediately), then returns captured stdout/stderr since since_offset (default 0), status (running / exited with exit_code / killed / error), and next_offset. New log lines do not end the wait. Finite jobs should use foreground bash (wait until exit) instead of this tool. With NO job_id: lists all background commands tracked in this app session (job_id, status, command, working directory, age) — background commands survive across turns until killed or the app exits. Always refresh once with bash_output before reporting a background command's result to the user.".to_string(),
         source: "native".to_string(),
         server_id: None,
         server_name: Some("Kivio".to_string()),
@@ -480,7 +479,8 @@ pub fn native_bash_output_tool() -> ChatToolDefinition {
             "type": "object",
             "properties": {
                 "job_id": { "type": "string", "description": "The job_id returned when the background command was started. Omit to list all tracked background jobs instead." },
-                "since_offset": { "type": "integer", "description": "Byte offset to read from (use next_offset from the previous bash_output call for incremental reads; default 0)" }
+                "since_offset": { "type": "integer", "description": "Byte offset to read from (use next_offset from the previous bash_output call for incremental reads; default 0)" },
+                "wait_ms": { "type": "integer", "description": "Maximum time to wait for the process to exit (default 30000). Returns sooner if it exits. New output does not end the wait. 0 returns a snapshot immediately. Capped at the tool timeout." }
             }
         }),
         sensitive: false,
@@ -537,11 +537,15 @@ pub fn native_save_assistant_tool() -> ChatToolDefinition {
     }
 }
 
+/// `present_artifacts` only takes id/path strings. Models sometimes dump
+/// base64 or file contents into the argument stream; abort past this.
+pub const PRESENT_ARTIFACTS_ARGUMENTS_MAX_CHARS: usize = 8_192;
+
 pub fn native_present_artifacts_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "native__present_artifacts".to_string(),
         name: "present_artifacts".to_string(),
-        description: "Show files or images in the chat. You must call this when the user asks to show, preview, attach, or send a file; reading or describing a file does not display it. Pass artifact_ids for files this conversation generated, or paths for files that already exist on disk — never both for the same file, and never invent a path for a generated file. Unselected files remain hidden.".to_string(),
+        description: "Show files or images in the chat. Call this when the user should see a file; reading or describing it does not display it. Pass only a short JSON of identifiers: copy `art_…` ids from tool results into artifact_ids, or pass existing disk paths. Never both for the same file. Never invent a path for a generated file. Never put file contents, image bytes, base64, or data URLs in any field. Caption is optional plain text. Max 16 files. Unselected files stay hidden. Example: {\"artifact_ids\":[\"art_…\"]}".to_string(),
         source: "native".to_string(),
         server_id: None,
         server_name: Some("Kivio".to_string()),
@@ -550,55 +554,27 @@ pub fn native_present_artifacts_tool() -> ChatToolDefinition {
             "properties": {
                 "artifact_ids": {
                     "type": "array",
-                    "description": "IDs of files generated in this conversation (e.g. images from mixer_generate_image). These have no filesystem path — do not also list them in paths.",
+                    "description": "Copy `art_…` ids from tool results verbatim. Short strings only — not file names, paths, bytes, base64, or data URLs. Generated files have these ids and no usable path.",
                     "items": { "type": "string", "minLength": 1 },
                     "minItems": 1,
                     "maxItems": 16
                 },
                 "paths": {
                     "type": "array",
-                    "description": "Paths of files that already exist on disk. Only for files you read or wrote yourself; never for generated artifacts.",
+                    "description": "Existing disk paths for files you already read or wrote. Do not use for generated artifacts (those use artifact_ids). Never file contents.",
                     "items": { "type": "string", "minLength": 1 },
                     "minItems": 1,
                     "maxItems": 16
                 },
                 "caption": {
                     "type": "string",
-                    "description": "Optional short caption",
+                    "description": "Optional plain-text caption (max 300 chars). Not for file contents or base64.",
                     "maxLength": 300
                 }
             },
             // 不用顶层 anyOf 表达“二选一必填”：grok/Vertex/Anthropic 都会拒或需剥离，
             // call_present_artifacts 在运行时校验，模型侧靠 description 提示即可。
             "additionalProperties": false
-        }),
-        sensitive: false,
-        annotations: None,
-        output_schema: None,
-    }
-}
-
-pub fn native_run_python_tool() -> ChatToolDefinition {
-    ChatToolDefinition {
-        id: "native__run_python".to_string(),
-        name: "run_python".to_string(),
-        description: "Execute Python code in a Pyodide sandbox with no direct host filesystem access. Use for computation, statistics, data analysis (numpy/pandas), reading and analyzing documents (PDF/XLSX), charts and plots (matplotlib), sandbox-compatible package installs, and generating files that REQUIRE a Python library to produce (formatted XLSX, PDF, rendered images). Its generated files are registered as artifacts but are not shown automatically; call present_artifacts with the returned artifact IDs when the user should see them. Do NOT use run_python merely to write a file from content you already have — for that, use write_file (to the current workbench, or to an explicit path requested by the user), then call present_artifacts only for files that should be shown in chat. Bundled packages auto-load on import: numpy, matplotlib, pandas, pillow, seaborn, openpyxl, xlrd, et_xmlfile, pypdf, micropip. Prefer plain import statements; do not write await micropip.install in sync code. To analyze local files, pass paths in files using the same syntax as the read tool; in project conversations these resolve from the project root by default. Mounted paths appear in KIVIO_INPUT_FILES. Save outputs to relative filenames in the Pyodide cwd (e.g. report.xlsx, chart.png, summary.csv); do not write host paths such as /Users or ~/Desktop inside Python. Kivio auto-captures images plus csv/json/md/txt/html/xlsx artifacts into the current default workbench and returns artifact IDs; use present_artifacts to place selected artifacts in the response. In chart text (titles, labels, legends, annotations) use only Latin and Chinese/Japanese/Korean characters; the sandbox bundles only a CJK+Latin font and has no emoji or symbol fonts, so emoji and decorative glyphs render as empty boxes—omit them. stdout/stderr are returned.".to_string(),
-        source: "native".to_string(),
-        server_id: None,
-        server_name: Some("Kivio".to_string()),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "code": { "type": "string", "description": "Python source code" },
-                "files": {
-                    "type": "array",
-                    "description": "Optional readable local file paths to copy into the Pyodide filesystem for this run",
-                    "items": { "type": "string" },
-                    "maxItems": 8
-                },
-                "timeout_ms": { "type": "integer", "description": "Timeout in ms (optional, max 300000)" }
-            },
-            "required": ["code"]
         }),
         sensitive: false,
         annotations: None,
@@ -723,7 +699,7 @@ pub fn mixer_generate_image_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "mixer__generate_image".to_string(),
         name: "mixer_generate_image".to_string(),
-        description: "Generate image artifacts from a text prompt using the Mixer image generation model configured in Settings.".to_string(),
+        description: "Generate or edit image artifacts using the Mixer image generation model configured in Settings. For image-to-image / edits, pass paths of local images or artifact_ids of images generated earlier in this conversation. If the user attached images this turn and you omit both, those attachments are used automatically.".to_string(),
         source: "mixer".to_string(),
         server_id: None,
         server_name: Some("Mixer".to_string()),
@@ -732,7 +708,7 @@ pub fn mixer_generate_image_tool() -> ChatToolDefinition {
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "Detailed image generation prompt"
+                    "description": "Detailed image generation or edit prompt"
                 },
                 "size": {
                     "type": "string",
@@ -749,6 +725,20 @@ pub fn mixer_generate_image_tool() -> ChatToolDefinition {
                     "minimum": 1,
                     "maximum": 4,
                     "description": "Number of images to generate"
+                },
+                "paths": {
+                    "type": "array",
+                    "description": "Local image files to edit or use as references. Use Kivio attachment copy paths from this turn, or files you already read.",
+                    "items": { "type": "string", "minLength": 1 },
+                    "minItems": 1,
+                    "maxItems": 4
+                },
+                "artifact_ids": {
+                    "type": "array",
+                    "description": "IDs of images generated earlier in this conversation to edit or use as references.",
+                    "items": { "type": "string", "minLength": 1 },
+                    "minItems": 1,
+                    "maxItems": 4
                 }
             },
             "required": ["prompt"]
@@ -763,8 +753,7 @@ pub fn native_web_fetch_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "native__web_fetch".to_string(),
         name: "web_fetch".to_string(),
-        description: "Fetch readable text from an HTTPS URL (HTML is stripped to plain text)."
-            .to_string(),
+        description: "Fetch readable text from an HTTPS URL. Uses the configured fetch provider's extract API when available (independent of the search provider: Tavily, Exa, Ollama, TinyFish, Serper, Kimi); otherwise fetches the page directly (HTML stripped to plain text, with a hosted reader fallback).".to_string(),
         source: "native".to_string(),
         server_id: None,
         server_name: Some("Kivio".to_string()),
@@ -783,6 +772,145 @@ pub fn native_web_fetch_tool() -> ChatToolDefinition {
         annotations: None,
         output_schema: None,
     }
+}
+
+fn native_automation_tool(
+    name: &str,
+    description: &str,
+    input_schema: serde_json::Value,
+    sensitive: bool,
+) -> ChatToolDefinition {
+    ChatToolDefinition {
+        id: format!("native__{name}"),
+        name: name.to_string(),
+        description: description.to_string(),
+        source: "native".to_string(),
+        server_id: None,
+        server_name: Some("Kivio".to_string()),
+        input_schema,
+        sensitive,
+        annotations: None,
+        output_schema: None,
+    }
+}
+
+pub fn native_automation_list_tool() -> ChatToolDefinition {
+    native_automation_tool(
+        "automation_list",
+        "List Kivio automations (id, name, enabled, trigger type). Call this once to avoid duplicates, then create with automation_upsert. Do not discover node types by trial.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        false,
+    )
+}
+
+pub fn native_automation_get_tool() -> ChatToolDefinition {
+    native_automation_tool(
+        "automation_get",
+        "Get the full graph JSON for one automation by id (nodes, edges, viewport).",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Automation id from automation_list." }
+            },
+            "required": ["id"]
+        }),
+        false,
+    )
+}
+
+pub fn native_automation_upsert_tool() -> ChatToolDefinition {
+    native_automation_tool(
+        "automation_upsert",
+        "Create or replace a Kivio automation graph in ONE call. Omit id to create. Omit node positions to auto-layout. Activate the `automation` skill first for node types and examples. Do not glob the repo and do not dry_run-probe types. Validation errors return allowedNodeTypes and schemaHint.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "automation": {
+                    "type": "object",
+                    "description": "Complete graph: {name, enabled, nodes:[{id, type, data}], edges:[{id, source, target, sourceHandle?, targetHandle?}]}. schemaVersion is set by Kivio. Allowed node types are in the `automation` skill."
+                },
+                "dry_run": {
+                    "type": "boolean",
+                    "description": "Validate a COMPLETE candidate graph without saving. Never use this to discover node types."
+                }
+            },
+            "required": ["automation"]
+        }),
+        true,
+    )
+}
+
+pub fn native_automation_set_enabled_tool() -> ChatToolDefinition {
+    native_automation_tool(
+        "automation_set_enabled",
+        "Enable or disable an automation. Enabled graphs honor schedule and hotkey triggers.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "enabled": { "type": "boolean" }
+            },
+            "required": ["id", "enabled"]
+        }),
+        true,
+    )
+}
+
+pub fn native_automation_run_tool() -> ChatToolDefinition {
+    native_automation_tool(
+        "automation_run",
+        "Run an automation and wait for it to finish. Optional input is exposed to later nodes as {{output}} / {{json.input.*}}. Returns per-node status plus the last step's output. If it is still running after timeout_seconds, returns runId so you can poll with automation_runs.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string", "description": "Automation id to run." },
+                "input": {
+                    "description": "Optional payload: a string, or { text, json }. Downstream nodes read it via {{output}} and {{json.input.*}}."
+                },
+                "timeout_seconds": {
+                    "type": "integer",
+                    "description": "How long to wait (default 600, max 1800). On timeout the run continues in the background."
+                }
+            },
+            "required": ["id"]
+        }),
+        true,
+    )
+}
+
+pub fn native_automation_runs_tool() -> ChatToolDefinition {
+    native_automation_tool(
+        "automation_runs",
+        "List recent runs for an automation, or fetch one run's per-node details when run_id is set.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "run_id": { "type": "string", "description": "Optional run id from automation_run." }
+            },
+            "required": ["id"]
+        }),
+        false,
+    )
+}
+
+pub fn native_automation_delete_tool() -> ChatToolDefinition {
+    native_automation_tool(
+        "automation_delete",
+        "Delete an automation and its run history. This cannot be undone.",
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" }
+            },
+            "required": ["id"]
+        }),
+        true,
+    )
 }
 
 /// `knowledge_search` — retrieve passages from the user's knowledge bases
@@ -866,6 +994,56 @@ pub fn list_native_builtin_tool_defs(
         .collect()
 }
 
+/// OpenAI / Gemini / Anthropic function names share a 64-char cap
+/// (`^[a-zA-Z0-9_-]{1,64}$`). Naive left-truncate turns
+/// `mcp__<uuid>__ui_to_artifact` and `mcp__<uuid>__ui_diff_check` into the
+/// same `...-ui` and Gemini silently drops the rest.
+const MAX_WIRE_TOOL_NAME: usize = 64;
+const WIRE_NAME_HASH_LEN: usize = 8;
+/// Server ids longer than this eat the 64-char budget; replace with a hash.
+const LONG_MCP_SERVER_ID: usize = 16;
+
+/// Shared wire-name builder for [`ChatToolDefinition`] and `ModelTool`.
+pub fn wire_tool_name(source: &str, name: &str, id: &str, server_id: Option<&str>) -> String {
+    match source {
+        // Native and Skill tools are model-facing APIs owned by Kivio. Keep their names
+        // aligned with the system prompt so models can call exactly what we instruct.
+        "native" | "skill" | "mixer" => apply_reserved_wire_alias(&sanitize_openai_tool_name(name)),
+        _ => sanitize_openai_tool_name(&compact_mcp_tool_id(id, server_id)),
+    }
+}
+
+/// `mcp__<very-long-server-id>__<tool>` → `mcp__<8-hex>__<tool>` so the
+/// distinguishing tool suffix survives the 64-char cap. Short / already-compact
+/// ids are left alone. `sanitize_openai_tool_name` still hash-suffixes if the
+/// compact form itself exceeds 64.
+fn compact_mcp_tool_id(id: &str, server_id: Option<&str>) -> String {
+    let Some(server_id) =
+        server_id.filter(|s| !s.is_empty() && s.chars().count() > LONG_MCP_SERVER_ID)
+    else {
+        return id.to_string();
+    };
+    let prefix = format!("mcp__{server_id}__");
+    let Some(tool) = id.strip_prefix(&prefix).filter(|t| !t.is_empty()) else {
+        return id.to_string();
+    };
+    format!("mcp__{}__{tool}", short_stable_hash(server_id))
+}
+
+fn short_stable_hash(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value.as_bytes());
+    digest
+        .iter()
+        .flat_map(|byte| [hex_digit(byte >> 4), hex_digit(byte & 0x0f)])
+        .take(WIRE_NAME_HASH_LEN)
+        .collect()
+}
+
+fn hex_digit(nibble: u8) -> char {
+    b"0123456789abcdef"[nibble as usize] as char
+}
+
 pub fn sanitize_openai_tool_name(name: &str) -> String {
     let mut out = String::with_capacity(name.len());
     for c in name.chars() {
@@ -877,10 +1055,17 @@ pub fn sanitize_openai_tool_name(name: &str) -> String {
     }
     let trimmed = out.trim_matches('_');
     if trimmed.is_empty() {
-        "tool".to_string()
-    } else {
-        trimmed.chars().take(64).collect()
+        return "tool".to_string();
     }
+    if trimmed.chars().count() <= MAX_WIRE_TOOL_NAME {
+        return trimmed.to_string();
+    }
+    // Left-truncate used to collide (issue #33). Keep a stable unique suffix:
+    // `<prefix>_<8-hex>` always 64 chars, deterministic, legal on the wire.
+    let digest = short_stable_hash(trimmed);
+    let prefix_len = MAX_WIRE_TOOL_NAME - 1 - WIRE_NAME_HASH_LEN;
+    let prefix: String = trimmed.chars().take(prefix_len).collect();
+    format!("{prefix}_{digest}")
 }
 
 pub fn looks_sensitive_tool(name: &str) -> bool {
@@ -935,10 +1120,56 @@ mod tests {
     }
 
     #[test]
+    fn automation_upsert_tool_description_stays_short() {
+        let def = native_automation_upsert_tool();
+        assert!(
+            def.description.contains("`automation` skill"),
+            "{}",
+            def.description
+        );
+        assert!(
+            !def.description.contains("Allowed node types"),
+            "schema belongs in the skill and validation errors, not the always-on tool"
+        );
+        assert!(
+            !def.description.contains("Minimal example"),
+            "{}",
+            def.description
+        );
+        assert!(
+            def.description.len() < 500,
+            "upsert description grew to {} chars",
+            def.description.len()
+        );
+    }
+
+    #[test]
+    fn present_artifacts_tool_tells_model_to_pass_ids_only() {
+        let def = native_present_artifacts_tool();
+        assert!(
+            def.description.contains(r#"{"artifact_ids":["art_…"]}"#),
+            "{}",
+            def.description
+        );
+        assert!(def.description.contains("base64"), "{}", def.description);
+        assert!(
+            def.input_schema["properties"]["artifact_ids"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("`art_…`"),
+        );
+        assert!(
+            def.input_schema["properties"]["caption"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("plain-text"),
+        );
+    }
+
+    #[test]
     fn native_file_and_web_tools_have_expected_sensitivity() {
         assert!(!native_read_file_tool().sensitive);
         assert!(!native_web_fetch_tool().sensitive);
-        assert!(!native_run_python_tool().sensitive);
         assert!(!native_memory_read_tool().sensitive);
         assert!(!native_memory_modify_tool().sensitive);
         assert!(native_write_file_tool().sensitive);
@@ -956,6 +1187,8 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("File path"));
+        assert!(read_schema["properties"].get("paths").is_some());
+        assert!(read_schema.get("required").is_none());
         // read 现在也列目录，描述里应提到目录
         assert!(native_read_file_tool().description.contains("directory"));
         assert!(grep.description.contains("file or under a directory"));
@@ -980,32 +1213,6 @@ mod tests {
         assert!(tool
             .description
             .contains("structured file mutation metadata"));
-    }
-
-    #[test]
-    fn run_python_tool_description_scopes_to_compute_deliverables() {
-        let tool = native_run_python_tool();
-
-        // Compute/analysis/chart power is retained.
-        assert!(tool.description.contains("computation"));
-        assert!(tool.description.contains("data analysis"));
-        assert!(tool.description.contains("charts and plots"));
-        assert!(tool.description.contains("REQUIRE a Python library"));
-        assert!(tool.description.contains("report.xlsx"));
-        assert!(tool.description.contains("Kivio auto-captures"));
-        // The old "just write a file" catch-all language is gone, and it now
-        // points at write for content you already have.
-        assert!(!tool
-            .description
-            .contains("user-requested chat deliverable files"));
-        assert!(!tool
-            .description
-            .contains("does not need to mention Python or run_python"));
-        // No reference to the removed deliver_file tool; deliverables are a
-        // path-driven channel via write into the conversation workbench.
-        assert!(!tool.description.contains("deliver_file"));
-        assert!(tool.description.contains("use write_file"));
-        assert!(tool.description.contains("current workbench"));
     }
 
     #[test]
@@ -1253,5 +1460,72 @@ mod tests {
         assert_eq!(canonical_tool_name("read"), "read");
         assert_eq!(canonical_tool_name("glob"), "glob");
         assert_eq!(canonical_tool_name("bash"), "bash");
+    }
+
+    #[test]
+    fn sanitize_keeps_short_names_and_hash_suffixes_long_ones() {
+        assert_eq!(sanitize_openai_tool_name("search.web"), "search_web");
+        assert_eq!(sanitize_openai_tool_name("read_file"), "read_file");
+        let long = "a".repeat(80);
+        let wire = sanitize_openai_tool_name(&long);
+        assert_eq!(wire.chars().count(), MAX_WIRE_TOOL_NAME);
+        assert!(wire.contains('_'), "{wire}");
+        assert_ne!(
+            sanitize_openai_tool_name(&format!("{}x", "a".repeat(79))),
+            wire,
+            "distinct inputs must not collapse after the 64-char cap"
+        );
+    }
+
+    #[test]
+    fn uuid_mcp_server_tools_keep_distinct_wire_names() {
+        // Issue #33: `mcp__<uuid>__zai-mcp-server-ui_*` all left-truncated to
+        // the same `...-ui` and Gemini dropped the duplicates.
+        let server = ChatMcpServer {
+            id: "mcp-d1ad400e-e2c7-4f34-9cd0-4e4cf1afa728".to_string(),
+            name: "zhipu".to_string(),
+            enabled: true,
+            transport: "stdio".to_string(),
+            url: String::new(),
+            command: "demo".to_string(),
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            headers: std::collections::HashMap::new(),
+            cwd: None,
+            enabled_tools: Vec::new(),
+            connector_id: None,
+            auth: None,
+        };
+        let names = [
+            "zai-mcp-server-ui_to_artifact",
+            "zai-mcp-server-ui_diff_check",
+            "zai-mcp-server-analyze_data_visualization",
+            "zai-mcp-server-analyze_image",
+            "zai-mcp-server-analyze_video",
+        ];
+        let mut wires = std::collections::HashSet::new();
+        for name in names {
+            let tool = tool_definition_from_mcp(
+                &server,
+                McpTool {
+                    name: name.to_string(),
+                    description: String::new(),
+                    input_schema: serde_json::json!({ "type": "object" }),
+                    output_schema: None,
+                    annotations: None,
+                },
+            );
+            let wire = tool.openai_tool_name();
+            assert!(
+                wire.chars().count() <= MAX_WIRE_TOOL_NAME,
+                "{wire} exceeds 64"
+            );
+            assert!(
+                wire.contains("zai-mcp-server"),
+                "tool suffix should stay visible: {wire}"
+            );
+            assert!(wires.insert(wire.clone()), "collided: {wire}");
+        }
+        assert_eq!(wires.len(), names.len());
     }
 }

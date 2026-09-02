@@ -2,6 +2,7 @@ import type { ChatMessageSegment, ToolCallRecord } from './types'
 import { foldToolName, hasAskUserStructuredContent, isAskUserToolName } from './askUserTools'
 import { normalizeToolCallStatus } from './toolStatus'
 import { isArtifactPresentationToolCall } from './artifactPresentation'
+import { isImageArtifact } from './artifacts'
 
 export function segmentToolCallId(segment: ChatMessageSegment): string {
   return segment.tool_call_id ?? segment.toolCallId ?? ''
@@ -33,7 +34,7 @@ const TOOL_NAME_ALIASES: Record<string, string> = {
   creategoal: 'todo_write',
   updategoal: 'todo_write',
   readimage: 'read',
-  runcode: 'run_python',
+  runcode: 'bash',
   subagent: 'agent',
   subagentfork: 'agent',
   listagents: 'agent',
@@ -166,6 +167,44 @@ export function userSteerText(toolCall: ToolCallRecord): string {
   return typeof text === 'string' ? text : ''
 }
 
+export function isUserFollowUpToolCall(toolCall: ToolCallRecord): boolean {
+  if (toolCall.source !== 'native') return false
+  if (toolRecordRawName(toolCall) !== 'user_follow_up') return false
+  const structured = toolCall.structured_content ?? toolCall.structuredContent
+  if (!structured || typeof structured !== 'object') return false
+  return (structured as { type?: unknown }).type === 'user_follow_up'
+}
+
+export function userFollowUpText(toolCall: ToolCallRecord): string {
+  const structured = toolCall.structured_content ?? toolCall.structuredContent
+  if (!structured || typeof structured !== 'object') return ''
+  const text = (structured as { text?: unknown }).text
+  return typeof text === 'string' ? text : ''
+}
+
+function structuredStringField(
+  toolCall: ToolCallRecord,
+  snake: string,
+  camel: string,
+): string | null {
+  const structured = toolCall.structured_content ?? toolCall.structuredContent
+  if (!structured || typeof structured !== 'object') return null
+  const value = (structured as Record<string, unknown>)[snake]
+    ?? (structured as Record<string, unknown>)[camel]
+  return typeof value === 'string' ? value : null
+}
+
+/** 插话卡上的前端队列 id。蛇/驼峰都认，协议层 Value 原样穿过。 */
+export function userSteerId(toolCall: ToolCallRecord): string | null {
+  if (!isUserSteerToolCall(toolCall)) return null
+  return structuredStringField(toolCall, 'steer_id', 'steerId')
+}
+
+export function userFollowUpId(toolCall: ToolCallRecord): string | null {
+  if (!isUserFollowUpToolCall(toolCall)) return null
+  return structuredStringField(toolCall, 'follow_up_id', 'followUpId')
+}
+
 /** 外部 CLI 的子代理工具调用：claude 新版报 `Agent`、旧版报 `Task`；dsh 报
  *  `subagent` / `subagent_fork` / `workflow` / `ralph`（source 恒为 `external_cli`）。
  *  精确匹配整名，MCP/native 不受影响。 */
@@ -187,7 +226,7 @@ export function isExternalSubagentToolCall(toolCall: ToolCallRecord): boolean {
  *  structured content arrives). */
 export function isStandaloneToolCard(toolCall: ToolCallRecord): boolean {
   // 用户插话：把它折进「调用 N 次工具」等于把用户自己说的话藏起来，同 ask_user 的理由。
-  if (isUserSteerToolCall(toolCall)) return true
+  if (isUserSteerToolCall(toolCall) || isUserFollowUpToolCall(toolCall)) return true
   const structured = toolCall.structured_content ?? toolCall.structuredContent
   if (structured && typeof structured === 'object') {
     const type = (structured as { type?: unknown }).type
@@ -206,6 +245,115 @@ export function isStandaloneToolCard(toolCall: ToolCallRecord): boolean {
   if (isExternalSubagentToolCall(toolCall)) return true
   if (toolCall.source !== 'native') return false
   return name === 'agent' || name === 'advisor' || isArtifactPresentationToolCall(toolCall)
+}
+
+const IMAGE_READ_EXT = /\.(png|jpe?g|gif|webp|bmp|tiff?|heic|heif)$/i
+
+function toolCallArgObject(toolCall: ToolCallRecord): Record<string, unknown> | null {
+  const raw = toolCall.arguments ?? toolCall.args ?? toolCall.input
+  if (!raw) return null
+  if (typeof raw === 'object' && !Array.isArray(raw)) return raw as Record<string, unknown>
+  if (typeof raw === 'string') {
+    try {
+      const parsed = JSON.parse(raw) as unknown
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>
+      }
+    } catch {
+      return null
+    }
+  }
+  return null
+}
+
+function toolCallPathList(toolCall: ToolCallRecord): string[] {
+  const args = toolCallArgObject(toolCall)
+  const paths: string[] = []
+  const extra = args?.paths
+  if (Array.isArray(extra)) {
+    for (const item of extra) {
+      if (typeof item === 'string' && item.trim()) paths.push(item.trim())
+    }
+  }
+  const path = args?.path ?? args?.file_path ?? args?.filePath
+  if (typeof path === 'string' && path.trim() && !paths.includes(path.trim())) {
+    paths.unshift(path.trim())
+  }
+  return paths
+}
+
+function pathBasename(path: string): string {
+  const slash = Math.max(path.lastIndexOf('/'), path.lastIndexOf('\\'))
+  return slash >= 0 ? path.slice(slash + 1) : path
+}
+
+/** `read` 正在看图片：结果带 image_read / 图片 artifact，或参数路径是图片。 */
+export function isImageReadToolCall(toolCall: ToolCallRecord): boolean {
+  const folded = foldToolName(canonicalToolName(toolCall))
+  if (folded !== 'read' && folded !== 'readfile') return false
+  const structured = toolCall.structured_content ?? toolCall.structuredContent
+  if (structured && typeof structured === 'object' && (structured as { type?: unknown }).type === 'image_read') {
+    return true
+  }
+  if ((toolCall.artifacts ?? []).some(isImageArtifact)) return true
+  return toolCallPathList(toolCall).some((path) => IMAGE_READ_EXT.test(path))
+}
+
+export type ImageReadItem = {
+  path: string
+  name: string
+  dataUrl: string
+}
+
+export function imageReadItems(toolCall: ToolCallRecord): ImageReadItem[] {
+  const fromArtifacts = (toolCall.artifacts ?? []).filter(isImageArtifact).map((artifact) => {
+    const path = artifact.path ?? artifact.filePath ?? artifact.localPath ?? ''
+    return {
+      path,
+      name: artifact.name || pathBasename(path) || 'image',
+      dataUrl: artifact.dataUrl ?? artifact.data_url ?? '',
+    }
+  })
+  if (fromArtifacts.length > 0) return fromArtifacts
+  return toolCallPathList(toolCall)
+    .filter((path) => IMAGE_READ_EXT.test(path))
+    .map((path) => ({ path, name: pathBasename(path) || 'image', dataUrl: '' }))
+}
+
+export function imageReadCount(toolCall: ToolCallRecord): number {
+  const items = imageReadItems(toolCall)
+  if (items.length > 0) return items.length
+  const structured = toolCall.structured_content ?? toolCall.structuredContent
+  if (structured && typeof structured === 'object') {
+    const count = (structured as { count?: unknown }).count
+    if (typeof count === 'number' && count > 0) return count
+  }
+  return 1
+}
+
+export type ToolDisplayCluster =
+  | { type: 'imageRead'; toolCalls: ToolCallRecord[] }
+  | { type: 'tool'; toolCall: ToolCallRecord }
+
+/** 连续的读图调用收成一组，好画成一行缩略图。 */
+export function clusterToolCallsForDisplay(toolCalls: ToolCallRecord[]): ToolDisplayCluster[] {
+  const items: ToolDisplayCluster[] = []
+  let cluster: ToolCallRecord[] | null = null
+  const flush = () => {
+    if (cluster?.length) items.push({ type: 'imageRead', toolCalls: cluster })
+    cluster = null
+  }
+  for (const toolCall of toolCalls) {
+    if (isImageReadToolCall(toolCall)) {
+      if (!cluster) cluster = []
+      cluster.push(toolCall)
+      continue
+    }
+    flush()
+    items.push({ type: 'tool', toolCall })
+  }
+  flush()
+  return items
 }
 
 /** tool record 的唯一 id（兼容多种字段命名）。 */
@@ -253,31 +401,55 @@ export type TimelineGroupItem =
   | { type: 'group'; segments: ChatMessageSegment[] }
   | { type: 'standaloneTool'; segment: ChatMessageSegment }
 
+/** Codex commentary：工具循环旁白，进 Working 壳，不是终稿。 */
+export function isProcessCommentaryText(segment: ChatMessageSegment): boolean {
+  return segment.kind === 'text' && (segment.phase === 'tool_loop' || segment.phase === 'auxiliary')
+}
+
+function isGroupableProcess(
+  segment: ChatMessageSegment,
+  isStandalone?: (segment: ChatMessageSegment) => boolean,
+): boolean {
+  if (segment.kind === 'reasoning') return true
+  if (segment.kind === 'tool') return !isStandalone?.(segment)
+  return isProcessCommentaryText(segment)
+}
+
 /**
- * 以正文(text)段为分隔，把两条正文之间连续的非 text 段（reasoning + tool）聚成一个组。
- * - 纯函数：输入有序 segments → 输出渲染项数组，便于单测。
- * - text 段单独成项（原样渲染正文），永远打断分组。
- * - `tool → text → tool` ⇒ 两个组。
- * - 空白 reasoning/text 段先过滤，避免产生空组或多余分隔。
- * - `isStandalone(segment)` 命中的 tool 段（如 advisor / subagent）像 text 一样单独成项、
- *   打断分组，交给调用方以专属卡片常驻渲染（不被折叠进「调用 N 次工具」组）。
+ * 把一轮里的过程收进 Working 组，终稿留在外面（对标 Codex App 的 Working / Worked for）。
+ * - 过程：reasoning、非 standalone 的 tool、`tool_loop`/`auxiliary` 正文，以及后面还有过程的
+ *   `plain`/`synthesis` 旁白（模型在工具之间写的话）。
+ * - 终稿：最后一个过程之后的 `plain`/`synthesis` 正文，始终展开。
+ * - `isStandalone` 命中的 tool（ask_user / subagent / 产物卡）常驻打断，不进壳。
+ * - 空白 reasoning/text 先过滤，避免空组或假分隔。
  */
 export function groupTimelineSegments(
   orderedSegments: ChatMessageSegment[],
   isStandalone?: (segment: ChatMessageSegment) => boolean,
 ): TimelineGroupItem[] {
+  let lastProcessIndex = -1
+  for (let index = 0; index < orderedSegments.length; index++) {
+    const segment = orderedSegments[index]
+    if (!segmentHasContent(segment)) continue
+    if (isGroupableProcess(segment, isStandalone)) lastProcessIndex = index
+  }
+
   const items: TimelineGroupItem[] = []
   let current: ChatMessageSegment[] | null = null
-  for (const segment of orderedSegments) {
+  for (let index = 0; index < orderedSegments.length; index++) {
+    const segment = orderedSegments[index]
     if (!segmentHasContent(segment)) continue
-    if (segment.kind === 'text') {
-      current = null
-      items.push({ type: 'text', segment })
-      continue
-    }
     if (segment.kind === 'tool' && isStandalone?.(segment)) {
       current = null
       items.push({ type: 'standaloneTool', segment })
+      continue
+    }
+    const foldText =
+      segment.kind === 'text' &&
+      (isProcessCommentaryText(segment) || index < lastProcessIndex)
+    if (segment.kind === 'text' && !foldText) {
+      current = null
+      items.push({ type: 'text', segment })
       continue
     }
     if (!current) {
@@ -289,6 +461,66 @@ export function groupTimelineSegments(
   return items
 }
 
+/** 后端 `started_at` 是 unix 秒；个别路径会写毫秒。 */
+function timestampToMs(value: number): number {
+  return value < 1e12 ? value * 1000 : value
+}
+
+function matchedGroupTools(
+  segments: ChatMessageSegment[],
+  toolCalls: ToolCallRecord[],
+  toolCallById?: ReadonlyMap<string, ToolCallRecord>,
+): ToolCallRecord[] {
+  const matched: ToolCallRecord[] = []
+  for (const segment of segments) {
+    if (segment.kind !== 'tool') continue
+    const id = segmentToolCallId(segment)
+    const record = toolCallById
+      ? toolCallById.get(id)
+      : toolCalls.find((tool) => toolRecordId(tool) === id)
+    if (record) matched.push(record)
+  }
+  return matched
+}
+
+/**
+ * 一组过程的墙钟耗时（Codex「Worked for Xs」）。
+ * 取组内工具最早 start → 最晚 complete；没有时间戳时回退思考耗时。
+ */
+export function groupWorkDurationMs(
+  segments: ChatMessageSegment[],
+  toolCalls: ToolCallRecord[],
+  toolCallById?: ReadonlyMap<string, ToolCallRecord>,
+  reasoningDurationMs?: number | null,
+): number | null {
+  let minStart: number | null = null
+  let maxEnd: number | null = null
+  for (const tool of matchedGroupTools(segments, toolCalls, toolCallById)) {
+    const start = tool.started_at ?? tool.startedAt
+    const end = tool.completed_at ?? tool.completedAt
+    if (typeof start === 'number') {
+      minStart = minStart == null ? start : Math.min(minStart, start)
+    }
+    if (typeof end === 'number') {
+      maxEnd = maxEnd == null ? end : Math.max(maxEnd, end)
+    }
+  }
+  if (minStart != null && maxEnd != null && maxEnd >= minStart) {
+    const delta = timestampToMs(maxEnd) - timestampToMs(minStart)
+    if (delta > 0) return delta
+  }
+  if (reasoningDurationMs != null && reasoningDurationMs > 0) return reasoningDurationMs
+  return null
+}
+
+export function formatWorkDuration(ms: number): string {
+  const totalSeconds = Math.max(1, Math.round(ms / 1000))
+  if (totalSeconds < 60) return `${totalSeconds}s`
+  const minutes = Math.floor(totalSeconds / 60)
+  const seconds = totalSeconds % 60
+  return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`
+}
+
 export type ToolGroupCategory =
   | 'read'
   | 'codeSearch'
@@ -297,7 +529,6 @@ export type ToolGroupCategory =
   | 'runCommand'
   | 'webFetch'
   | 'webSearch'
-  | 'runPython'
   | 'listDir'
   | 'fileOps'
   | 'todo'
@@ -337,8 +568,6 @@ function categorizeTool(toolCall: ToolCallRecord): ToolGroupCategory {
       return 'webFetch'
     case 'web_search':
       return 'webSearch'
-    case 'run_python':
-      return 'runPython'
     case 'ls':
     case 'list_dir':
       return 'listDir'
@@ -419,8 +648,6 @@ function categoryFragment(category: ToolGroupCategory, count: number): string {
       return '搜索网络'
     case 'globFiles':
       return '查找文件'
-    case 'runPython':
-      return '运行代码'
     case 'todo':
       return '更新任务清单'
     case 'memory':
@@ -475,14 +702,7 @@ export function summarizeToolGroup(
   const toolSegments = segments.filter((segment) => segment.kind === 'tool')
   // 「步数」按工具步计；纯 reasoning 组（无工具）回退到总段数。
   const stepCount = toolSegments.length || segments.length
-  const matchedTools: ToolCallRecord[] = []
-  for (const segment of toolSegments) {
-    const id = segmentToolCallId(segment)
-    const record = toolCallById
-      ? toolCallById.get(id)
-      : toolCalls.find((tool) => toolRecordId(tool) === id)
-    if (record) matchedTools.push(record)
-  }
+  const matchedTools = matchedGroupTools(segments, toolCalls, toolCallById)
 
   const categories = matchedTools.map((tool) => categorizeTool(tool))
   const meaningful = meaningfulCategories(categories)

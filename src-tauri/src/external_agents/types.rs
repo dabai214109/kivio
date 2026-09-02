@@ -139,6 +139,10 @@ pub struct DetectedAgent {
     /// 前端据此决定排队条上给不给「立刻引导」。
     #[serde(default)]
     pub supports_steering: bool,
+    /// 协议是否支持把消息排到当前运行之后继续处理。
+    /// 当前：Pi RPC `follow_up`，dsh 官方 `session/prompt`。
+    #[serde(default)]
+    pub supports_follow_up: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -179,17 +183,20 @@ pub struct RuntimeAgentDef {
     pub prompt_input_format: PromptInputFormat,
     pub stream_format: StreamFormat,
     pub resumes_session_via_cli: bool,
-    /// 该 CLI 是否能通过其协议原生接收图片（Claude base64 / ACP image / Codex localImage）。
-    /// false（pi/kimi）时图片降级为在 prompt 文本里写出路径。
+    /// 该 CLI 是否能通过其协议原生接收图片（Claude/Pi base64 / ACP image / Codex localImage）。
+    /// false（当前主要是 kimi）时图片降级为在 prompt 文本里写出路径。
     pub supports_native_image: bool,
     /// 该 CLI 的协议能否往**在飞的轮次**里追加一条用户输入（「立刻引导」）。
     ///
-    /// 目前只有 codex 能：`turn/steer` + `expectedTurnId`（真机验证见
-    /// `session::codex_app_server` 的 `codex_turn_steer_injects_into_the_running_turn`）。
-    /// claude 的 stream-json 输入是**顺序**处理的、没有注入用的 control_request；
-    /// ACP 只有 `session/prompt` 与 `session/cancel`。这些一律 false —— 前端据此
-    /// 不显示引导入口，排队消息照旧在轮末自动发出。
+    /// Codex 使用 `turn/steer`，Pi 使用 RPC `steer`，dsh 使用 bridge `session/steer`
+    ///（`agent.steer()`，next-step inbox）。都只在对端成功响应后确认。
+    /// claude 的 stream-json 输入是顺序处理、ACP 只有 `session/prompt` 与 `session/cancel`，
+    /// 因而仍不声明该能力。
     pub supports_steering: bool,
+    /// 该 CLI 的协议能否把一条用户消息排到当前运行完成后继续处理。
+    /// Pi 使用 RPC `follow_up`；dsh 使用官方 `session/prompt` → `agent.followup()`。
+    /// 其余协议仍由 Kivio 在轮末发起普通新轮次。
+    pub supports_follow_up: bool,
     /// 允许原生注入的图片 MIME 白名单；空 = 不限。Claude stream-json 仅认 jpeg/png/gif/webp，
     /// 超出的图片降级为路径文本（不静默丢弃）。
     pub image_mime_whitelist: &'static [&'static str],
@@ -251,6 +258,13 @@ pub enum UnifiedAgentEvent {
         id: String,
         text: String,
     },
+    /// Pi 已接受一条原生 `follow_up`。该事件会生成独立的用户追加卡，既留下可见历史，
+    /// 也让前端确认这条本地排队消息已由 Pi 接管，不再在轮末重复发送。
+    UserFollowUp {
+        /// 前端排队消息 id，回到 `structured_content.follow_up_id` 供前端对账。
+        id: String,
+        text: String,
+    },
     /// CLI 在**自己内部**完成了一次上下文压缩（claude 的
     /// `{"type":"system","subtype":"compact_boundary"}`）。
     ///
@@ -278,8 +292,8 @@ pub enum UnifiedAgentEvent {
         /// 压缩耗时，仅用于诊断日志。
         duration_ms: Option<u64>,
     },
-    /// 生成过程的瞬态状态一行字（当前唯一来源：claude 的 `system/api_retry`——上游
-    /// 429/overloaded 时 CLI 在静默重试）。挂到前端的流状态行，不进消息正文。
+    /// 生成过程的瞬态状态一行字（claude `api_retry`、codex `Reconnecting... N/M`、
+    /// grok `retry_state`、dsh `llm/retry-started`）。挂到前端的流状态行，不进消息正文。
     StatusNote {
         text: String,
     },
@@ -311,11 +325,14 @@ pub enum UnifiedAgentEvent {
     TodoWrite {
         todos: Value,
     },
-    /// dsh 后台子代理（另一个 `sessionId`）的嵌套进度。
+    /// 子代理嵌套进度。
     ///
     /// 不能走 `TextDelta` / `ToolUse`：那些会进父气泡。前端已有
     /// `subagent_updated` → `structuredContent.subagentProgress`。
-    /// `task_id` 是子会话 id，对应派出回执 / `subagent.started` 的 `childSessionId`。
+    ///
+    /// `task_id` 的含义因 CLI 而异：dsh 是子会话 id（派出回执 /
+    /// `subagent.started` 的 `childSessionId`）；claude 是派出它的那次
+    /// Task/Agent `tool_use` id（`parent_tool_use_id`）。
     SubagentProgress {
         task_id: String,
         status: String,

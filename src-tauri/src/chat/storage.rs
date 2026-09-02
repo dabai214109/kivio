@@ -8,9 +8,9 @@ use tauri::{AppHandle, Manager};
 use serde::Serialize;
 
 use super::{
-    ChatAssistant, ChatAssistantIndex, ChatAssistantSnapshot, ChatProject, ChatProjectIndex,
-    ChatSet, ChatSetIndex, Conversation, ConversationIndex, ConversationListItem, ConversationPin,
-    ConversationSearchHit,
+    AdditionalDirectory, ChatAssistant, ChatAssistantIndex, ChatAssistantSnapshot, ChatProject,
+    ChatProjectIndex, ChatSet, ChatSetIndex, Conversation, ConversationIndex, ConversationListItem,
+    ConversationPin, ConversationSearchHit, MAX_ADDITIONAL_DIRECTORIES,
 };
 
 const WRITE_RETRY_ATTEMPTS: usize = 3;
@@ -238,6 +238,13 @@ pub fn conversation_file_path(app: &AppHandle, id: &str) -> Result<PathBuf, Stri
     Ok(conversations_dir(app)?.join(format!("{}.json", id)))
 }
 
+/// 中断草稿日志路径(`{id}.draft.jsonl`,见 `chat::draft_journal`)。
+/// 扩展名刻意不是 `.json`:`conversation_file_ids_in_dir` 的扫描不会把它当会话文件。
+pub(crate) fn draft_journal_path(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
+    validate_conversation_id(id)?;
+    Ok(conversations_dir(app)?.join(format!("{id}.draft.jsonl")))
+}
+
 /// 获取对话附件目录
 pub fn conversation_attachments_dir(app: &AppHandle, id: &str) -> Result<PathBuf, String> {
     validate_conversation_id(id)?;
@@ -266,8 +273,7 @@ fn load_index_in_dir(dir: &Path) -> Result<ConversationIndex, String> {
 /// 保存对话索引
 pub(crate) fn save_index(app: &AppHandle, index: &ConversationIndex) -> Result<(), String> {
     let path = index_file_path(app)?;
-    let content =
-        serde_json::to_string_pretty(index).map_err(|e| format!("serialize index: {e}"))?;
+    let content = serde_json::to_string(index).map_err(|e| format!("serialize index: {e}"))?;
     atomic_write(&path, &content, "index")
 }
 
@@ -330,7 +336,8 @@ const NO_AI_FLAVOR_STYLE: &str = "写作要求（务必遵守，优先级高于�
 不过度免责和模棱两可（少用「可能也许某种程度上或许」），有判断就直说，不确定就点明到底哪里不确定。\
 写中文就写地道中文，别带翻译腔和英式长句；句子长短交错，读起来像正常人说话。默认使用与用户相同的语言。";
 
-/// 内置专家模板：写作 / 编程 / 前端设计 / 研究 / 数据分析 / 翻译 / 文档。
+/// 内置专家模板：写作 / 编程 / 前端设计 / 研究 / 数据分析 / 翻译 / 文档 /
+/// 产品 / 法务 / 财务 / 教学 / 代码审查 / 求职。
 ///
 /// `ChatAssistant` 没有原生工具白名单（只有 mcp_server_ids + skill_ids），所以人设主要靠
 /// `system_prompt`，文件/联网/Python 等原生工具由全局 Chat 工具开关决定。这里：
@@ -422,11 +429,11 @@ pub fn builtin_assistant_definitions(now: i64) -> Vec<ChatAssistant> {
             "数据分析",
             "📊",
             "#7A9A57",
-            "读 PDF / Excel / Word，用 Python 做数据清洗、统计与可视化，结论落到数字和图。",
-            "你是数据分析师，能读 PDF、Excel/CSV、Word 里的数据，用 Python 沙箱做清洗、统计和画图。\
+            "读 PDF / Excel / Word，做数据清洗、统计与可视化，结论落到数字和图。",
+            "你是数据分析师，能读 PDF、Excel/CSV、Word 里的数据，做清洗、统计和画图。\
 先摸清数据长什么样、要回答什么问题，再动手；过程要可复现，关键步骤讲清楚。\
 结论要落到具体数字和图表上，别停在「大致上升」这种空话；数据有质量问题、或你做了什么假设，主动摆出来。\
-读附件用 pdf/docx/xlsx 技能，画图表关系可用 diagram 技能。拿不准的地方标清楚，不替数据编故事。",
+读附件用 pdf/docx/xlsx 技能，画图表关系可用 diagram 技能。本机有 Python 时可以用 bash 跑分析脚本，没有就直说。拿不准的地方标清楚，不替数据编故事。",
             &["pdf", "docx", "xlsx", "diagram"],
         ),
         make(
@@ -454,6 +461,80 @@ pub fn builtin_assistant_definitions(now: i64) -> Vec<ChatAssistant> {
 用词准确、口径一致，写清楚约束、前提和未定项；有需要核实的事实标出来，不含糊带过。\
 长文档协作用 doc-coauthoring 技能，读/改附件用 docx/pdf/xlsx 技能。",
             &["doc-coauthoring", "docx", "xlsx", "pdf", "diagram"],
+        ),
+        make(
+            "asst_builtin_pm",
+            "产品经理",
+            "📋",
+            "#2F6FED",
+            "把模糊想法收成能开工的方案：用户问题、范围、优先级和验收，不堆功能清单。",
+            "你是产品经理，帮我把模糊想法收成工程师能直接动手的方案。\
+先弄清三件事：用户是谁、要解决什么问题、做成什么样算成功；没交代就先问，别自己编一版人设。\
+谈方案时把非目标、约束和取舍说在前面，优先级要讲为什么做这个、为什么现在不做那个。\
+写需求就写场景、流程、边界和验收标准，不写空话口号。没证据的市场判断标成假设。\
+需要结构时用表格或 diagram 技能；长文档协作用 doc-coauthoring，读附件用 docx。",
+            &["doc-coauthoring", "docx", "diagram"],
+        ),
+        make(
+            "asst_builtin_legal",
+            "法务助手",
+            "⚖️",
+            "#8A6FBD",
+            "合同和合规材料初审：标风险、提问题、给修改方向。审阅备忘，不替代律师。",
+            "你是法务审阅搭档，帮我看合同、条款、隐私政策、用工和商务文件。\
+先按红/黄/绿标风险，再说清楚：对我方意味着什么、常见改法、还要问对方什么。引用条款时带原文短摘，不凭记忆编法条编号。\
+立场要问清（我方是买方、卖方、雇主还是平台），没说就先问一句。\
+你不是律师，输出是审阅备忘不是法律意见；涉及诉讼、监管调查或大额交易，明确建议找持证律师复核。\
+读附件用 pdf/docx 技能。",
+            &["pdf", "docx"],
+        ),
+        make(
+            "asst_builtin_finance",
+            "财务分析",
+            "💹",
+            "#B7791F",
+            "读报表和经营表格，做结构、比率与异常分析，结论落到数字。不做投资建议。",
+            "你是财务分析搭档，读利润表、资产负债表、现金流和经营表格。\
+先确认口径（期间、币种、是否合并、是否经审计），再拆结构、算关键比率、找异常和缺口。\
+结论落到具体数字和对比，不写「整体向好」这种空话；你做的假设和数据质量问题主动摆出来。\
+你不是持牌顾问，不给买卖、借贷或税务筹划建议。读表用 xlsx/pdf 技能，关系用 diagram 技能。",
+            &["xlsx", "pdf", "diagram"],
+        ),
+        make(
+            "asst_builtin_teacher",
+            "教学助手",
+            "📚",
+            "#5E8C6A",
+            "把难点拆开讲、把练习设计好：讲解、出题、找误区、做讲义和试卷。",
+            "你是教学搭档，帮我讲清楚一个概念、出练习、改讲义或试卷。\
+先确认学生大概程度和这节要达成什么，再讲；没交代就先问，别按竞赛难度一上来灌。\
+讲解用例子和反例，练习带答案和常见错法，一次只攻一个难点。\
+材料可做成讲义或试卷。读/写文档用 docx/pdf 技能，流程或知识结构用 diagram 技能。",
+            &["docx", "pdf", "diagram"],
+        ),
+        make(
+            "asst_builtin_reviewer",
+            "代码审查",
+            "🔎",
+            "#3D5A80",
+            "像资深工程师审变更：找能过测试却在生产炸掉的问题，按严重程度说。",
+            "你是代码审查搭档，专找能过测试却在生产炸掉的问题：并发、错误处理、边界、权限、数据丢失、不可逆操作。\
+先读变更和相关上下文，再按严重程度列问题；能给补丁就给小而聚焦的补丁，不借机重构。\
+风格之争让给项目已有约定。没看过的代码不装看过，不确定的行为去代码里核实。\
+架构或数据流需要讲清时用 diagram 技能。",
+            &["diagram"],
+        ),
+        make(
+            "asst_builtin_career",
+            "求职教练",
+            "🧳",
+            "#7D6B5A",
+            "简历、求职信和面试：按目标岗位改，写成可验证的事实，不编经历。",
+            "你是求职教练，改简历、求职信、面试回答。\
+先问目标岗位和真实经历要点，再按那个岗位改，不用万能模板。经历写成可验证的事实和结果，删掉空形容词。\
+面试题给回答骨架和可能的追问，不替我编没做过的事。拿不准的空窗期或跳槽理由先问我。\
+读原简历用 pdf/docx 技能。",
+            &["pdf", "docx"],
         ),
     ]
 }
@@ -502,6 +583,12 @@ pub fn merge_builtin_assistants_v2(app: &AppHandle, now: i64) -> Result<(), Stri
     save_assistant_index(app, &ChatAssistantIndex { assistants: merged })
 }
 
+/// 非破坏性内置专家迁移（v3）：与 v2 同一套 upsert，补齐产品/法务/财务/教学/审查/求职。
+/// 幂等由调用方通过 `settings.builtin_assistants_seeded_v3` 标记保证。
+pub fn merge_builtin_assistants_v3(app: &AppHandle, now: i64) -> Result<(), String> {
+    merge_builtin_assistants_v2(app, now)
+}
+
 /// 加载对话详情
 pub fn load_conversation(app: &AppHandle, id: &str) -> Result<Conversation, String> {
     let path = conversation_file_path(app, id)?;
@@ -517,29 +604,30 @@ pub fn load_conversation(app: &AppHandle, id: &str) -> Result<Conversation, Stri
 /// `ConversationRepository`; this function deliberately does not touch the index.
 pub(crate) fn write_conversation_file(
     app: &AppHandle,
-    conversation: &Conversation,
+    mut conversation: Conversation,
 ) -> Result<Conversation, String> {
     let path = conversation_file_path(app, &conversation.id)?;
-    let mut to_save = conversation.clone();
     // 外置内联图：artifact 的大图 + 两份隐藏转录（`model_messages` / `api_messages`）里
     // 模型看过的整图 base64。后者是"会话 JSON 绝不含 base64"的关键——它每轮都被整本读写，
     // 一张图存几份就是几 MB × 每轮 fsync。中断草稿同时持有两份转录，所以两个都要扫。
-    // 三个谓词都是廉价预扫描，没有可外置的图就不必克隆对话。
-    if to_save.messages.iter().any(|message| {
+    // 参数取 owned（调用方本来就持有所有权），省掉此前每次落盘的整会话 clone。
+    if conversation.messages.iter().any(|message| {
         super::attachments::message_has_inline_image_to_externalize(message)
             || super::attachments::message_has_model_message_image_to_externalize(message)
             || super::attachments::message_has_api_message_image_to_externalize(message)
     }) {
-        let conv_id = to_save.id.clone();
-        for message in to_save.messages.iter_mut() {
+        let conv_id = conversation.id.clone();
+        for message in conversation.messages.iter_mut() {
             super::attachments::externalize_message_artifacts(app, &conv_id, message);
         }
     }
 
-    let content = serde_json::to_string_pretty(&to_save)
-        .map_err(|e| format!("serialize conversation: {e}"))?;
+    // compact 而非 pretty：长对话数 MB 级,pretty 徒增 ~30-50% 体积与序列化时间,
+    // 且每个工具轮都要整本重写。人读导出走 export.rs,不靠这份文件的排版。
+    let content =
+        serde_json::to_string(&conversation).map_err(|e| format!("serialize conversation: {e}"))?;
     atomic_write(&path, &content, "conversation")?;
-    Ok(to_save)
+    Ok(conversation)
 }
 
 /// 删除对话。
@@ -595,6 +683,9 @@ pub(crate) fn delete_conversation(app: &AppHandle, id: &str) -> Result<Vec<Strin
     save_index(app, &index)?;
 
     // ② 副产物尽力清，失败只记账。
+    if let Ok(draft) = draft_journal_path(app, id) {
+        let _ = fs::remove_file(draft);
+    }
     let attachments_dir = match conversations_dir(app) {
         Ok(dir) => Some(dir.join(format!("{}_attachments", id))),
         Err(e) => {
@@ -938,7 +1029,9 @@ fn match_conversation_for_search(
     item: ConversationListItem,
     needle: &str,
 ) -> Option<ConversationSearchHit> {
-    if item.title.to_lowercase().contains(needle) {
+    if item.title.to_lowercase().contains(needle)
+        && !crate::chat::commands::title::is_placeholder_title(&item.title)
+    {
         return Some(ConversationSearchHit {
             match_field: "title".into(),
             match_message_id: None,
@@ -1482,8 +1575,106 @@ fn normalize_project_root_path(
         return Err("项目文件夹不存在或不是文件夹。".to_string());
     }
     fs::canonicalize(path)
-        .map(|path| Some(path.to_string_lossy().to_string()))
+        .map(|path| {
+            Some(
+                crate::utils::strip_windows_verbatim_prefix(path)
+                    .to_string_lossy()
+                    .to_string(),
+            )
+        })
         .map_err(|err| format!("解析项目文件夹失败：{err}"))
+}
+
+/// Canonicalize, name, and cap a conversation's additional directories.
+/// Drops the primary working directory (relative paths already resolve there).
+/// Duplicate paths keep the first entry. Missing paths fail instead of silently vanishing.
+pub fn normalize_additional_directories(
+    entries: Vec<AdditionalDirectory>,
+    primary_root: Option<&str>,
+) -> Result<Vec<AdditionalDirectory>, String> {
+    if entries.len() > MAX_ADDITIONAL_DIRECTORIES {
+        return Err(format!(
+            "一条对话最多附加 {MAX_ADDITIONAL_DIRECTORIES} 个目录。"
+        ));
+    }
+    let primary = primary_root
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .and_then(|path| canonicalize_existing_dir(path).ok());
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for entry in entries {
+        let normalized = normalize_additional_directory_path(entry.path)?;
+        if primary
+            .as_ref()
+            .is_some_and(|root| paths_equal(root, &normalized))
+        {
+            continue;
+        }
+        if !seen.insert(normalized.clone()) {
+            continue;
+        }
+        let name = entry
+            .name
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .or_else(|| {
+                Path::new(&normalized)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .map(|name| name.to_string())
+            });
+        out.push(AdditionalDirectory {
+            path: normalized,
+            name,
+        });
+    }
+    if out.len() > MAX_ADDITIONAL_DIRECTORIES {
+        return Err(format!(
+            "一条对话最多附加 {MAX_ADDITIONAL_DIRECTORIES} 个目录。"
+        ));
+    }
+    Ok(out)
+}
+
+fn canonicalize_existing_dir(raw: &str) -> Result<String, String> {
+    let expanded = expand_home_prefix(raw.trim())?;
+    let path = Path::new(&expanded);
+    if !path.is_absolute() {
+        return Err("附加目录必须是绝对路径。".to_string());
+    }
+    if !path.is_dir() {
+        if path.exists() {
+            return Err(format!("附加路径不是文件夹：{expanded}"));
+        }
+        return Err(format!("附加目录不存在：{expanded}"));
+    }
+    fs::canonicalize(path)
+        .map(|path| {
+            crate::utils::strip_windows_verbatim_prefix(path)
+                .to_string_lossy()
+                .to_string()
+        })
+        .map_err(|err| format!("解析附加目录失败：{err}"))
+}
+
+fn normalize_additional_directory_path(raw: String) -> Result<String, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("附加目录路径不能为空。".to_string());
+    }
+    canonicalize_existing_dir(trimmed)
+}
+
+fn paths_equal(left: &str, right: &str) -> bool {
+    #[cfg(windows)]
+    {
+        left.eq_ignore_ascii_case(right)
+    }
+    #[cfg(not(windows))]
+    {
+        Path::new(left) == Path::new(right)
+    }
 }
 
 fn expand_home_prefix(raw_path: &str) -> Result<String, String> {
@@ -2013,12 +2204,12 @@ mod conversation_workspace_tests {
             "id": "conv_s", "title": "t", "provider_id": "p", "model": "m",
             "created_at": 1, "updated_at": 1,
             "messages": [
-                {"id": "m1", "role": "user", "content": "帮我看看 Pyodide 沙箱", "timestamp": 1},
+                {"id": "m1", "role": "user", "content": "帮我看看知识库配置", "timestamp": 1},
                 {"id": "m2", "role": "assistant", "content": "好的", "reasoning": "需要检查 WASM 加载", "timestamp": 2}
             ]
         }))
         .expect("conversation");
-        assert!(messages_match(&conv, "pyodide")); // content，大小写不敏感
+        assert!(messages_match(&conv, "知识库")); // content，大小写不敏感
         assert!(messages_match(&conv, "wasm 加载")); // reasoning
         assert!(!messages_match(&conv, "不存在的词"));
     }
@@ -2133,7 +2324,7 @@ mod conversation_workspace_tests {
                 {
                     "id": "m2",
                     "role": "assistant",
-                    "content": "前面一长段铺垫文字用来撑开窗口，然后出现关键词 Pyodide 沙箱，后面继续补上下文。",
+                    "content": "前面一长段铺垫文字用来撑开窗口，然后出现关键词知识库配置，后面继续补上下文。",
                     "reasoning": "需要检查 WASM 加载",
                     "timestamp": 2
                 }
@@ -2142,13 +2333,10 @@ mod conversation_workspace_tests {
         .expect("conversation");
 
         let (field, message_id, snippet) =
-            first_message_match(&conv, "pyodide").expect("content hit");
+            first_message_match(&conv, "知识库").expect("content hit");
         assert_eq!(field, "content");
         assert_eq!(message_id, "m2");
-        assert!(
-            snippet.to_lowercase().contains("pyodide"),
-            "snippet={snippet}"
-        );
+        assert!(snippet.contains("知识库"), "snippet={snippet}");
 
         let (field, message_id, snippet) =
             first_message_match(&conv, "wasm 加载").expect("reasoning hit");
@@ -2299,7 +2487,7 @@ mod builtin_assistant_tests {
     #[test]
     fn builtin_assistants_are_valid_built_in_personas() {
         let defs = builtin_assistant_definitions(1_700_000_000);
-        assert_eq!(defs.len(), 7, "expected exactly 7 built-in assistants");
+        assert_eq!(defs.len(), 13, "expected exactly 13 built-in assistants");
 
         let mut ids: Vec<&str> = defs.iter().map(|d| d.id.as_str()).collect();
         ids.sort();
@@ -2345,11 +2533,17 @@ mod builtin_assistant_tests {
                 "missing skill {skill}"
             );
         }
-        // 新增的三个专家在册，且 id 唯一（数量断言在上一个测试）。
+        // v2/v3 新增的专家在册，且 id 唯一（数量断言在上一个测试）。
         for id in [
             "asst_builtin_frontend",
             "asst_builtin_translator",
             "asst_builtin_docsmith",
+            "asst_builtin_pm",
+            "asst_builtin_legal",
+            "asst_builtin_finance",
+            "asst_builtin_teacher",
+            "asst_builtin_reviewer",
+            "asst_builtin_career",
         ] {
             assert!(defs.iter().any(|d| d.id == id), "missing {id}");
         }
@@ -2361,6 +2555,19 @@ mod builtin_assistant_tests {
                 d.id
             );
         }
+        let legal = defs.iter().find(|d| d.id == "asst_builtin_legal").unwrap();
+        assert!(
+            legal.system_prompt.contains("不是律师"),
+            "legal persona must disclaim it is not a lawyer"
+        );
+        let finance = defs
+            .iter()
+            .find(|d| d.id == "asst_builtin_finance")
+            .unwrap();
+        assert!(
+            finance.system_prompt.contains("不是持牌顾问"),
+            "finance persona must disclaim it is not a licensed advisor"
+        );
     }
 
     #[test]
@@ -2398,9 +2605,10 @@ mod builtin_assistant_tests {
         assert!(w.system_prompt.contains("像具体的人写的"));
         // 新增内置补齐。
         assert!(merged.iter().any(|a| a.id == "asst_builtin_translator"));
-        // 7 内置 + 1 用户，无重复。
-        assert_eq!(merged.len(), 8);
-        assert_eq!(merged.iter().filter(|a| a.built_in).count(), 7);
+        assert!(merged.iter().any(|a| a.id == "asst_builtin_pm"));
+        // 13 内置 + 1 用户，无重复。
+        assert_eq!(merged.len(), 14);
+        assert_eq!(merged.iter().filter(|a| a.built_in).count(), 13);
     }
 
     #[test]
@@ -2641,6 +2849,95 @@ mod delete_side_artifact_tests {
         )
         .is_empty());
 
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn conversation_without_additional_directories_deserializes() {
+        let conversation: crate::chat::types::Conversation =
+            serde_json::from_value(serde_json::json!({
+                "id": "conv_old",
+                "revision": 1,
+                "title": "legacy",
+                "provider_id": "p",
+                "model": "m",
+                "created_at": 1,
+                "updated_at": 1,
+                "messages": []
+            }))
+            .unwrap();
+        assert!(conversation.additional_directories.is_empty());
+    }
+
+    #[test]
+    fn normalize_additional_directories_skips_primary_and_duplicates() {
+        let root = temp_dir();
+        let primary = root.join("primary");
+        let extra = root.join("biz");
+        fs::create_dir_all(&primary).unwrap();
+        fs::create_dir_all(&extra).unwrap();
+        let primary_s =
+            crate::utils::strip_windows_verbatim_prefix(fs::canonicalize(&primary).unwrap())
+                .to_string_lossy()
+                .to_string();
+        let extra_s =
+            crate::utils::strip_windows_verbatim_prefix(fs::canonicalize(&extra).unwrap())
+                .to_string_lossy()
+                .to_string();
+
+        let out = normalize_additional_directories(
+            vec![
+                AdditionalDirectory {
+                    path: extra_s.clone(),
+                    name: Some("biz".to_string()),
+                },
+                AdditionalDirectory {
+                    path: primary_s.clone(),
+                    name: None,
+                },
+                AdditionalDirectory {
+                    path: extra_s.clone(),
+                    name: Some("dup".to_string()),
+                },
+            ],
+            Some(&primary_s),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].path, extra_s);
+        assert_eq!(out[0].name.as_deref(), Some("biz"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn normalize_additional_directories_errors_on_missing_path() {
+        let missing = std::env::temp_dir().join("kivio-additional-dir-does-not-exist-xyz");
+        let err = normalize_additional_directories(
+            vec![AdditionalDirectory {
+                path: missing.to_string_lossy().to_string(),
+                name: None,
+            }],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("不存在"), "{err}");
+    }
+
+    #[test]
+    fn normalize_additional_directories_caps_at_eight() {
+        let root = temp_dir();
+        let entries: Vec<_> = (0..9)
+            .map(|i| {
+                let dir = root.join(format!("d{i}"));
+                fs::create_dir_all(&dir).unwrap();
+                AdditionalDirectory {
+                    path: dir.to_string_lossy().to_string(),
+                    name: None,
+                }
+            })
+            .collect();
+        let err = normalize_additional_directories(entries, None).unwrap_err();
+        assert!(err.contains("8"), "{err}");
         let _ = fs::remove_dir_all(&root);
     }
 }

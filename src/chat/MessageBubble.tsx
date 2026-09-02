@@ -1,29 +1,15 @@
-import { memo, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import {
   AlertCircle,
-  Bot,
-  Brain,
   Check,
+  ChevronRight,
   Copy,
   CornerDownRight,
-  FileCode2,
-  FilePen,
-  FileSearch,
-  FileText,
-  FolderInput,
-  FolderOpen,
-  Globe,
   GitBranch,
-  ImagePlus,
   ListChecks,
   Play,
-  Plug,
   RotateCcw,
-  ScrollText,
-  Search,
-  SquareTerminal,
 } from 'lucide-react'
-import type { LucideIcon } from 'lucide-react'
 import { Button, IconButton } from '../components/Button'
 import { copyToClipboard } from '../utils/clipboard'
 import { AssistantMessageMeta } from './AssistantMessageMeta'
@@ -38,15 +24,31 @@ import { isExecutableAgentPlanText } from './agentPlan'
 import { artifactDataUrl, isImageArtifact } from './artifacts'
 import { loadArtifactDataUrl } from './attachmentPreview'
 import { openChatImageViewer } from './imageViewer'
-import { ChatInlineImage } from './ChatInlineImage'
+import { ChatInlineImage, CHAT_IMAGE_TILE_MAX_PX } from './ChatInlineImage'
 import { ReasoningBlock } from './ReasoningBlock'
 import { ModelIcon } from './ModelIcon'
-import { ToolCallBlock } from './ToolCallBlock'
+import { ToolCallBlock, ImageReadCluster } from './ToolCallBlock'
 import { ToolCallErrorBoundary } from './ToolCallErrorBoundary'
-import type { AgentPlanState, ChatMessage, ChatMessageSegment, ChatToolArtifact, ToolCallRecord } from './types'
-import { knowledgeSearchHits, type KbHitView } from './knowledgeBaseHits'
-import { compareTimelineSegments, groupTimelineSegments, isStandaloneToolCard, isUserSteerToolCall, segmentToolCallId, summarizeToolGroup, toolRecordId, userSteerText } from './segments'
-import type { TimelineGroupItem, ToolGroupIcon } from './segments'
+import type { AgentPlanState, ChatMessage, ChatMessageSegment, ChatToolArtifact, ModelRef, ToolCallRecord } from './types'
+import { buildCitationMap, type CitationView } from './citations'
+import {
+  compareTimelineSegments,
+  clusterToolCallsForDisplay,
+  formatWorkDuration,
+  groupTimelineSegments,
+  groupWorkDurationMs,
+  isImageReadToolCall,
+  isProcessCommentaryText,
+  isStandaloneToolCard,
+  isUserFollowUpToolCall,
+  isUserSteerToolCall,
+  segmentToolCallId,
+  summarizeToolGroup,
+  toolRecordId,
+  userFollowUpText,
+  userSteerText,
+} from './segments'
+import type { TimelineGroupItem } from './segments'
 
 const DIRECT_IMAGE_GENERATION_PENDING = '[[KIVIO_DIRECT_IMAGE_GENERATION_PENDING]]'
 
@@ -68,6 +70,8 @@ interface MessageBubbleProps {
   sentModels?: { providerId: string | null; model: string | null }[]
   onUpdateMessage?: (messageId: string, content: string) => Promise<void>
   onRegenerateMessage?: (messageId: string, newContent?: string) => Promise<void>
+  onReplyWithModel?: (messageId: string, providerId: string, model: string) => Promise<void>
+  replyOccupiedModels?: ModelRef[]
   onForkMessage?: (messageId: string) => Promise<void>
   /** 一键 rewind：截掉这条提问及其之后的消息，原文回输入框（仅 user 气泡）。 */
   onRewindMessage?: (messageId: string) => Promise<void>
@@ -171,7 +175,7 @@ function ArtifactImage({
       conversationId,
     })
   return (
-    <figure className="m-0">
+    <figure className="m-0 min-w-0 max-w-full shrink-0">
       <ChatInlineImage
         src={src}
         alt={label || name}
@@ -179,7 +183,10 @@ function ArtifactImage({
         onOpenViewer={openViewer}
       />
       {label ? (
-        <figcaption className="mt-1 text-[11px] text-neutral-400 dark:text-neutral-500">
+        <figcaption
+          className="mt-1 truncate text-[11px] text-neutral-400 dark:text-neutral-500"
+          style={{ maxWidth: CHAT_IMAGE_TILE_MAX_PX }}
+        >
           {label}
         </figcaption>
       ) : null}
@@ -206,6 +213,7 @@ function selectGalleryImageArtifacts(
   // 找最后一个产生图片的 round，只展示该轮（通常是最终 screenshot 验收）
   let lastImageRound: number | null = null
   for (const tc of toolCalls) {
+    if (isImageReadToolCall(tc)) continue
     const hasImg = (tc.artifacts ?? []).some(isImageArtifact)
     if (!hasImg) continue
     const r = tc.round ?? 0
@@ -215,6 +223,7 @@ function selectGalleryImageArtifacts(
 
   const fromLastRound: ChatToolArtifact[] = []
   for (const tc of toolCalls) {
+    if (isImageReadToolCall(tc)) continue
     const r = tc.round ?? 0
     if (r !== lastImageRound) continue
     for (const a of tc.artifacts ?? []) {
@@ -236,7 +245,7 @@ function GeneratedImageArtifacts({
   const total = imageArtifacts.length
 
   return (
-    <div className="mt-3 space-y-3">
+    <div className="mt-3 flex min-w-0 max-w-full flex-wrap content-start gap-2">
       {imageArtifacts.map((artifact, index) => (
         <ArtifactImage
           key={`${artifact.path || artifact.name || 'img'}-${index}`}
@@ -379,7 +388,7 @@ function MissingToolSegment({ toolCallId }: { toolCallId: string }) {
  * 渲染成一条右对齐的小气泡，读起来就是「我在这里插了一句」，与时间线上下文的因果关系对得上。
  */
 function UserSteerSegment({ toolCall }: { toolCall: ToolCallRecord }) {
-  const text = userSteerText(toolCall)
+  const text = isUserFollowUpToolCall(toolCall) ? userFollowUpText(toolCall) : userSteerText(toolCall)
   if (!text.trim()) return null
   return (
     <div className="not-prose flex justify-end">
@@ -392,6 +401,59 @@ function UserSteerSegment({ toolCall }: { toolCall: ToolCallRecord }) {
         <span className="min-w-0 whitespace-pre-wrap break-words">{text}</span>
       </div>
     </div>
+  )
+}
+
+function isUserInjectedToolCall(toolCall: ToolCallRecord): boolean {
+  return isUserSteerToolCall(toolCall) || isUserFollowUpToolCall(toolCall)
+}
+
+function ClusteredToolCalls({
+  toolCalls,
+  artifacts,
+  conversationId,
+  itemClassName,
+}: {
+  toolCalls: ToolCallRecord[]
+  artifacts: ChatToolArtifact[]
+  conversationId?: string | null
+  itemClassName?: string
+}) {
+  return (
+    <>
+      {clusterToolCallsForDisplay(toolCalls).map((item, index) => {
+        if (item.type === 'imageRead') {
+          const key = item.toolCalls.map((toolCall) => toolRecordId(toolCall)).filter(Boolean).join('-')
+            || `image-read-${index}`
+          return (
+            <div key={key} className={itemClassName}>
+              <ToolCallErrorBoundary>
+                <ImageReadCluster toolCalls={item.toolCalls} />
+              </ToolCallErrorBoundary>
+            </div>
+          )
+        }
+        const toolCall = item.toolCall
+        const key = toolRecordId(toolCall) || `tool-${index}`
+        return (
+          <div key={key} className={itemClassName}>
+            {isUserInjectedToolCall(toolCall) ? (
+              <UserSteerSegment toolCall={toolCall} />
+            ) : isArtifactPresentationToolCall(toolCall) ? (
+              <ArtifactPresentationBlock
+                toolCall={toolCall}
+                artifacts={artifacts}
+                conversationId={conversationId}
+              />
+            ) : (
+              <ToolCallErrorBoundary>
+                <ToolCallBlock toolCall={toolCall} />
+              </ToolCallErrorBoundary>
+            )}
+          </div>
+        )
+      })}
+    </>
   )
 }
 
@@ -411,7 +473,7 @@ function TimelineToolSegment({
   if (!toolCall) {
     return <MissingToolSegment toolCallId={toolCallId} />
   }
-  if (isUserSteerToolCall(toolCall)) {
+  if (isUserInjectedToolCall(toolCall)) {
     return <UserSteerSegment toolCall={toolCall} />
   }
   if (isArtifactPresentationToolCall(toolCall)) {
@@ -435,15 +497,17 @@ function TimelineTextSegment({
   artifacts,
   citations,
   conversationId,
+  process = false,
 }: {
   segment: ChatMessageSegment
   artifacts: ChatToolArtifact[]
-  citations?: Map<number, KbHitView>
+  citations?: Map<number, CitationView>
   conversationId?: string | null
+  process?: boolean
 }) {
   const text = segmentText(segment).trim()
   if (!text) return null
-  const isProcessText = segment.phase === 'tool_loop' || segment.phase === 'auxiliary'
+  const isProcessText = process || isProcessCommentaryText(segment)
   return (
     <div className={isProcessText ? 'text-neutral-600 dark:text-neutral-300' : undefined}>
       <ChatMarkdown
@@ -475,7 +539,7 @@ function TimelineSegmentNode({
   segmentCount: number
   toolCallById: ReadonlyMap<string, ToolCallRecord>
   artifacts: ChatToolArtifact[]
-  citations?: Map<number, KbHitView>
+  citations?: Map<number, CitationView>
   conversationId?: string | null
   reasoningStreaming: boolean
   reasoningDurationMs?: number | null
@@ -513,30 +577,8 @@ function TimelineSegmentNode({
       artifacts={artifacts}
       citations={citations}
       conversationId={conversationId}
+      process
     />
-  )
-}
-
-function TimelineStepsIcon({ size = 16, className }: { size?: number; className?: string }) {
-  return (
-    <svg
-      width={size}
-      height={size}
-      viewBox="0 0 16 16"
-      fill="none"
-      stroke="currentColor"
-      strokeWidth={1.8}
-      strokeLinecap="round"
-      strokeLinejoin="round"
-      className={className}
-      aria-hidden="true"
-    >
-      <circle cx="3.5" cy="4" r="1.6" />
-      <circle cx="3.5" cy="12" r="1.6" />
-      <path d="M3.5 5.6v4.8" />
-      <path d="M8 4h5" />
-      <path d="M8 12h3.5" />
-    </svg>
   )
 }
 
@@ -568,43 +610,91 @@ function TimelineSpinner({ size = 16, className }: { size?: number; className?: 
   )
 }
 
-/**
- * 分组头折叠态图标：按摘要代表类别选 lucide 图标，与 ToolCallBlock 的单工具图标观感一致。
- * `other`（通用/混合兜底）保留自绘 TimelineStepsIcon。
- */
-const GROUP_ICON_BY_CATEGORY: Record<
-  ToolGroupIcon,
-  LucideIcon | typeof TimelineStepsIcon
-> = {
-  read: FileText,
-  codeSearch: Search,
-  globFiles: FileSearch,
-  fileWrite: FilePen,
-  runCommand: SquareTerminal,
-  webFetch: Globe,
-  webSearch: Search,
-  runPython: FileCode2,
-  listDir: FolderOpen,
-  fileOps: FolderInput,
-  todo: ListChecks,
-  memory: Brain,
-  subAgent: Bot,
-  skill: ScrollText,
-  image: ImagePlus,
-  notion: Plug,
-  mcp: Plug,
-  reasoning: Brain,
-  other: TimelineStepsIcon,
+function workingGroupTitle(generating: boolean, durationMs: number | null): string {
+  if (generating) return 'Working'
+  if (durationMs != null && durationMs > 0) return `Worked for ${formatWorkDuration(durationMs)}`
+  return 'Worked'
+}
+
+function renderProcessSegments({
+  segments,
+  toolCallById,
+  artifacts,
+  citations,
+  conversationId,
+  messageStreaming,
+  reasoningStreaming,
+  reasoningDurationMs,
+  reasoningDurationMsBySegmentId,
+  reasoningSegmentCount,
+}: {
+  segments: ChatMessageSegment[]
+  toolCallById: ReadonlyMap<string, ToolCallRecord>
+  artifacts: ChatToolArtifact[]
+  citations?: Map<number, CitationView>
+  conversationId?: string | null
+  messageStreaming: boolean
+  reasoningStreaming: boolean
+  reasoningDurationMs?: number | null
+  reasoningDurationMsBySegmentId?: Record<string, number>
+  reasoningSegmentCount: number
+}) {
+  const nodes: ReactNode[] = []
+  const segmentCount = segments.length
+  for (let index = 0; index < segments.length; ) {
+    const segment = segments[index]
+    if (segment.kind === 'tool') {
+      const toolCall = toolCallById.get(segmentToolCallId(segment))
+      if (toolCall && isImageReadToolCall(toolCall)) {
+        const imageReads = [toolCall]
+        let end = index + 1
+        while (end < segments.length) {
+          const next = segments[end]
+          if (next.kind !== 'tool') break
+          const nextCall = toolCallById.get(segmentToolCallId(next))
+          if (!nextCall || !isImageReadToolCall(nextCall)) break
+          imageReads.push(nextCall)
+          end += 1
+        }
+        nodes.push(
+          <div key={segment.id} className={messageStreaming ? 'chat-motion-fade' : undefined}>
+            <ToolCallErrorBoundary>
+              <ImageReadCluster toolCalls={imageReads} />
+            </ToolCallErrorBoundary>
+          </div>,
+        )
+        index = end
+        continue
+      }
+    }
+    nodes.push(
+      <div key={segment.id} className={messageStreaming ? 'chat-motion-fade' : undefined}>
+        <TimelineSegmentNode
+          segment={segment}
+          index={index}
+          segmentCount={segmentCount}
+          toolCallById={toolCallById}
+          artifacts={artifacts}
+          citations={citations}
+          conversationId={conversationId}
+          reasoningStreaming={reasoningStreaming}
+          reasoningDurationMs={reasoningDurationMs}
+          reasoningDurationMsBySegmentId={reasoningDurationMsBySegmentId}
+          reasoningSegmentCount={reasoningSegmentCount}
+        />
+      </div>,
+    )
+    index += 1
+  }
+  return nodes
 }
 
 /**
- * 一组「连续的 thinking + tool 段」= 单一可折叠单元。
- * - 「生成中」= 这条消息还在流式生成、且这是末组（messageStreaming && isLastGroup）：
- *   始终保持展开，不受工具间隙/reasoning 是否在流影响，避免抖动。
- * - 后面出现正文/别的块（非末组）或消息流式结束（含历史消息）→ 折叠成一行摘要。
- * - 用户手动点过开关后以用户操作为准（userToggledRef，参考 ReasoningBlock）。
- * - 历史折叠态只保留摘要 header，不挂载组内 ReasoningBlock / ToolCallBlock；
- *   展开后再原样平铺，避免重历史消息默认挂满工具/Markdown/Diff 子树。
+ * 一轮过程 = 一个 Codex 式 Working 壳。
+ * - 「生成中」= 这条消息还在流式、且这是末组：始终展开，避免抖动。
+ * - 后面出现终稿/standalone（非末组）或流式结束 → 收成一行 Worked for Xs。
+ * - 用户手动点过开关后以用户操作为准（userToggledRef）。
+ * - 折叠态只留 header，不挂组内 ReasoningBlock / ToolCallBlock / 过程旁白。
  */
 function TimelineGroupBlock({
   segments,
@@ -624,7 +714,7 @@ function TimelineGroupBlock({
   toolCalls: ToolCallRecord[]
   toolCallById: ReadonlyMap<string, ToolCallRecord>
   artifacts: ChatToolArtifact[]
-  citations?: Map<number, KbHitView>
+  citations?: Map<number, CitationView>
   conversationId?: string | null
   isLastGroup: boolean
   messageStreaming: boolean
@@ -638,7 +728,11 @@ function TimelineGroupBlock({
     () => summarizeToolGroup(segments, toolCalls, toolCallById),
     [segments, toolCalls, toolCallById],
   )
-  const SummaryIcon = GROUP_ICON_BY_CATEGORY[summary.icon]
+  const durationMs = useMemo(
+    () => groupWorkDurationMs(segments, toolCalls, toolCallById, reasoningDurationMs),
+    [segments, toolCalls, toolCallById, reasoningDurationMs],
+  )
+  const title = workingGroupTitle(generating, durationMs)
   const [open, setOpen] = useState(generating)
   const userToggledRef = useRef(false)
 
@@ -670,7 +764,13 @@ function TimelineGroupBlock({
         {generating ? (
           <TimelineSpinner size={16} className="shrink-0 text-neutral-400 dark:text-neutral-500" />
         ) : (
-          <SummaryIcon size={16} className="shrink-0" />
+          <ChevronRight
+            size={14}
+            strokeWidth={2}
+            className={`shrink-0 transition-transform duration-[var(--kv-dur-fast)] ease-[var(--kv-ease-out)] ${
+              renderDetails ? 'rotate-90' : ''
+            }`}
+          />
         )}
         <div className="flex min-w-0 items-center gap-1.5">
           <span
@@ -678,20 +778,12 @@ function TimelineGroupBlock({
               generating ? 'chat-motion-tool-shimmer' : ''
             }`}
           >
-            {summary.text}
+            {title}
           </span>
           {summary.diffStats && (
             <span className="shrink-0 font-mono text-[11px] tabular-nums">
               <span className="text-emerald-600 dark:text-emerald-400">+{summary.diffStats.additions}</span>
               <span className="ml-1 text-red-500/80 dark:text-red-400/80">-{summary.diffStats.removals}</span>
-            </span>
-          )}
-          {summary.categories.length > 1 && (
-            <span className="flex shrink-0 items-center gap-1" aria-hidden="true">
-              {summary.categories.map((category) => {
-                const CategoryIcon = GROUP_ICON_BY_CATEGORY[category]
-                return <CategoryIcon key={category} size={14} />
-              })}
             </span>
           )}
         </div>
@@ -702,40 +794,23 @@ function TimelineGroupBlock({
             {/* 段级淡入只在流式中播：历史消息被虚拟列表反复卸载/重挂载，无条件的
                 `both` fill 动画会让回翻时每个重进 DOM 的段落整批重播淡入——外层气泡
                 入场早已为此 gate（playEntranceAnimation），内层段落同理。 */}
-            {segments.map((segment, index) => (
-              <div key={segment.id} className={messageStreaming ? 'chat-motion-fade' : undefined}>
-                <TimelineSegmentNode
-                  segment={segment}
-                  index={index}
-                  segmentCount={segments.length}
-                  toolCallById={toolCallById}
-                  artifacts={artifacts}
-                  citations={citations}
-                  conversationId={conversationId}
-                  reasoningStreaming={reasoningStreaming && isLastGroup}
-                  reasoningDurationMs={reasoningDurationMs}
-                  reasoningDurationMsBySegmentId={reasoningDurationMsBySegmentId}
-                  reasoningSegmentCount={reasoningSegmentCount}
-                />
-              </div>
-            ))}
+            {renderProcessSegments({
+              segments,
+              toolCallById,
+              artifacts,
+              citations,
+              conversationId,
+              messageStreaming,
+              reasoningStreaming: reasoningStreaming && isLastGroup,
+              reasoningDurationMs,
+              reasoningDurationMsBySegmentId,
+              reasoningSegmentCount,
+            })}
           </div>
         </div>
       )}
     </section>
   )
-}
-
-/** 汇总本条消息所有 knowledge_search 命中，按 n 建索引，供答案里的 `[n]` 角标查源。
- *  多次检索 n 会重叠 —— 后写覆盖（罕见，且只影响弹窗预览内容）。 */
-function buildCitationMap(toolCalls: ToolCallRecord[]): Map<number, KbHitView> {
-  const map = new Map<number, KbHitView>()
-  for (const toolCall of toolCalls) {
-    for (const hit of knowledgeSearchHits(toolCall) ?? []) {
-      map.set(hit.n, hit)
-    }
-  }
-  return map
 }
 
 function TimelineSegments({
@@ -824,7 +899,7 @@ function TimelineSegments({
           if (!toolCall) return null
           return (
             <div key={item.segment.id} className={messageStreaming ? 'chat-motion-fade' : undefined}>
-              {isUserSteerToolCall(toolCall) ? (
+              {isUserInjectedToolCall(toolCall) ? (
                 <UserSteerSegment toolCall={toolCall} />
               ) : isArtifactPresentationToolCall(toolCall) ? (
                 <ArtifactPresentationBlock
@@ -860,23 +935,12 @@ function TimelineSegments({
           </div>
         )
       })}
-      {orphanTools.map((toolCall, index) => (
-        <div key={toolRecordId(toolCall) || `orphan-tool-${index}`} className={messageStreaming ? 'chat-motion-fade' : undefined}>
-          {isUserSteerToolCall(toolCall) ? (
-            <UserSteerSegment toolCall={toolCall} />
-          ) : isArtifactPresentationToolCall(toolCall) ? (
-            <ArtifactPresentationBlock
-              toolCall={toolCall}
-              artifacts={artifacts}
-              conversationId={conversationId}
-            />
-          ) : (
-            <ToolCallErrorBoundary>
-              <ToolCallBlock toolCall={toolCall} />
-            </ToolCallErrorBoundary>
-          )}
-        </div>
-      ))}
+      <ClusteredToolCalls
+        toolCalls={orphanTools}
+        artifacts={artifacts}
+        conversationId={conversationId}
+        itemClassName={messageStreaming ? 'chat-motion-fade' : undefined}
+      />
     </section>
   )
 }
@@ -892,6 +956,8 @@ function MessageBubbleComponent({
   sentModels,
   onUpdateMessage,
   onRegenerateMessage,
+  onReplyWithModel,
+  replyOccupiedModels,
   onForkMessage,
   onRewindMessage,
   onDeleteMessage,
@@ -903,9 +969,9 @@ function MessageBubbleComponent({
   // 历史消息会被虚拟列表反复卸载/挂载；只让真正的流式预览播放进入动画，
   // 否则滚动时每个重新进入 DOM 的旧气泡都会淡入并上移，看起来像刷新且阻滞滚动。
   const playEntranceAnimation = messageStreaming
-  // 「这条可以改动吗」：门控重新生成 / 删除。`onUpdateMessage` 保留在判据里不是残留——
-  // MessageGroup 的**在飞列**正是靠不传它来一次关掉这些入口（见那里的 `!live ? … : undefined`），
-  // 去掉它会让还在生成的那一列冒出删除键。（编辑入口已按需求移除，改写消息不再有 UI。）
+  // 「这条是否已落盘并允许历史操作」：门控重新生成。`onUpdateMessage` / `onDeleteMessage`
+  // 在这里作为完整可变能力信号；MessageGroup 的在飞列不传它们，从而一次关掉这些入口。
+  // 编辑与删除入口已按需求移除，但底层能力仍保留。
   const canMutate = Boolean(onUpdateMessage && onDeleteMessage && onRegenerateMessage)
   const prepared = useMemo(() => {
     const attachments = message.attachments ?? []
@@ -1123,29 +1189,6 @@ function MessageBubbleComponent({
     )
   }
 
-  const renderToolCall = (toolCall: ToolCallRecord, index: number) => {
-    const key = toolCall.id || toolCall.call_id || toolCall.callId || index
-    // 无时间线段的旧路径：插话卡照样不能退化成一张写着 user_steer 的工具卡。
-    if (isUserSteerToolCall(toolCall)) {
-      return <UserSteerSegment key={key} toolCall={toolCall} />
-    }
-    if (isArtifactPresentationToolCall(toolCall)) {
-      return (
-        <ArtifactPresentationBlock
-          key={key}
-          toolCall={toolCall}
-          artifacts={renderArtifacts}
-          conversationId={conversationId}
-        />
-      )
-    }
-    return (
-      <ToolCallErrorBoundary key={key}>
-        <ToolCallBlock toolCall={toolCall} />
-      </ToolCallErrorBoundary>
-    )
-  }
-
   return (
     <MarkdownStreamingContext.Provider value={messageStreaming}>
     <div
@@ -1177,10 +1220,20 @@ function MessageBubbleComponent({
             )}
             {toolsCollapsible && toolsExpanded && (
               <div className="chat-motion-reveal is-open">
-                <div>{toolCalls.map((toolCall, index) => renderToolCall(toolCall, index))}</div>
+                <ClusteredToolCalls
+                  toolCalls={toolCalls}
+                  artifacts={renderArtifacts}
+                  conversationId={conversationId}
+                />
               </div>
             )}
-            {!toolsCollapsible && toolCalls.map((toolCall, index) => renderToolCall(toolCall, index))}
+            {!toolsCollapsible && (
+              <ClusteredToolCalls
+                toolCalls={toolCalls}
+                artifacts={renderArtifacts}
+                conversationId={conversationId}
+              />
+            )}
           </section>
         )}
 
@@ -1269,17 +1322,18 @@ function MessageBubbleComponent({
                   }
                 : undefined
             }
+            onReplyWithModel={
+              onReplyWithModel
+                ? (providerId, model) => {
+                    void onReplyWithModel(message.id, providerId, model)
+                  }
+                : undefined
+            }
+            replyOccupiedModels={replyOccupiedModels}
             onFork={
               onForkMessage
                 ? () => {
                     void onForkMessage(message.id)
-                  }
-                : undefined
-            }
-            onDelete={
-              canMutate
-                ? () => {
-                    void onDeleteMessage!(message.id)
                   }
                 : undefined
             }

@@ -1,9 +1,60 @@
+use std::path::PathBuf;
+
+/// Strip the Windows `\\?\` / `\\?\UNC\` prefix that `fs::canonicalize` adds.
+///
+/// Rust file APIs accept verbatim paths. Node (`dsh`, other CLIs) does not:
+/// `fs.realpath('\\?\E:\foo')` throws `EISDIR ... lstat 'E:'`, so Host Workspace
+/// attach fails and the session never joins the folder the user opened in Kivio.
+pub fn strip_windows_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        const VERBATIM_UNC: &str = r"\\?\UNC\";
+        const VERBATIM: &str = r"\\?\";
+        let raw = path.to_string_lossy();
+        if let Some(rest) = raw.strip_prefix(VERBATIM_UNC) {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = raw.strip_prefix(VERBATIM) {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
 /// 判断 provider 是否支持 `thinking` 字段。
 /// 目前只有 DeepSeek 官方 API 和 Kimi 支持该字段；
 /// 第三方代理（OpenRouter / 反代）做严格校验时会以 400 拒绝整个请求。
 pub fn provider_supports_thinking_field(base_url: &str) -> bool {
     let lower = base_url.to_ascii_lowercase();
     lower.contains("deepseek.com") || lower.contains("moonshot.cn")
+}
+
+/// 是否官方 DeepSeek API 主机（`api.deepseek.com`）。
+/// 中转 / 文档站不算：hosted `web_search` 只在这条线上可靠。
+pub fn is_official_deepseek_api(base_url: &str) -> bool {
+    let lower = base_url.trim().to_ascii_lowercase();
+    let host = lower
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(lower.as_str());
+    let host = host.split('/').next().unwrap_or(host);
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    host == "api.deepseek.com"
+}
+
+/// 官方 DeepSeek 的 Anthropic / Claude 协议端点（`https://api.deepseek.com/anthropic`）。
+pub fn is_official_deepseek_anthropic_api(base_url: &str) -> bool {
+    if !is_official_deepseek_api(base_url) {
+        return false;
+    }
+    let lower = base_url.trim().to_ascii_lowercase();
+    let rest = lower
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(lower.as_str());
+    let path = rest.split_once('/').map(|(_, path)| path).unwrap_or("");
+    path == "anthropic" || path.starts_with("anthropic/")
 }
 
 /**
@@ -44,5 +95,67 @@ pub fn language_name(code: &str) -> &'static str {
         "fr" => "French",
         "de" => "German",
         _ => "English",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        is_official_deepseek_anthropic_api, is_official_deepseek_api, strip_windows_verbatim_prefix,
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn official_deepseek_api_matches_host_only() {
+        assert!(is_official_deepseek_api("https://api.deepseek.com"));
+        assert!(is_official_deepseek_api("https://api.deepseek.com/v1"));
+        assert!(is_official_deepseek_api(
+            "https://api.deepseek.com/anthropic"
+        ));
+        assert!(!is_official_deepseek_api("https://docs.deepseek.com"));
+        assert!(!is_official_deepseek_api(
+            "https://relay.example/deepseek.com/v1"
+        ));
+        assert!(!is_official_deepseek_api("https://api.openai.com/v1"));
+    }
+
+    #[test]
+    fn official_deepseek_anthropic_api_matches_path() {
+        assert!(is_official_deepseek_anthropic_api(
+            "https://api.deepseek.com/anthropic"
+        ));
+        assert!(is_official_deepseek_anthropic_api(
+            "https://api.deepseek.com/anthropic/v1"
+        ));
+        assert!(!is_official_deepseek_anthropic_api(
+            "https://api.deepseek.com/v1"
+        ));
+        assert!(!is_official_deepseek_anthropic_api(
+            "https://api.anthropic.com"
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn strip_windows_verbatim_prefix_unwraps_drive_and_unc() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(PathBuf::from(r"\\?\E:\ZM database\kivioC")),
+            PathBuf::from(r"E:\ZM database\kivioC")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(PathBuf::from(r"\\?\UNC\server\share\dir")),
+            PathBuf::from(r"\\server\share\dir")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(PathBuf::from(r"E:\already\normal")),
+            PathBuf::from(r"E:\already\normal")
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn strip_windows_verbatim_prefix_is_a_noop_off_windows() {
+        let path = PathBuf::from(r"\\?\E:\ZM database\kivioC");
+        assert_eq!(strip_windows_verbatim_prefix(path.clone()), path);
     }
 }

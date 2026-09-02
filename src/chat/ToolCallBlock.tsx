@@ -4,11 +4,12 @@ import {
   Bot,
   Brain,
   CheckCircle2,
+  ChevronDown,
   CircleSlash,
   Copy,
   Download,
+  ExternalLink,
   Eye,
-  FileCode2,
   FilePen,
   FilePlus2,
   FileSearch,
@@ -16,6 +17,7 @@ import {
   FolderInput,
   FolderOpen,
   FolderPlus,
+  ImageOff,
   ImagePlus,
   ListChecks,
   Loader2,
@@ -26,6 +28,7 @@ import {
   Search,
   SquareTerminal,
   Trash2,
+  Workflow,
   Wrench,
   XCircle,
 } from 'lucide-react'
@@ -34,13 +37,20 @@ import type { AgentTodoItem, AgentTodoState, AgentTodoStatus, ToolCallRecord, To
 import { normalizeToolCallStatus } from './toolStatus'
 import { formatToolResultPreview } from './toolResultPreview'
 import { hasAskUserStructuredContent, isAskUserToolName } from './askUserTools'
-import { canonicalToolName, isExternalSubagentToolCall, toolCallDiffStats, toolRecordRawName } from './segments'
+import { canonicalToolName, isExternalSubagentToolCall, isImageReadToolCall, imageReadCount, imageReadItems, toolCallDiffStats, toolRecordRawName } from './segments'
 import { requestDockDiffPreview, requestDockPreview } from './dock/dockPreview'
 import { DiffView } from './dock/DiffView'
 import { knowledgeSearchHits, type KbHitView } from './knowledgeBaseHits'
+import { webSearchCardView, type WebCitationView } from './webSearchCitations'
 import { AskUserBlock } from './AskUserBlock'
 import { ChatMarkdown } from './ChatMarkdown'
 import { WebSearchIcon } from '../settings/NavIcons'
+import { api } from '../api/tauri'
+import { useT } from '../settings/i18n'
+import { setHash } from './chatRoutes'
+import { loadAttachmentDataUrl } from './attachmentPreview'
+import { openChatImageViewer } from './imageViewer'
+import type { ImageReadItem } from './segments'
 
 export interface ToolCallBlockProps {
   toolCall: ToolCallRecord
@@ -106,6 +116,12 @@ function parsedArguments(toolCall: ToolCallRecord): Record<string, unknown> | nu
   }
 }
 
+function isKivioToolDraft(toolCall: ToolCallRecord): boolean {
+  const args = parsedArguments(toolCall)
+  if (args?._kivioToolDraft === true) return true
+  return Boolean(objectValue(objectValue(toolCall.structured_content ?? toolCall.structuredContent)?.toolDraft))
+}
+
 /** 展示映射用的规范工具名（别名表在 `canonicalToolName`）。
  *
  *  **只用于 switch 匹配，不要拿它当显示文案**：MCP 工具名（`mcp__server__toolName`）的
@@ -167,8 +183,6 @@ function toolGlyph(toolCall: ToolCallRecord): LucideIcon | ComponentType<{ size?
     case 'stat':
     case 'stat_path':
       return FileSearch
-    case 'run_python':
-      return FileCode2
     case 'web_search':
       return WebSearchIcon
     case 'web_fetch':
@@ -196,6 +210,14 @@ function toolGlyph(toolCall: ToolCallRecord): LucideIcon | ComponentType<{ size?
       return Bot
     case 'ask_user':
       return MessageCircleQuestion
+    case 'automation_run':
+    case 'automation_list':
+    case 'automation_get':
+    case 'automation_upsert':
+    case 'automation_set_enabled':
+    case 'automation_runs':
+    case 'automation_delete':
+      return Workflow
     default:
       break
   }
@@ -396,8 +418,9 @@ function subagentPrompt(args: Record<string, unknown> | null): string {
 /** dsh 后台子代理的 tool/result 只是派出回执，不是跑完。 */
 function isSubagentLaunchReceipt(text: string | undefined): boolean {
   const trimmed = text?.trim() ?? ''
-  return trimmed.startsWith('started subagent ')
+  return trimmed.startsWith('started background subagent job ')
     || trimmed.startsWith('started background subagent task ')
+    || trimmed.startsWith('started subagent ')
 }
 
 function subagentDisplayStatus(toolCall: ToolCallRecord, status: ToolCallStatus): ToolCallStatus {
@@ -477,6 +500,7 @@ function ConsultCard({
   identityChips,
   metricChips,
   statusLine,
+  defaultOpen = false,
   children,
 }: {
   label: string
@@ -484,9 +508,10 @@ function ConsultCard({
   identityChips?: ReactNode
   metricChips?: ReactNode
   statusLine?: string
+  defaultOpen?: boolean
   children?: ReactNode
 }) {
-  const [open, setOpen] = useState(false)
+  const [open, setOpen] = useState(defaultOpen)
   const hasBody = Boolean(children)
   const running = status === 'running'
   return (
@@ -691,6 +716,193 @@ function AdvisorCard({ toolCall }: ToolCallBlockProps) {
   )
 }
 
+interface AutomationRunNodeView {
+  nodeId: string
+  nodeType: string
+  status: string
+  output?: string
+  error?: string
+}
+
+function structuredAutomationRun(toolCall: ToolCallRecord): {
+  automationId: string
+  runId: string
+  name: string
+  status?: string
+  nodes: AutomationRunNodeView[]
+} | null {
+  const structured = objectValue(toolCall.structured_content ?? toolCall.structuredContent)
+  if (!structured || structured.type !== 'automation_run') return null
+  const nodes = Array.isArray(structured.nodes)
+    ? structured.nodes.flatMap((item) => {
+        const node = objectValue(item)
+        if (!node) return []
+        const nodeId = stringValue(node.nodeId ?? node.node_id)
+        if (!nodeId) return []
+        return [{
+          nodeId,
+          nodeType: stringValue(node.nodeType ?? node.node_type),
+          status: stringValue(node.status) || 'running',
+          output: stringValue(node.output) || undefined,
+          error: stringValue(node.error) || undefined,
+        }]
+      })
+    : []
+  return {
+    automationId: stringValue(structured.automationId ?? structured.automation_id),
+    runId: stringValue(structured.runId ?? structured.run_id),
+    name: stringValue(structured.name),
+    status: stringValue(structured.status) || undefined,
+    nodes,
+  }
+}
+
+function isAutomationRunRecord(toolCall: ToolCallRecord): boolean {
+  if (structuredAutomationRun(toolCall)) return true
+  return toolRawName(toolCall) === 'automation_run'
+}
+
+function AutomationRunCard({ toolCall }: ToolCallBlockProps) {
+  const t = useT()
+  const status = normalizeToolCallStatus(toolCall.status)
+  const view = useMemo(() => structuredAutomationRun(toolCall), [toolCall])
+  const args = useMemo(() => parsedArguments(toolCall), [toolCall])
+  const automationId = view?.automationId || stringValue(args?.id)
+  const name = view?.name || stringValue(args?.name)
+  const [liveNodes, setLiveNodes] = useState<AutomationRunNodeView[]>(view?.nodes ?? [])
+  const [liveStep, setLiveStep] = useState('')
+
+  useEffect(() => {
+    if (view?.nodes?.length) setLiveNodes(view.nodes)
+  }, [view])
+
+  useEffect(() => {
+    if (!automationId) return
+    const pinnedRunId = view?.runId ?? ''
+    const followLive = status === 'running' || Boolean(pinnedRunId)
+    if (!followLive) return
+    let cancelled = false
+    let lockedId = pinnedRunId
+    let unlisten: (() => void) | undefined
+    void api.onAutomationRun((event) => {
+      if (event.automationId !== automationId) return
+      if (lockedId && event.runId !== lockedId) return
+      if (!lockedId && event.runId) lockedId = event.runId
+      if (event.kind === 'node_started' && event.nodeId) {
+        setLiveStep(event.nodeId)
+        setLiveNodes((current) => upsertLiveNode(current, event.nodeId!, 'running'))
+      }
+      if (event.kind === 'node_finished' && event.nodeId) {
+        setLiveNodes((current) => upsertLiveNode(
+          current,
+          event.nodeId!,
+          event.status || 'success',
+          event.output,
+          event.error,
+        ))
+      }
+      if (event.kind === 'run_finished') {
+        setLiveStep('')
+      }
+    }).then((fn) => {
+      if (cancelled) fn()
+      else unlisten = fn
+    }).catch(() => {})
+    return () => {
+      cancelled = true
+      unlisten?.()
+    }
+  }, [automationId, view?.runId, status])
+
+  const nodes = liveNodes.length ? liveNodes : (view?.nodes ?? [])
+  const current = nodes.find((node) => node.status === 'running')
+  const runningLabel = current
+    ? `${t.chatAutomationExecuting}: ${current.nodeType || current.nodeId}`
+    : liveStep
+      ? `${t.chatAutomationExecuting}: ${liveStep}`
+      : `${t.chatAutomationStatusRunning}…`
+  const statusLine = status === 'running'
+    ? runningLabel
+    : status === 'error'
+      ? (toolCall.error ? compactToolError(toolCall.error) : t.chatAutomationStatusError)
+      : status === 'cancelled'
+        ? t.chatAutomationCancelled
+        : ''
+  const error = toolCall.error ? compactToolError(toolCall.error) : ''
+  const result = status !== 'running' && status !== 'pending' ? getResultPreview(toolCall) : ''
+
+  return (
+    <ConsultCard
+      label="AUTOMATION"
+      status={status}
+      defaultOpen={status === 'running' || nodes.length > 0}
+      identityChips={
+        <>
+          {name ? <CardChip>{name}</CardChip> : null}
+          {automationId && !name ? <CardChip>{compactText(automationId, 18)}</CardChip> : null}
+        </>
+      }
+      statusLine={statusLine}
+    >
+      {nodes.length > 0 && (
+        <div className="space-y-0.5 font-mono text-[10.5px] text-neutral-500 dark:text-neutral-400">
+          {nodes.map((node) => (
+            <div key={node.nodeId} className="flex min-w-0 items-center gap-1.5">
+              <span className="shrink-0">
+                {node.status === 'success' ? '✓' : node.status === 'error' ? '✗' : node.status === 'running' ? '…' : '·'}
+              </span>
+              <span className="min-w-0 truncate">{node.nodeType || node.nodeId}</span>
+            </div>
+          ))}
+        </div>
+      )}
+      {status !== 'running' && result && (
+        <CardSection label="Result">
+          <div className="whitespace-pre-wrap break-words text-neutral-500 dark:text-neutral-400">
+            {compactText(result, 800)}
+          </div>
+        </CardSection>
+      )}
+      {error && status !== 'running' && (
+        <div className="whitespace-pre-wrap break-words text-neutral-500 dark:text-neutral-400">
+          {error}
+        </div>
+      )}
+      {automationId ? (
+        <button
+          type="button"
+          className="text-[12px] text-neutral-600 underline-offset-2 hover:underline dark:text-neutral-300"
+          data-tauri-drag-region="false"
+          onClick={() => setHash(`#chat/automations/${encodeURIComponent(automationId)}`)}
+        >
+          {t.chatAutomationOpenWorkflow}
+        </button>
+      ) : null}
+    </ConsultCard>
+  )
+}
+
+function upsertLiveNode(
+  nodes: AutomationRunNodeView[],
+  nodeId: string,
+  status: string,
+  output?: string | null,
+  error?: string | null,
+): AutomationRunNodeView[] {
+  const next = nodes.map((node) => (
+    node.nodeId === nodeId
+      ? {
+          ...node,
+          status,
+          output: output ?? node.output,
+          error: error ?? node.error,
+        }
+      : node
+  ))
+  if (next.some((node) => node.nodeId === nodeId)) return next
+  return [...next, { nodeId, nodeType: nodeId, status, output: output ?? undefined, error: error ?? undefined }]
+}
+
 function normalizeFileMutationFile(value: unknown): FileMutationFile | null {
   const file = objectValue(value)
   if (!file) return null
@@ -800,53 +1012,114 @@ function KnowledgeCard({ toolCall }: ToolCallBlockProps) {
   )
 }
 
-function isPythonRecord(toolCall: ToolCallRecord): boolean {
-  return toolCall.source === 'native' && toolRawName(toolCall) === 'run_python'
+function isWebSearchRecord(toolCall: ToolCallRecord): boolean {
+  const name = toolRawName(toolCall)
+  return name === 'web_search' || name === 'search_web'
 }
 
-/** Dedicated card for `run_python`: same consult-card shell as SUBAGENT/ADVISOR.
- *  Body shows the executed code and stdout/stderr. Generated files/images are
- *  rendered separately at the message level (GeneratedImageArtifacts /
- *  GeneratedFileArtifacts), so here they only surface as a count chip. */
-function PythonCard({ toolCall }: ToolCallBlockProps) {
+/** 联网搜索来源目录：编号 + 可点标题（浏览器打开）+ 域名/日期 + 摘要。
+ *  行样式对齐 Lens 的 WebSearchBlock，编号与答案正文 `[n]` 角标一致。 */
+function WebSources({ citations }: { citations: WebCitationView[] }) {
+  return (
+    <div className="space-y-0.5">
+      {citations.map((citation) => (
+        <button
+          key={`${citation.n}-${citation.url}`}
+          type="button"
+          onClick={() => {
+            void api.openExternal(citation.url).catch((err) => console.error('openExternal failed', err))
+          }}
+          className="group block w-full min-w-0 rounded-md px-1.5 py-1 text-left transition-colors hover:bg-black/[0.03] dark:hover:bg-white/[0.04]"
+          title={citation.url}
+        >
+          <div className="flex items-center gap-1.5 min-w-0">
+            <span className="shrink-0 w-4 text-[10.5px] font-medium tabular-nums text-indigo-500">
+              [{citation.n}]
+            </span>
+            <span className="min-w-0 flex-1 truncate text-[12px] font-medium text-neutral-700 dark:text-neutral-200">
+              {citation.title}
+            </span>
+            <ExternalLink
+              size={10.5}
+              className="shrink-0 text-neutral-300 transition-colors group-hover:text-neutral-500 dark:text-neutral-600 dark:group-hover:text-neutral-300"
+            />
+          </div>
+          <div className="mt-0.5 truncate pl-5 text-[10.5px] leading-4 text-neutral-400 dark:text-neutral-500">
+            {citation.host}
+            {citation.publishedDate ? ` · ${citation.publishedDate}` : ''}
+          </div>
+          {citation.snippet && (
+            <div className="mt-0.5 line-clamp-3 pl-5 whitespace-pre-wrap break-words text-[11px] leading-5 text-neutral-500 dark:text-neutral-400">
+              {citation.snippet}
+            </div>
+          )}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/** Dedicated card for a `web_search` (builtin hosted search / third-party search_web):
+ *  same consult-card shell as SUBAGENT/ADVISOR/KNOWLEDGE. Body shows the queries plus
+ *  the numbered, clickable source directory; falls back to the plain result text when
+ *  structured citations are absent (old persisted records). */
+function WebSearchCard({ toolCall }: ToolCallBlockProps) {
   const status = normalizeToolCallStatus(toolCall.status)
   const args = useMemo(() => parsedArguments(toolCall), [toolCall])
+  const view = useMemo(() => webSearchCardView(toolCall), [toolCall])
 
-  const code = stringValue(args?.code)
-  const output = getResultPreview(toolCall)
-  const error = toolCall.error ? compactToolError(toolCall.error) : ''
+  const queries = view?.queries ?? (stringValue(args?.query) ? [stringValue(args?.query)] : [])
+  const citations = view?.citations ?? []
+  const provider = view?.provider || ''
   const duration = formatDuration(getDuration(toolCall))
-  const artifactCount = toolCall.artifacts?.length ?? 0
+  const resultText = getResultPreview(toolCall)
+  const error = toolCall.error ? compactToolError(toolCall.error) : ''
   const statusLine =
-    status === 'running' ? '运行中…' : status === 'error' ? (error || '运行失败') : ''
+    status === 'running' ? '搜索中…' : status === 'error' ? (error || '搜索失败') : ''
 
-  const hasBody = Boolean(code || output || error)
+  const hasBody = Boolean(
+    queries.length ||
+      citations.length ||
+      (status !== 'running' && status !== 'pending' && resultText) ||
+      error,
+  )
 
   return (
     <ConsultCard
-      label="PYTHON"
+      label="WEB SEARCH"
       status={status}
-      identityChips={artifactCount > 0 ? <CardChip>{artifactCount} 个产物</CardChip> : undefined}
-      metricChips={duration ? <CardChip tabular>{duration}</CardChip> : undefined}
+      identityChips={provider ? <CardChip>{provider}</CardChip> : undefined}
+      metricChips={
+        <>
+          {citations.length > 0 && <CardChip tabular>{citations.length} 来源</CardChip>}
+          {duration && status !== 'running' && <CardChip tabular>{duration}</CardChip>}
+        </>
+      }
       statusLine={statusLine}
     >
       {hasBody && (
         <>
-          {code && (
-            <CardSection label="Code">
-              <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-black/[0.08] bg-black/[0.02] p-2 font-mono text-[11px] text-neutral-600 dark:border-white/[0.1] dark:bg-white/[0.03] dark:text-neutral-300">
-                {code.length > 4000 ? `${code.slice(0, 4000)}…` : code}
-              </pre>
-            </CardSection>
-          )}
-          {output && (
-            <CardSection label="Output">
-              <div className="whitespace-pre-wrap break-words font-mono text-[11px] text-neutral-500 dark:text-neutral-400">
-                {output}
+          {queries.length > 0 && (
+            <CardSection label="Query">
+              <div className="whitespace-pre-wrap break-words text-neutral-500 dark:text-neutral-400">
+                {compactText(queries.join(' · '), 300)}
               </div>
             </CardSection>
           )}
-          {error && !output && (
+          {citations.length > 0 ? (
+            <WebSources citations={citations} />
+          ) : (
+            status !== 'running' &&
+            status !== 'pending' &&
+            resultText && (
+              <CardSection label="结果">
+                <div className="whitespace-pre-wrap break-words text-neutral-500 dark:text-neutral-400">
+                  {resultText}
+                </div>
+              </CardSection>
+            )
+          )}
+          {error && (
             <div className="whitespace-pre-wrap break-words text-neutral-500 dark:text-neutral-400">
               {error}
             </div>
@@ -1184,7 +1457,6 @@ function getToolName(toolCall: ToolCallRecord): string {
     default:
       break
   }
-  if (raw === 'run_python') return 'Python'
   if (raw === 'web_search') {
     // 结果里带了实际使用的搜索服务名（后端 structured_content.provider），显示为「Web search · Ollama」。
     const structured = objectValue(toolCall.structured_content ?? toolCall.structuredContent) ?? {}
@@ -1193,6 +1465,13 @@ function getToolName(toolCall: ToolCallRecord): string {
   }
   if (raw === 'web_fetch') return 'Fetch'
   if (raw === 'knowledge_search') return 'Knowledge search'
+  if (raw === 'automation_run') return 'Run automation'
+  if (raw === 'automation_list') return 'List automations'
+  if (raw === 'automation_get') return 'Get automation'
+  if (raw === 'automation_upsert') return 'Save automation'
+  if (raw === 'automation_set_enabled') return 'Toggle automation'
+  if (raw === 'automation_runs') return 'Automation runs'
+  if (raw === 'automation_delete') return 'Delete automation'
   if (raw === 'mixer_vision') return 'Vision'
   if (raw === 'mixer_generate_image') return 'Generate image'
   if (raw === 'todo_write' || raw === 'todo_update') return 'Update todos'
@@ -1283,6 +1562,19 @@ function getToolTarget(toolCall: ToolCallRecord): string {
       case 'web_search':
       case 'knowledge_search':
         return compactText(firstString(args?.query), 140)
+      case 'automation_run':
+      case 'automation_get':
+      case 'automation_set_enabled':
+      case 'automation_runs':
+      case 'automation_delete':
+        return compactText(firstString(args?.id, args?.name), 140)
+      case 'automation_upsert': {
+        const graph = args?.automation
+        const name = graph && typeof graph === 'object' && !Array.isArray(graph)
+          ? firstString((graph as Record<string, unknown>).name)
+          : ''
+        return compactText(name || firstString(args?.id), 140)
+      }
       case 'todo_write': {
         const counts = formatTodoCounts(
           structuredTodoState(toolCall)?.items ?? normalizeTodoItems(args?.todos),
@@ -1315,13 +1607,11 @@ function getToolTarget(toolCall: ToolCallRecord): string {
     }
   })()
   if (primary) return primary
-  // run_python 只显示动词「Python」，不追加目标；其余工具（含参数尚未解析出的情况）
-  // 回退到已有的输入参数摘要（todo / mixer / skill / MCP 及流式占位 argumentPreview）。
-  if (raw === 'run_python') return ''
   return getArgumentPreview(toolCall)
 }
 
 function getArgumentPreview(toolCall: ToolCallRecord): string {
+  if (isKivioToolDraft(toolCall)) return ''
   const rawName = toolRawName(toolCall)
   const args = parsedArguments(toolCall)
   if (rawName === 'todo_write') {
@@ -1368,6 +1658,7 @@ function getArgumentPreview(toolCall: ToolCallRecord): string {
 }
 
 function getResultPreview(toolCall: ToolCallRecord): string {
+  if (isKivioToolDraft(toolCall)) return ''
   const rawName = toolRawName(toolCall)
   const todoItems = structuredTodoState(toolCall)?.items
   if (rawName === 'todo_write' || rawName === 'todo_update' || todoItems) {
@@ -1390,60 +1681,7 @@ function getResultPreview(toolCall: ToolCallRecord): string {
   return formatToolResultPreview(raw)
 }
 
-function stripPythonFailurePrefix(message: string): string {
-  return message
-    .replace(/^Python\s*(?:执行失败|语法错误|执行超时|沙盒调用失败)(?:（[^）]+）)?[：:]\s*/i, '')
-    .trim()
-}
-
-function cleanPythonExceptionSnippet(message: string): string {
-  const normalized = stripPythonFailurePrefix(message).replace(/\s+/g, ' ').trim()
-  const stackBoundary = normalized.search(
-    /\s+(?=Traceback \(most recent call last\):|File\s+"|File\s+'|await CodeRunner\(|coroutine =|new_error@|[0-9]+@wasm-function|\^+)/,
-  )
-  const clipped = stackBoundary >= 0 ? normalized.slice(0, stackBoundary) : normalized
-  return compactText(clipped, 260)
-}
-
-function extractPythonException(message: string): string {
-  const cleaned = message
-    .replace(/\bstderr:\s*/gi, '\n')
-    .replace(/\bstdout:\s*/gi, '\n')
-  const stackNoise = /(pyodide\.asm\.js|wasm-function|new_error@|_pyodide)/i
-  const exceptionName = /^[A-Za-z_][\w.]*(?:Error|Exception|Warning|Interrupt|Exit|Fault|Found|Denied|Timeout)\b/
-  const lines = cleaned
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .filter(Boolean)
-  const tracebackLine = [...lines]
-    .reverse()
-    .find((line) => exceptionName.test(line) && !stackNoise.test(line) && !line.startsWith('PythonError: Traceback'))
-  if (tracebackLine) return cleanPythonExceptionSnippet(tracebackLine)
-
-  const inlineMatches = [
-    ...cleaned.matchAll(
-      /\b([A-Za-z_][\w.]*(?:Error|Exception|Warning|Interrupt|Exit|Fault|Found|Denied|Timeout)\b(?::\s*[^。\r\n]+)?)/g,
-    ),
-  ]
-    .map((match) => cleanPythonExceptionSnippet(match[1] || ''))
-    .filter((value) => value && !stackNoise.test(value) && !value.startsWith('PythonError: Traceback'))
-  const inline = inlineMatches.reverse()[0]
-  return inline || ''
-}
-
 function compactToolError(error: string): string {
-  const lower = error.toLowerCase()
-  if (
-    lower.includes('pyodide.asm.js') ||
-    lower.includes('wasm-function') ||
-    lower.includes('traceback (most recent call last)') ||
-    lower.includes('pythonerror: traceback') ||
-    lower.includes('_pyodide/')
-  ) {
-    const exception = extractPythonException(error)
-    if (exception) return `Python 执行失败：${exception}`
-    return 'Python 执行失败。详情已隐藏，请查看最终回答。'
-  }
   return compactText(error, 260)
 }
 
@@ -1705,9 +1943,137 @@ function DefaultToolCallBlock({
   )
 }
 
+function collectImageReadItems(toolCalls: ToolCallRecord[]): ImageReadItem[] {
+  const seen = new Set<string>()
+  const items: ImageReadItem[] = []
+  for (const toolCall of toolCalls) {
+    for (const item of imageReadItems(toolCall)) {
+      const key = item.path || item.name
+      if (!key || seen.has(key)) continue
+      seen.add(key)
+      items.push(item)
+    }
+  }
+  return items
+}
+
+function ImageReadThumb({ item }: { item: ImageReadItem }) {
+  const t = useT()
+  const [src, setSrc] = useState<string | null>(item.dataUrl || null)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    if (item.dataUrl) {
+      setSrc(item.dataUrl)
+      setFailed(false)
+      return
+    }
+    if (!item.path) {
+      setFailed(true)
+      return
+    }
+    let cancelled = false
+    setSrc(null)
+    setFailed(false)
+    void loadAttachmentDataUrl({ type: 'image', path: item.path, name: item.name }, null).then((dataUrl) => {
+      if (cancelled) return
+      if (dataUrl) setSrc(dataUrl)
+      else setFailed(true)
+    })
+    return () => {
+      cancelled = true
+    }
+  }, [item.dataUrl, item.path, item.name])
+
+  if (failed) {
+    return (
+      <div
+        className="flex h-16 w-16 items-center justify-center rounded-lg bg-neutral-100 text-neutral-400 dark:bg-neutral-800"
+        title={item.name}
+      >
+        <ImageOff size={16} strokeWidth={1.8} />
+        <span className="sr-only">{t.chatImagePreviewFailed}</span>
+      </div>
+    )
+  }
+
+  if (!src) {
+    return <div className="kv-skeleton h-16 w-16 rounded-lg" aria-hidden="true" />
+  }
+
+  return (
+    <button
+      type="button"
+      className="h-16 w-16 shrink-0 overflow-hidden rounded-lg bg-neutral-100 p-0 dark:bg-neutral-800"
+      title={item.name}
+      aria-label={t.chatPreviewImage}
+      onClick={() => openChatImageViewer({
+        src,
+        alt: item.name,
+        name: item.name,
+        path: item.path || null,
+        conversationId: null,
+      })}
+    >
+      <img src={src} alt="" className="h-full w-full object-cover" loading="lazy" />
+    </button>
+  )
+}
+
+export function ImageReadCluster({ toolCalls }: { toolCalls: ToolCallRecord[] }) {
+  const t = useT()
+  const [open, setOpen] = useState(false)
+  const items = useMemo(() => collectImageReadItems(toolCalls), [toolCalls])
+  const count = Math.max(
+    items.length,
+    toolCalls.reduce((total, toolCall) => total + imageReadCount(toolCall), 0),
+  )
+  const running = toolCalls.some((toolCall) => normalizeToolCallStatus(toolCall.status) === 'running')
+  const label = (running ? t.chatViewingImages : t.chatViewedImages).replace('{n}', String(Math.max(1, count)))
+
+  return (
+    <div className="not-prose mb-1 text-[12.5px] leading-5 text-neutral-500 dark:text-neutral-400">
+      <button
+        type="button"
+        onClick={() => setOpen((value) => !value)}
+        aria-expanded={open}
+        className="max-w-full min-w-0 inline-flex items-center gap-1.5 rounded-md py-0 text-[11.5px] text-neutral-500 transition-colors hover:text-neutral-700 dark:text-neutral-400 dark:hover:text-neutral-200"
+      >
+        <Eye
+          className="shrink-0 text-neutral-400 dark:text-neutral-500"
+          size={14}
+          strokeWidth={1.9}
+        />
+        <span
+          className={`shrink-0 font-medium text-neutral-700 dark:text-neutral-200${
+            running ? ' chat-motion-tool-shimmer' : ''
+          }`}
+        >
+          {label}
+        </span>
+        <ChevronDown
+          className={`shrink-0 text-neutral-400 transition-transform dark:text-neutral-500 ${open ? '' : '-rotate-90'}`}
+          size={12}
+          strokeWidth={2}
+        />
+      </button>
+      {open && items.length > 0 && (
+        <div className="mt-1.5 flex flex-wrap gap-1.5">
+          {items.map((item, index) => (
+            <ImageReadThumb key={item.path || `${item.name}-${index}`} item={item} />
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function ToolCallBlockComponent(props: ToolCallBlockProps) {
   if (isAskUserTool(props.toolCall)) {
     return <AskUserBlock toolCall={props.toolCall} />
+  }
+  if (isImageReadToolCall(props.toolCall)) {
+    return <ImageReadCluster toolCalls={[props.toolCall]} />
   }
   if (isSubAgentRecord(props.toolCall)) {
     return <SubAgentCard {...props} />
@@ -1715,11 +2081,14 @@ function ToolCallBlockComponent(props: ToolCallBlockProps) {
   if (isAdvisorRecord(props.toolCall)) {
     return <AdvisorCard {...props} />
   }
+  if (isAutomationRunRecord(props.toolCall)) {
+    return <AutomationRunCard {...props} />
+  }
   if (isKnowledgeSearchRecord(props.toolCall)) {
     return <KnowledgeCard {...props} />
   }
-  if (isPythonRecord(props.toolCall)) {
-    return <PythonCard {...props} />
+  if (isWebSearchRecord(props.toolCall)) {
+    return <WebSearchCard {...props} />
   }
   return <DefaultToolCallBlock {...props} />
 }

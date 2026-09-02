@@ -7,7 +7,7 @@ const NATIVE_BUILTIN_TOOL_KEYS = [
   'writeFile',
   'editFile',
   'runCommand',
-  'runPython',
+  'automation',
 ] as const satisfies readonly (keyof ChatNativeToolsConfig)[]
 
 export function hasEnabledNativeBuiltinTool(

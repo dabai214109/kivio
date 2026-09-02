@@ -367,6 +367,14 @@ export interface CompactionBoundaryRecord {
   createdAt?: number
 }
 
+export interface ContextClearBoundaryRecord {
+  id: string
+  source_until_message_id?: string
+  sourceUntilMessageId?: string
+  created_at?: number
+  createdAt?: number
+}
+
 export interface ConversationContextSummary {
   id: string
   content: string
@@ -408,6 +416,8 @@ export interface ConversationContextState {
   summary?: ConversationContextSummary | null
   compaction_boundaries?: CompactionBoundaryRecord[]
   compactionBoundaries?: CompactionBoundaryRecord[]
+  clear_boundaries?: ContextClearBoundaryRecord[]
+  clearBoundaries?: ContextClearBoundaryRecord[]
   warning?: string | null
   warningMessage?: string | null
   context_source?: 'kivio_builtin' | 'external_cli' | string
@@ -521,9 +531,12 @@ export interface DetectedExternalAgent {
   auth_status?: string | null
   /** 设置页里被用户停用：不出现在运行时选择器，但已绑定它的旧会话照常。 */
   disabled?: boolean
-  /** 该 CLI 的协议能否往在飞的轮次里注入一条用户消息（「立刻引导」）。目前只有 codex。 */
+  /** 该 CLI 的协议能否往在飞的轮次里注入一条用户消息（「立刻引导」）。 */
   supportsSteering?: boolean
   supports_steering?: boolean
+  /** 该 CLI 是否支持在当前运行后原生排队继续处理（Pi / dsh）。 */
+  supportsFollowUp?: boolean
+  supports_follow_up?: boolean
 }
 
 export interface Conversation {
@@ -561,6 +574,8 @@ export interface Conversation {
   knowledgeBaseIds?: string[]
   force_knowledge_search?: boolean
   forceKnowledgeSearch?: boolean
+  additional_directories?: AdditionalDirectory[]
+  additionalDirectories?: AdditionalDirectory[]
   thinking_level?: ThinkingLevel | null
   thinkingLevel?: ThinkingLevel | null
   /** 会话级三态联网搜索（任务 07-23）。缺省/null = 跟随全局 nativeTools.webSearch。 */
@@ -585,6 +600,13 @@ export interface ForkOrigin {
   messageId?: string
   title: string
 }
+
+export interface AdditionalDirectory {
+  path: string
+  name?: string | null
+}
+
+export const MAX_ADDITIONAL_DIRECTORIES = 8
 
 /** 一次回答所用的 (provider, model) 引用。多模型一问多答的会话级模型集元素。 */
 export interface ModelRef {
