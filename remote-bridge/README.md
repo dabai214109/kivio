@@ -101,6 +101,16 @@ nginx 等价配置需同时升级 WebSocket（`proxy_set_header Upgrade/Connecti
 | 手机 → 桌面 | `conv_list` / `conv_history {conversation_id}` / `send {conversation_id?, content}` / `stop {conversation_id}` / `ping` |
 | 桌面 → 手机 | `conv_list_result` / `conv_history_result` / `turn_started` / `turn_done` / `turn_busy` / `turn_error` / `stop_ack` / `pong` |
 
+### 企业微信回调透传（`/wecom/callback`）
+
+企业微信通道复用同一 relay：桌面端用第二个 device token 连接（IM 网关 → 企业微信 → 连接中继），
+企微后台「接收消息」的 URL 填 `https://<relay>/wecom/callback?t=<该token>`。
+
+- relay **不持有企微凭据、不解密**：`GET`（验证 URL）把签名参数转给桌面端解密后 5s 内回显；
+  `POST`（消息推送）立即回 `success`（满足企微 5s 应答限制），密文 XML 原样转给桌面端。
+- 桌面端发来的 `wecom_verify_result` 是设备控制帧，relay 路由到等待中的回调，不转发给手机。
+- 桌面端离线时：验证返回 400；消息回 `success` 但会丢失（企微侧无补推）。
+
 ## 安全说明
 
 - 中继请务必置于 HTTPS 反代之后；裸 HTTP 仅限本机/内网调试。
