@@ -1096,6 +1096,28 @@ impl Default for ImGatewayConfig {
     }
 }
 
+/// Kivio Remote（手机浏览器 ↔ 自建中继 ↔ 桌面端）。
+/// `device_token` 在首次配对成功后由设置页写回；为空表示尚未配对。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RemoteBridgeConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub server_url: String,
+    #[serde(default)]
+    pub device_token: String,
+}
+
+impl Default for RemoteBridgeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_url: String::new(),
+            device_token: String::new(),
+        }
+    }
+}
+
 fn default_skill_auto_match() -> bool {
     true
 }
@@ -1641,6 +1663,8 @@ pub struct Settings {
     #[serde(default)]
     pub im_gateway: ImGatewayConfig,
     #[serde(default)]
+    pub remote_bridge: RemoteBridgeConfig,
+    #[serde(default)]
     pub document_processing: DocumentProcessingConfig,
     #[serde(default)]
     pub knowledge_base: KnowledgeBaseConfig,
@@ -1796,6 +1820,7 @@ impl Default for Settings {
             theme: "system".to_string(),
             theme_color: default_theme_color(),
             im_gateway: ImGatewayConfig::default(),
+            remote_bridge: RemoteBridgeConfig::default(),
             translucent_sidebar: false,
             ui_font_scale: default_ui_font_scale(),
             ui_font_family: String::new(),
@@ -2518,6 +2543,21 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
         if settings.im_gateway.ws_url.is_empty() || missing_creds {
             settings.im_gateway.enabled = false;
         }
+    }
+
+    // Kivio Remote：地址 trim 去尾斜杠；开了但没地址/没配对 token 的直接关。
+    settings.remote_bridge.server_url = settings
+        .remote_bridge
+        .server_url
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+    settings.remote_bridge.device_token = settings.remote_bridge.device_token.trim().to_string();
+    if settings.remote_bridge.enabled
+        && (settings.remote_bridge.server_url.is_empty()
+            || settings.remote_bridge.device_token.is_empty())
+    {
+        settings.remote_bridge.enabled = false;
     }
     let mut im_allow: Vec<String> = settings
         .im_gateway

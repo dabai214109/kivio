@@ -168,6 +168,19 @@ export function ImGatewayIcon(props: IconProps) {
   )
 }
 
+// 远程连接：显示器 + 手机（扫码远程的意象）
+export function RemoteIcon(props: IconProps) {
+  return (
+    <svg {...svgProps(props)}>
+      <rect x="2.5" y="4" width="13" height="10" rx="1.5" />
+      <path d="M6 17 H11" />
+      <path d="M8.5 14 V17" />
+      <rect x="16.5" y="9" width="5" height="10" rx="1.5" />
+      <path d="M18.5 16.5 H19.5" />
+    </svg>
+  )
+}
+
 // MCP：插头/连接
 export function McpIcon(props: IconProps) {
   return (

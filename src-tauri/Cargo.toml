@@ -1,7 +1,7 @@
 # Kivio Rust 后端 Cargo 配置
 [package]
 name = "kivio"
-version = "2.9.2-im.2"
+version = "2.9.2-im.3"
 description = "Kivio Desktop - Screen-level AI assistant for macOS/Windows"
 authors = ["ZM"]
 license = "GPL-3.0-or-later"
@@ -65,6 +65,8 @@ reqwest = { version = "0.13", features = ["json", "rustls", "multipart", "form"]
 tokio = { version = "1", features = ["time", "process", "io-util", "sync", "rt-multi-thread", "macros"] }
 # IM 网关：OneBot11 连本机 NapCat（ws:// 明文）；QQ 官方机器人网关是 wss://，需 rustls。
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
+# Kivio Remote：配对二维码生成（纯矩阵，无图像后端）
+qrcode = { version = "0.14", default-features = false }
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
 scraper = "0.23"
 html-escape = "0.2"

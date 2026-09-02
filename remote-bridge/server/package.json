@@ -1,0 +1,17 @@
+{
+  "name": "kivio-remote-relay",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Kivio Remote 中继服务器：桌面端与手机浏览器之间的配对与消息转发",
+  "main": "relay.mjs",
+  "scripts": {
+    "start": "node relay.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

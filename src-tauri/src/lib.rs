@@ -26,6 +26,7 @@ pub mod proc;
 pub mod prompts;
 pub mod provider_request;
 pub mod rapidocr;
+pub mod remote_bridge;
 pub mod replace_translation;
 #[cfg(target_os = "macos")]
 pub mod sck;
@@ -346,6 +347,14 @@ pub fn run() {
                 });
             }
 
+            // Kivio Remote（远程连接）监督循环：同样按 remoteBridge 设置热生效。
+            {
+                let app_handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    crate::remote_bridge::run(app_handle).await;
+                });
+            }
+
             if let Err(err) = register_hotkeys(&app.handle()) {
                 eprintln!(
                     "Failed to register hotkeys: {}",
@@ -571,6 +580,10 @@ pub fn run() {
             chat::commands::send::chat_send_message,
             chat::commands::interaction::chat_cancel_stream,
             im_gateway::im_gateway_status,
+            remote_bridge::remote_bridge_start_pairing,
+            remote_bridge::remote_bridge_pairing_status,
+            remote_bridge::remote_bridge_cancel_pairing,
+            remote_bridge::remote_bridge_status,
             chat::commands::interaction::chat_confirm_tool_call,
             chat::commands::interaction::chat_respond_session_consent,
             chat::commands::interaction::chat_submit_user_choice,
@@ -711,6 +724,7 @@ pub fn run() {
                     // 真正退出：同步排干 MCP 连接池，杀掉所有持久子进程，避免孤儿进程。
                     // 先通知 IM 网关监督循环收摊（幂等；WS 断开后循环自然退出）。
                     crate::im_gateway::request_shutdown();
+                    crate::remote_bridge::request_shutdown();
                     let state: State<AppState> = app_handle.state();
                     // 带超时：一个卡在握手里的 server 会占着会话锁不放，没有这层
                     // 上限的话退出钩子会永久阻塞在主线程上 —— 表现是「点关闭没反应、

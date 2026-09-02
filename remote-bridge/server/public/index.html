@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="color-scheme" content="dark">
+<title>Kivio Remote</title>
+<style>
+  :root {
+    --bg: #101014; --panel: #17171d; --panel2: #1e1e26; --line: #2a2a34;
+    --text: #e8e8ee; --dim: #9a9aa6; --acc: #6c8cff; --ok: #3ecf8e; --err: #ff6b6b;
+    --safe-b: env(safe-area-inset-bottom, 0px);
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  header {
+    display: flex; align-items: center; gap: 10px; padding: 12px 14px;
+    background: var(--panel); border-bottom: 1px solid var(--line); flex: none;
+  }
+  header h1 { font-size: 16px; margin: 0; flex: 1; font-weight: 600; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--err); flex: none; }
+  .dot.on { background: var(--ok); }
+  .dot.wait { background: #e6b800; }
+  .backbtn { display: none; background: none; border: 1px solid var(--line); color: var(--dim);
+    border-radius: 8px; padding: 4px 12px; font-size: 14px; }
+  main { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  .view { display: none; height: 100%; }
+  .view.show { display: block; }
+
+  /* 配对页 */
+  #pairView { padding: 40px 24px; text-align: center; }
+  #pairView h2 { font-size: 18px; margin: 0 0 8px; }
+  #pairView p { color: var(--dim); font-size: 13px; }
+  #pairInput { width: 100%; max-width: 320px; padding: 12px; font-size: 20px; text-align: center;
+    letter-spacing: 4px; text-transform: uppercase; background: var(--panel2); color: var(--text);
+    border: 1px solid var(--line); border-radius: 12px; outline: none; }
+  #pairBtn { margin-top: 14px; width: 100%; max-width: 320px; padding: 12px; font-size: 15px;
+    background: var(--acc); color: #fff; border: 0; border-radius: 12px; }
+  #pairErr { color: var(--err); font-size: 13px; min-height: 18px; margin-top: 10px; }
+
+  /* 列表页 */
+  #listBar { display: flex; gap: 8px; padding: 10px 12px; }
+  button.act { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 10px; padding: 8px 14px; font-size: 14px; }
+  button.act.primary { background: var(--acc); border-color: var(--acc); color: #fff; }
+  .conv { padding: 12px 14px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .conv:active { background: var(--panel2); }
+  .conv .t { display: flex; justify-content: space-between; gap: 10px; }
+  .conv .title { font-weight: 600; font-size: 15px; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; flex: 1; }
+  .conv .time { color: var(--dim); font-size: 12px; flex: none; }
+  .conv .prev { color: var(--dim); font-size: 13px; margin-top: 2px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+
+  /* 聊天页 */
+  #chatView { display: none; flex-direction: column; }
+  #chatView.show { display: flex; }
+  #msgs { flex: 1; overflow-y: auto; padding: 14px 12px 8px; }
+  .msg { max-width: 86%; margin-bottom: 12px; padding: 9px 12px; border-radius: 14px;
+    white-space: pre-wrap; word-break: break-word; font-size: 15px; }
+  .msg.user { background: var(--acc); color: #fff; margin-left: auto; border-bottom-right-radius: 4px; }
+  .msg.assistant { background: var(--panel2); border: 1px solid var(--line);
+    border-bottom-left-radius: 4px; }
+  .msg details { margin-top: 6px; color: var(--dim); font-size: 12px; }
+  .msg details pre { white-space: pre-wrap; margin: 4px 0 0; }
+  .genhint { text-align: center; color: var(--dim); font-size: 13px; margin: 10px 0; }
+  @keyframes blink { 50% { opacity: .3; } }
+  .genhint .cursor { animation: blink 1s infinite; }
+
+  footer { flex: none; display: none; gap: 8px; padding: 10px 12px calc(10px + var(--safe-b));
+    background: var(--panel); border-top: 1px solid var(--line); }
+  footer.show { display: flex; }
+  #input { flex: 1; background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+    border-radius: 12px; padding: 10px 12px; font-size: 15px; outline: none; resize: none;
+    max-height: 120px; font-family: inherit; line-height: 1.4; }
+  #stopBtn { display: none; background: var(--err); border: 0; color: #fff; border-radius: 12px;
+    padding: 0 16px; font-size: 14px; }
+  #sendBtn { background: var(--acc); border: 0; color: #fff; border-radius: 12px;
+    padding: 0 16px; font-size: 14px; }
+  .toast { position: fixed; left: 50%; bottom: 90px; transform: translateX(-50%);
+    background: rgba(0,0,0,.8); color: #fff; padding: 8px 16px; border-radius: 10px;
+    font-size: 13px; opacity: 0; transition: opacity .2s; pointer-events: none; z-index: 9; }
+  .toast.show { opacity: 1; }
+</style>
+</head>
+<body>
+  <header>
+    <button class="backbtn" id="backBtn">‹ 会话</button>
+    <h1 id="title">Kivio Remote</h1>
+    <div class="dot" id="dot"></div>
+  </header>
+
+  <main>
+    <div class="view" id="pairView">
+      <h2>连接到你的 Kivio</h2>
+      <p>在 Kivio「设置 → 远程连接」点击配对，<br>把显示的配对码输入到这里。</p>
+      <input id="pairInput" inputmode="latin" maxlength="8" placeholder="配对码">
+      <button id="pairBtn">连接</button>
+      <div id="pairErr"></div>
+    </div>
+    <div class="view" id="listView">
+      <div id="listBar">
+        <button class="act primary" id="newBtn">＋ 新对话</button>
+        <button class="act" id="refreshBtn">刷新</button>
+      </div>
+      <div id="convList"></div>
+    </div>
+    <div class="view" id="chatView"><div id="msgs"></div></div>
+  </main>
+
+  <footer id="foot">
+    <textarea id="input" rows="1" placeholder="发消息给 Kivio…"></textarea>
+    <button id="stopBtn">停止</button>
+    <button id="sendBtn">发送</button>
+  </footer>
+  <div class="toast" id="toast"></div>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+  const state = {
+    ws: null, token: localStorage.getItem('kivio_client_token') || '',
+    convs: [], curId: null, generating: false, connected: false,
+  };
+  let toastTimer = null;
+  const toast = (msg) => {
+    const t = $('toast'); t.textContent = msg; t.classList.add('show');
+    clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.remove('show'), 2200);
+  };
+  const setDot = (cls) => { $('dot').className = 'dot ' + cls; };
+
+  /* ---------- WebSocket ---------- */
+  function connect(opts) {
+    const proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
+    const q = opts.token ? `token=${encodeURIComponent(opts.token)}` : `code=${encodeURIComponent(opts.code)}`;
+    const ws = new WebSocket(`${proto}${location.host}/ws?mode=client&${q}`);
+    state.ws = ws;
+    ws.onopen = () => { setDot('wait'); };
+    ws.onmessage = (ev) => { try { handle(JSON.parse(ev.data)); } catch { /* ignore */ } };
+    ws.onclose = (ev) => {
+      state.connected = false; setDot(''); state.ws = null;
+      if (ev.reason === 'bad code' || ev.reason === 'bad token') {
+        localStorage.removeItem('kivio_client_token'); state.token = '';
+        showPair(ev.code === 1008 && $('pairInput').value ? '连接被拒绝' : '');
+        return;
+      }
+      setDot(''); setTimeout(() => reconnectOrPair(), 2500);
+    };
+    ws.onerror = () => { /* onclose 会跟进 */ };
+  }
+  function reconnectOrPair() {
+    if (state.ws) return;
+    if (state.token) connect({ token: state.token });
+    else showPair('');
+  }
+  function sendCmd(obj) {
+    if (state.ws && state.ws.readyState === 1) { state.ws.send(JSON.stringify(obj)); return true; }
+    toast('未连接到中继'); return false;
+  }
+
+  /* ---------- 协议 ---------- */
+  function handle(m) {
+    switch (m.type) {
+      case 'hello':
+      case 'client_bound':
+        state.connected = true; setDot('on');
+        if (m.client_token) { state.token = m.client_token; localStorage.setItem('kivio_client_token', m.client_token); }
+        showList(); sendCmd({ type: 'conv_list' });
+        break;
+      case 'error':
+        if (String(m.error || '').includes('无效')) {
+          localStorage.removeItem('kivio_client_token'); state.token = '';
+          showPair(m.error);
+        } else toast(m.error || '发生错误');
+        break;
+      case 'conv_list_result':
+        state.convs = m.conversations || []; renderList();
+        break;
+      case 'conv_history_result':
+        renderHistory(m);
+        break;
+      case 'turn_started':
+        if (m.conversation_id && !state.curId) { state.curId = m.conversation_id; $('title').textContent = '新对话'; }
+        setGenerating(true);
+        appendHint();
+        break;
+      case 'turn_done': {
+        setGenerating(false);
+        const el = document.querySelector('.genhint'); if (el) el.remove();
+        appendMsg('assistant', m.content || '');
+        break;
+      }
+      case 'turn_error':
+        setGenerating(false);
+        { const el = document.querySelector('.genhint'); if (el) el.remove(); }
+        toast('出错：' + (m.error || '未知错误'));
+        break;
+      case 'turn_busy':
+        setGenerating(false);
+        { const el = document.querySelector('.genhint'); if (el) el.remove(); }
+        toast('该对话正在生成中，请稍后再试');
+        break;
+      default: break;
+    }
+  }
+
+  /* ---------- 视图 ---------- */
+  function showPair(err) {
+    setView('pairView'); $('foot').classList.remove('show'); $('backBtn').style.display = 'none';
+    $('title').textContent = 'Kivio Remote';
+    $('pairErr').textContent = err || '';
+    if (!state.ws) { const code = new URLSearchParams(location.search).get('code'); if (code) { connect({ code }); } }
+  }
+  function showList() {
+    setView('listView'); $('foot').classList.remove('show'); $('backBtn').style.display = 'none';
+    $('title').textContent = '会话';
+    if (state.connected) sendCmd({ type: 'conv_list' });
+  }
+  function showChat() {
+    setView('chatView'); $('foot').classList.add('show'); $('backBtn').style.display = '';
+    $('msgs').innerHTML = '';
+  }
+  function setView(id) {
+    for (const v of document.querySelectorAll('.view')) v.classList.remove('show');
+    $(id).classList.add('show');
+  }
+  function setGenerating(on) {
+    state.generating = on;
+    $('stopBtn').style.display = on ? '' : 'none';
+    $('sendBtn').style.display = on ? 'none' : '';
+  }
+
+  /* ---------- 渲染 ---------- */
+  function fmtTime(ts) {
+    if (!ts) return '';
+    const d = new Date(ts * 1000 < 1e12 ? ts * 1000 : ts);
+    const now = new Date();
+    const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+    if (d.toDateString() === now.toDateString()) return hm;
+    return `${d.getMonth() + 1}-${d.getDate()} ${hm}`;
+  }
+  function renderList() {
+    const box = $('convList'); box.innerHTML = '';
+    if (!state.convs.length) {
+      box.innerHTML = '<div style="text-align:center;color:var(--dim);padding:40px 0;">还没有会话</div>';
+      return;
+    }
+    for (const c of state.convs) {
+      const div = document.createElement('div');
+      div.className = 'conv';
+      const t = document.createElement('div'); t.className = 't';
+      const title = document.createElement('div'); title.className = 'title'; title.textContent = c.title || '未命名';
+      const time = document.createElement('div'); time.className = 'time'; time.textContent = fmtTime(c.updated_at);
+      t.append(title, time);
+      const prev = document.createElement('div'); prev.className = 'prev';
+      prev.textContent = c.preview || `消息数 ${c.message_count ?? ''}`;
+      div.append(t, prev);
+      div.onclick = () => openConv(c);
+      box.appendChild(div);
+    }
+  }
+  function addBubble(role, text, reasoning) {
+    const div = document.createElement('div');
+    div.className = 'msg ' + role;
+    div.textContent = text;
+    if (reasoning) {
+      const d = document.createElement('details');
+      const s = document.createElement('summary'); s.textContent = '思考过程';
+      const pre = document.createElement('pre'); pre.textContent = reasoning;
+      d.append(s, pre); div.appendChild(d);
+    }
+    $('msgs').appendChild(div);
+    $('msgs').scrollTop = $('msgs').scrollHeight;
+    return div;
+  }
+  function appendHint() {
+    const h = document.createElement('div');
+    h.className = 'genhint'; h.innerHTML = '生成中<span class="cursor">…</span>';
+    $('msgs').appendChild(h);
+    $('msgs').scrollTop = $('msgs').scrollHeight;
+  }
+  function renderHistory(m) {
+    showChat();
+    state.curId = m.conversation_id;
+    $('title').textContent = (state.convs.find((c) => c.id === m.conversation_id) || {}).title || '会话';
+    for (const msg of m.messages || []) {
+      if (msg.role === 'user' || msg.role === 'assistant') addBubble(msg.role, msg.content || '', msg.reasoning);
+    }
+    if (!(m.messages || []).length) addBubble('assistant', '（空会话，发条消息开始吧）');
+  }
+  function appendMsg(role, text) { addBubble(role, text); }
+  async function openConv(c) {
+    $('title').textContent = c.title || '会话';
+    if (!sendCmd({ type: 'conv_history', conversation_id: c.id })) return;
+    showChat(); state.curId = c.id;
+    addBubble('assistant', '加载中…');
+  }
+
+  /* ---------- 事件 ---------- */
+  $('pairBtn').onclick = () => {
+    const code = $('pairInput').value.trim().toUpperCase();
+    if (!code) { $('pairErr').textContent = '请输入配对码'; return; }
+    $('pairErr').textContent = '';
+    if (state.ws) state.ws.close();
+    connect({ code });
+  };
+  $('newBtn').onclick = () => {
+    state.curId = null; showChat(); $('title').textContent = '新对话';
+    addBubble('assistant', '发条消息开始新对话');
+  };
+  $('refreshBtn').onclick = () => sendCmd({ type: 'conv_list' });
+  $('backBtn').onclick = showList;
+  $('sendBtn').onclick = doSend;
+  $('stopBtn').onclick = () => sendCmd({ type: 'stop', conversation_id: state.curId });
+  $('input').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); doSend(); }
+  });
+  function doSend() {
+    const text = $('input').value.trim();
+    if (!text || state.generating) return;
+    if (!state.curId) showChat();
+    if (document.querySelector('.genhint')) document.querySelector('.genhint').remove();
+    addBubble('user', text);
+    $('input').value = '';
+    $('input').style.height = 'auto';
+    sendCmd({ type: 'send', conversation_id: state.curId, content: text });
+  }
+  $('input').addEventListener('input', function () {
+    this.style.height = 'auto'; this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+  });
+
+  /* ---------- 启动 ---------- */
+  const urlCode = new URLSearchParams(location.search).get('code');
+  if (state.token) connect({ token: state.token });
+  else if (urlCode) connect({ code: urlCode });
+  else showPair('');
+})();
+</script>
+</body>
+</html>

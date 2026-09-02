@@ -492,6 +492,34 @@ export function defaultImGateway(): ImGatewayConfig {
   }
 }
 
+/** Kivio Remote（远程连接）：手机浏览器 ↔ 自建中继 ↔ 桌面端。镜像 Rust RemoteBridgeConfig。 */
+export type RemoteBridgeConfig = {
+  enabled: boolean
+  serverUrl: string
+  deviceToken: string
+}
+
+export function defaultRemoteBridge(): RemoteBridgeConfig {
+  return { enabled: false, serverUrl: '', deviceToken: '' }
+}
+
+/** remote_bridge_pairing_status 返回值。 */
+export type RemotePairingStatus = {
+  status: 'idle' | 'pending' | 'paired' | 'failed' | string
+  code?: string
+  client_url?: string
+  device_token?: string
+  error?: string
+}
+
+/** remote_bridge_status 返回值。 */
+export type RemoteBridgeStatus = {
+  enabled: boolean
+  connected: boolean
+  server_url: string
+  token_set: boolean
+}
+
 export type SkillFileEntry = {
   relativePath: string
   kind: 'skillmd' | 'reference' | 'script' | 'asset' | 'other' | string
@@ -1060,6 +1088,7 @@ export type Settings = {
   providers: ModelProvider[]
   chatTools: ChatToolsConfig
   imGateway?: ImGatewayConfig
+  remoteBridge?: RemoteBridgeConfig
   documentProcessing?: DocumentProcessingConfig
   knowledgeBase?: KnowledgeBaseConfig
   /** 供应商自定义图标：provider id → 图标 key（见 chat/ModelIcon 的 PROVIDER_BRANDS） */
@@ -1632,6 +1661,15 @@ function normalizeImGateway(config?: Partial<ImGatewayConfig> | null): ImGateway
   }
 }
 
+function normalizeRemoteBridge(config?: Partial<RemoteBridgeConfig> | null): RemoteBridgeConfig {
+  const current = config ?? {}
+  return {
+    enabled: current.enabled ?? false,
+    serverUrl: typeof current.serverUrl === 'string' ? current.serverUrl : '',
+    deviceToken: typeof current.deviceToken === 'string' ? current.deviceToken : '',
+  }
+}
+
 function normalizeDefaultModelSelection(selection?: Partial<DefaultModelSelection> | null): DefaultModelSelection {
   return {
     providerId: selection?.providerId ?? '',
@@ -1751,6 +1789,7 @@ export function normalizeSettings(settings: Settings): Settings {
     providers: Array.isArray(current.providers) ? current.providers.map(normalizeProvider) : [],
     chatTools: normalizeChatTools(current.chatTools),
     imGateway: normalizeImGateway(current.imGateway),
+    remoteBridge: normalizeRemoteBridge(current.remoteBridge),
     retryEnabled: current.retryEnabled ?? true,
     retryAttempts: current.retryAttempts ?? 3,
     screenshotTranslation: {
@@ -1872,6 +1911,12 @@ async function onChatProtocol(
 export const api = {
   // 设置相关
   getSettings: async () => normalizeSettings(await invoke<Settings>('get_settings')),
+  // Kivio Remote（远程连接）
+  remoteBridgeStartPairing: (serverUrl: string) =>
+    invoke<{ code: string; client_url: string; qr_svg: string }>('remote_bridge_start_pairing', { serverUrl }),
+  remoteBridgePairingStatus: () => invoke<RemotePairingStatus>('remote_bridge_pairing_status'),
+  remoteBridgeCancelPairing: () => invoke<void>('remote_bridge_cancel_pairing'),
+  remoteBridgeStatus: () => invoke<RemoteBridgeStatus>('remote_bridge_status'),
   // 某模型可选的思考等级列表（用户覆盖 modelOverrides → 模型库 reasoningEfforts → 家族兜底）。
   reasoningEffortsForModel: (model: string, providerId?: string) =>
     invoke<string[]>('chat_reasoning_efforts_for_model', { model, providerId }),
