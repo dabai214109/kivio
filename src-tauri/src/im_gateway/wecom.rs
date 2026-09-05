@@ -529,7 +529,17 @@ fn handle_msg(
         let plain = crypto.decrypt(&encrypt)?;
         let msg = parse_plain_message(&plain);
         if msg.msg_type != "text" {
-            return Ok(None); // v1 只处理文本
+            // 图片/语音等暂不支持：给明确反馈（event 类如上下线通知不回，避免噪音）。
+            if msg.msg_type != "event" && !msg.from.is_empty() {
+                let gw = std::sync::Arc::clone(gateway);
+                let user = UserKey::Wecom(msg.from.clone());
+                tauri::async_runtime::spawn(async move {
+                    let _ = gw
+                        .send_user(&user, "暂只支持文本消息，请直接发送文字。")
+                        .await;
+                });
+            }
+            return Ok(None);
         }
         if !dedup.push(&msg.msg_id) {
             return Ok(None); // 重推

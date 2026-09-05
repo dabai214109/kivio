@@ -973,11 +973,20 @@ async fn run_turn_for_user(gateway: &Arc<Gateway>, user: &UserKey, session_key: 
             send_chunked(gateway, user, &body, split_length).await;
         }
         TurnOutcome::Failed { error, reply } => {
-            let _ = gateway
-                .send_user(user, &format!("⚠️ 执行失败：{error}"))
-                .await;
-            if let Some(reply) = reply.filter(|r| !r.trim().is_empty()) {
-                send_chunked(gateway, user, &format!("已生成的部分：\n{}", reply.trim()), split_length).await;
+            let head = format!("⚠️ 执行失败：{error}");
+            let body = reply
+                .filter(|r| !r.trim().is_empty())
+                .map(|r| format!("已生成的部分：\n{}", r.trim()));
+            // QQ 官方被动回复仅 4 条：错误头与部分内容合并，避免拆散占用配额导致尾部无提示截断。
+            if let Some(body) = body {
+                if gateway.is_qq_official() {
+                    send_chunked(gateway, user, &format!("{head}\n\n{body}"), split_length).await;
+                } else {
+                    let _ = gateway.send_user(user, &head).await;
+                    send_chunked(gateway, user, &body, split_length).await;
+                }
+            } else {
+                let _ = gateway.send_user(user, &head).await;
             }
         }
         TurnOutcome::Busy => {
@@ -986,11 +995,19 @@ async fn run_turn_for_user(gateway: &Arc<Gateway>, user: &UserKey, session_key: 
                 .await;
         }
         TurnOutcome::TimedOut { partial } => {
-            let _ = gateway
-                .send_user(user, &format!("⚠️ 超时（{timeout_sec} 秒），已请求停止。"))
-                .await;
-            if let Some(partial) = partial.filter(|p| !p.trim().is_empty()) {
-                send_chunked(gateway, user, &format!("已生成的部分：\n{}", partial.trim()), split_length).await;
+            let head = format!("⚠️ 超时（{timeout_sec} 秒），已请求停止。");
+            let body = partial
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| format!("已生成的部分：\n{}", p.trim()));
+            if let Some(body) = body {
+                if gateway.is_qq_official() {
+                    send_chunked(gateway, user, &format!("{head}\n\n{body}"), split_length).await;
+                } else {
+                    let _ = gateway.send_user(user, &head).await;
+                    send_chunked(gateway, user, &body, split_length).await;
+                }
+            } else {
+                let _ = gateway.send_user(user, &head).await;
             }
         }
     }

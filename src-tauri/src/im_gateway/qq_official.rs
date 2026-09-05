@@ -341,19 +341,24 @@ async fn ws_session(
     };
     let (mut writer, mut reader) = ws.split();
 
-    // 等 op10 Hello 拿心跳周期。
+    // 等 op10 Hello 拿心跳周期（可被退出信号打断，不挂在无响应连接上）。
     let heartbeat_interval = loop {
-        match reader.next().await {
-            Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
-                let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
-                if v.get("op").and_then(Value::as_i64) == Some(10) {
-                    match v.pointer("/d/heartbeat_interval").and_then(Value::as_u64) {
-                        Some(ms) => break Duration::from_millis(ms.max(5000)),
-                        None => break Duration::from_secs(30),
+        tokio::select! {
+            _ = shutdown.changed() => return WsStop::Shutdown,
+            frame = reader.next() => {
+                match frame {
+                    Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) => {
+                        let Ok(v) = serde_json::from_str::<Value>(&text) else { continue };
+                        if v.get("op").and_then(Value::as_i64) == Some(10) {
+                            match v.pointer("/d/heartbeat_interval").and_then(Value::as_u64) {
+                                Some(ms) => break Duration::from_millis(ms.max(5000)),
+                                None => break Duration::from_secs(30),
+                            }
+                        }
                     }
+                    _ => return WsStop::Disconnected,
                 }
             }
-            _ => return WsStop::Disconnected,
         }
     };
 
