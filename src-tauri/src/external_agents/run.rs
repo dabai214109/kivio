@@ -130,6 +130,27 @@ pub async fn run_external_cli_reply(
     active_skill_id: Option<&str>,
     entry: AgentRunEntry,
 ) -> Result<(), String> {
+    run_external_cli_reply_in(
+        app, state, conversation, title_from_first_user, latest_user_message,
+        image_paths, file_paths, active_skill_id, entry, None,
+    )
+    .await
+}
+
+/// Automation steps share a workspace even though each CLI has its own session.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn run_external_cli_reply_in(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    conversation: &mut Conversation,
+    title_from_first_user: Option<&str>,
+    latest_user_message: &str,
+    image_paths: &[std::path::PathBuf],
+    file_paths: &[std::path::PathBuf],
+    active_skill_id: Option<&str>,
+    entry: AgentRunEntry,
+    working_directory: Option<&std::path::Path>,
+) -> Result<(), String> {
     let settings = state.settings_read().clone();
     let agent_id = conversation
         .agent_runtime
@@ -141,7 +162,14 @@ pub async fn run_external_cli_reply(
     let def = get_agent_def(&agent_id).ok_or_else(|| format!("未知外部 Agent: {agent_id}"))?;
 
     // CLI 要在这个目录里真的跑起来 ⇒ 必须确保存在（唯一需要建目录的路径之一）。
-    let cwd = ensure_effective_cwd(app, &conversation.id, conversation.project_id.as_deref())?;
+    let cwd = match working_directory {
+        Some(path) => {
+            std::fs::create_dir_all(path)
+                .map_err(|err| format!("create automation workspace: {err}"))?;
+            crate::utils::strip_windows_verbatim_prefix(path.to_path_buf())
+        }
+        None => ensure_effective_cwd(app, &conversation.id, conversation.project_id.as_deref())?,
+    };
     // N2：回复路径不再跑完整检测（version/auth/模型探测可达 10-25s）。可用性/auth 的展示
     // 交给列表阶段；这里只解析二进制（唯一必需项），把第 2+ 轮的前置开销压到 <500ms。
     let probe_start = Instant::now();
@@ -306,6 +334,11 @@ pub async fn run_external_cli_reply(
     // `runtimeWorkspaceRoots` 下发。其它协议忽略这个字段。
     let extra_writable_roots = {
         let mut roots = extra_dirs.clone();
+        if working_directory.is_some() {
+            // A resumed Codex thread may still have the old conversation cwd
+            // in its sandbox roots. Explicitly supply the automation workspace.
+            roots.push(cwd.to_string_lossy().to_string());
+        }
         if !image_blocks.is_empty() {
             roots.push(std::env::temp_dir().to_string_lossy().to_string());
         }
@@ -322,7 +355,11 @@ pub async fn run_external_cli_reply(
             .filter(|path| !path.trim().is_empty())
             .collect(),
     );
-    let additional_dirs_key = additional_cli_dirs.join("\n");
+    let additional_dirs_key = if agent_id == "antigravity" {
+        extra_dirs.join("\n")
+    } else {
+        additional_cli_dirs.join("\n")
+    };
     let runtime_ctx = RuntimeContext {
         extra_allowed_dirs: extra_dirs,
         resume_session_id: resume_ctx.resume_session_id.clone(),
@@ -402,6 +439,7 @@ pub async fn run_external_cli_reply(
             | StreamFormat::AcpJsonRpc
             | StreamFormat::DshJsonRpc
             | StreamFormat::PiRpc
+            | StreamFormat::AntigravityStreamJson
     );
     let mut spawned_opt = if persistent {
         None
@@ -498,6 +536,7 @@ pub async fn run_external_cli_reply(
         auto_allow_tools: std::sync::atomic::AtomicBool::new(
             permission_mode_from_args(&args)
                 .is_some_and(crate::external_agents::defs::claude::claude_mode_auto_allows_tools)
+                || (agent_id == "grok" && args.iter().any(|arg| arg == "--always-approve"))
                 || crate::external_agents::ask_user::auto_allow_ordinary_tools(&agent_id),
         ),
     });
@@ -692,10 +731,13 @@ pub async fn run_external_cli_reply(
         }
     }
 
-    let actual_native_session_id = matches!(def.stream_format, StreamFormat::PiRpc)
-        .then(|| crate::external_agents::session::load_live_handle(app, &conversation_id))
-        .flatten()
-        .map(|handle| handle.native_id);
+    let actual_native_session_id = matches!(
+        def.stream_format,
+        StreamFormat::PiRpc | StreamFormat::AntigravityStreamJson
+    )
+    .then(|| crate::external_agents::session::load_live_handle(app, &conversation_id))
+    .flatten()
+    .map(|handle| handle.native_id);
     persist_delivered_session(
         app,
         &conversation_id,
@@ -1283,6 +1325,20 @@ fn launch_config_for_turn(
             instructions: None,
         };
     }
+    if matches!(protocol, StreamFormat::AntigravityStreamJson) {
+        let env: std::collections::BTreeMap<_, _> =
+            crate::external_agents::overrides::env_for("antigravity")
+                .into_iter()
+                .collect();
+        let env_hash = crate::external_agents::session::stable_prompt_hash(
+            &serde_json::to_string(&env).unwrap_or_default(),
+        );
+        return LaunchConfig {
+            flags: serde_json::json!([model, reasoning, sandbox, additional_dirs_key, env_hash])
+                .to_string(),
+            instructions: None,
+        };
+    }
     if matches!(protocol, StreamFormat::PiRpc) {
         return LaunchConfig::for_pi(model, reasoning);
     }
@@ -1300,7 +1356,13 @@ fn launch_config_for_turn(
     }
     if matches!(protocol, StreamFormat::AcpJsonRpc) {
         return LaunchConfig {
-            flags: additional_dirs_key.to_string(),
+            // Grok's ask mode removes the process-bound --always-approve flag.
+            // A live full-access process must be relaunched before this choice can apply.
+            flags: if sandbox == Some("ask") {
+                serde_json::json!(["ask", additional_dirs_key]).to_string()
+            } else {
+                additional_dirs_key.to_string()
+            },
             instructions: None,
         };
     }
@@ -1351,9 +1413,10 @@ fn persistent_turn_prompt<'a>(
     latest_user_message: &'a str,
 ) -> &'a str {
     match protocol {
-        StreamFormat::ClaudeStreamJson | StreamFormat::DshJsonRpc | StreamFormat::PiRpc => {
-            composed_prompt
-        }
+        StreamFormat::ClaudeStreamJson
+        | StreamFormat::DshJsonRpc
+        | StreamFormat::PiRpc
+        | StreamFormat::AntigravityStreamJson => composed_prompt,
         _ => latest_user_message,
     }
 }
@@ -1432,6 +1495,11 @@ fn persistent_failure_action(
             PersistentFailureAction::ReconnectWithoutResume
         };
     }
+    // agy has no request ids or prompt acknowledgement. Replaying a failed in-flight
+    // turn could execute tools twice. Preserve the binding and let the user retry.
+    if agent_id == "antigravity" {
+        return PersistentFailureAction::Fatal;
+    }
     // Auth is never auto-retried (a doomed retry could trigger a login storm).
     if crate::external_agents::errors::is_auth_error(err, agent_id) {
         return PersistentFailureAction::Fatal;
@@ -1465,7 +1533,7 @@ fn is_missing_resume_target(err: &str, agent_id: &str) -> bool {
         Some(StreamFormat::AcpJsonRpc) => {
             crate::external_agents::session::acp::is_missing_acp_session_error(err)
         }
-        None => false,
+        Some(StreamFormat::AntigravityStreamJson) | None => false,
     }
 }
 
@@ -1533,7 +1601,9 @@ fn turn_asks_for_permission(args: &[String]) -> bool {
 /// 没有这条 flag 的 CLI（dsh 的 `session/ask`）靠 `ask_user::needs_host` —— 加了
 /// codec 就会开通道。
 fn turn_needs_approval_host(args: &[String], agent_id: &str) -> bool {
-    turn_asks_for_permission(args) || crate::external_agents::ask_user::needs_host(agent_id)
+    turn_asks_for_permission(args)
+        || agent_id == "grok"
+        || crate::external_agents::ask_user::needs_host(agent_id)
 }
 
 /// 本轮 argv 里的权限档位（`--permission-mode` 的值）。
@@ -1971,6 +2041,7 @@ fn persistent_protocol_tag(protocol: StreamFormat) -> &'static str {
         StreamFormat::AcpJsonRpc => "acp_json_rpc",
         StreamFormat::PiRpc => "pi_rpc",
         StreamFormat::DshJsonRpc => "dsh_json_rpc",
+        StreamFormat::AntigravityStreamJson => "antigravity_stream_json",
     }
 }
 
@@ -2409,6 +2480,22 @@ async fn connect_persistent_session(
     };
 
     match protocol {
+        StreamFormat::AntigravityStreamJson => {
+            use crate::external_agents::session::antigravity::{
+                spawn_antigravity_session_actor, AntigravitySession,
+            };
+            let session =
+                AntigravitySession::connect(resolved_bin, args, cwd, resume_native.as_deref())
+                    .await?;
+            let native_id = session.session_id().to_string();
+            let child_pid = session.child_pid();
+            Ok(PersistentConnection {
+                control: spawn_antigravity_session_actor(session),
+                native_id,
+                resumed: resume_native.is_some(),
+                child_pid,
+            })
+        }
         StreamFormat::ClaudeStreamJson => {
             // claude 的会话 id 走**启动参数**，不像 codex / ACP 在握手 RPC 里传 ——
             // 所以这里要看/改 argv 而不是传参。
@@ -2988,6 +3075,13 @@ fn apply_unified_event(
             tool_calls.push(record.clone());
             emit_chat_tool_record(app, run_id, &record);
         }
+        UnifiedAgentEvent::QueuedTextsRestored { texts } => {
+            crate::chat::protocol::emit_run_event(
+                app,
+                run_id,
+                crate::chat::protocol::ChatRunEvent::QueuedTextsRestored { texts },
+            );
+        }
         // 上游重试等瞬态状态 → 流状态行（StreamStatusLine），不进正文。
         // 前端在下一条正文/思考增量到达时自行清除（重试成功没有显式信号，流恢复即成功）。
         UnifiedAgentEvent::StatusNote { text } => {
@@ -3390,6 +3484,47 @@ fn truncate_for_preview(value: &str, max_chars: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn antigravity_preserves_turn_context_and_restarts_for_launch_changes() {
+        let protocol = StreamFormat::AntigravityStreamJson;
+        let original =
+            launch_config_for_turn(protocol, Some("a"), Some("low"), None, None, None, "dir");
+        for (model, effort, sandbox, dirs) in [
+            (Some("b"), Some("low"), None, "dir"),
+            (Some("a"), Some("high"), None, "dir"),
+            (Some("a"), Some("low"), Some("plan"), "dir"),
+            (Some("a"), Some("low"), None, "new-dir"),
+        ] {
+            assert!(!original.accepts(&launch_config_for_turn(
+                protocol, model, effort, sandbox, None, None, dirs
+            )));
+        }
+        assert_eq!(
+            persistent_turn_prompt(protocol, "skill + attachment + message", "message"),
+            "skill + attachment + message"
+        );
+        assert!(!cancel_keeps_live_session("cancelled", protocol));
+        assert_eq!(
+            persistent_failure_action(
+                "EOF after tool execution",
+                "antigravity",
+                false,
+                false,
+                false
+            ),
+            PersistentFailureAction::Fatal
+        );
+        assert_eq!(
+            persistent_failure_action(
+                crate::external_agents::session::live::CANCELLED_SESSION_LOST,
+                "antigravity",
+                false,
+                false,
+                false
+            ),
+            PersistentFailureAction::Cancelled
+        );
+    }
 
     /// 协议层自报的失败必须能到出口——修复前这里只打了一条日志，于是
     /// 「CLI 明确说本轮失败了」被整个吞掉（claude 未登录 ⇒ 空气泡 + 零提示）。
@@ -3870,6 +4005,8 @@ mod tests {
         // dsh 没有 `--permission-prompt-tool`：问用户靠 codec 开通道。
         assert!(turn_needs_approval_host(&[], "dsh"));
         assert!(turn_needs_approval_host(&[], "codex"));
+        assert!(turn_needs_approval_host(&[], "grok"));
+        assert!(turn_needs_approval_host(&[], "cursor-agent"));
         assert!(!turn_needs_approval_host(&[], "cursor"));
         assert!(!turn_needs_approval_host(&[], "claude"));
     }
@@ -4400,6 +4537,12 @@ mod tests {
     /// model/reasoning/sandbox/provider; Codex fingerprints sandbox only; ACP stays default.
     #[test]
     fn launch_config_fingerprints_process_bound_protocols() {
+        let grok = |sandbox| launch_config_for_turn(
+            StreamFormat::AcpJsonRpc, None, None, sandbox, None, None, "",
+        );
+        assert_eq!(grok(None), grok(Some("full")));
+        assert!(!grok(None).accepts(&grok(Some("ask"))));
+        assert!(!grok(Some("ask")).accepts(&grok(Some("full"))));
         let claude = launch_config_for_turn(
             StreamFormat::ClaudeStreamJson,
             Some("opus"),

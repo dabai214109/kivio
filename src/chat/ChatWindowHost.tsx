@@ -3,7 +3,9 @@ import { getCurrentWindow, type PhysicalSize } from '@tauri-apps/api/window'
 import { api } from '../api/tauri'
 import { isMac, isWindows, usesNativeTitlebar } from './platform'
 import { isTauriRuntime } from './utils'
+import { WindowMaximizedContext } from './windowMaximizedContext'
 import { syncChatWindowEffect, type ChatEffectPlatform } from './chatWindowEffects'
+import { observeNotificationView } from './notificationView'
 
 type ChatWindowHostProps = {
   children: ReactNode
@@ -31,6 +33,10 @@ function useDocumentDark(): boolean {
  * 并驱动系统窗口材质（macOS Menu / Windows Mica）的开关。
  */
 export function ChatWindowHost({ children, translucentSidebar }: ChatWindowHostProps) {
+  useEffect(() => {
+    if (!isTauriRuntime()) return
+    return observeNotificationView(api.chatReportNotificationView)
+  }, [])
   const [maximized, setMaximized] = useState(false)
   const [nativeEffectActive, setNativeEffectActive] = useState(false)
   const [effectInput, setEffectInput] = useState<{
@@ -297,8 +303,10 @@ export function ChatWindowHost({ children, translucentSidebar }: ChatWindowHostP
   ].filter(Boolean).join(' ')
 
   return (
-    <div className={hostClassName}>
-      {children}
-    </div>
+    <WindowMaximizedContext.Provider value={maximized}>
+      <div className={hostClassName}>
+        {children}
+      </div>
+    </WindowMaximizedContext.Provider>
   )
 }

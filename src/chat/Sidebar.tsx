@@ -754,22 +754,26 @@ export const Sidebar = memo(function Sidebar({
     const silent = options?.silent ?? false
     if (!silent) setLoading(true)
     try {
-      const [projectData, setData, assistantData, conversationData, pinData] = await Promise.all([
+      const conversationsPromise = chatApi.getConversations(0, 80)
+      const extrasPromise = Promise.all([
         chatApi.getProjects(),
         chatApi.getSets(),
         chatApi.getAssistants(),
-        chatApi.getConversations(0, 80),
         chatApi.getConversationPins(),
       ])
-      setProjects(projectData)
-      setSets(setData)
-      setConversationPins(pinData)
-      setAssistants(assistantData)
+      const conversationData = await conversationsPromise
       setConversations(conversationData)
       // 真实列表已落地：通知父组件剪掉已被接管的乐观条目。必须在 setConversations 同一批
       // 更新里发出，两个 state 才会在同一次 commit 中切换——行实例（key=id）无缝从乐观
       // 条目换到真实条目，SwapTitle 不重挂。
       onConversationsLoaded?.()
+      if (!silent) setLoading(false)
+
+      const [projectData, setData, assistantData, pinData] = await extrasPromise
+      setProjects(projectData)
+      setSets(setData)
+      setConversationPins(pinData)
+      setAssistants(assistantData)
       if (projectForLoad && !projectData.some((project) => project.id === projectForLoad.id)) {
         onSelectProject(null)
       }
@@ -1388,7 +1392,7 @@ export const Sidebar = memo(function Sidebar({
         )}
 
       <nav
-        className={`shrink-0 space-y-0.5 px-3 pb-2 ${usesNativeTitlebar ? '' : 'pt-2'}`}
+        className={`shrink-0 space-y-0.5 px-2 pb-2 ${usesNativeTitlebar ? '' : 'pt-2'}`}
         data-tauri-drag-region="false"
       >
         <NavRow
@@ -1410,18 +1414,18 @@ export const Sidebar = memo(function Sidebar({
         />
       </nav>
 
-      <div className="mx-3 border-t border-neutral-200/90 dark:border-neutral-800" />
+      <div className="mx-2 border-t border-neutral-200/90 dark:border-neutral-800" />
 
       <div className="flex min-h-0 flex-1 flex-col" data-tauri-drag-region="false">
         {loading ? (
-          <div className="space-y-2 px-3 py-3" aria-label={t.chatLoading} aria-busy="true">
+          <div className="space-y-2 px-2 py-3" aria-label={t.chatLoading} aria-busy="true">
             {[0, 1, 2, 3, 4, 5].map((i) => (
               <div key={i} className="kv-skeleton h-7 rounded-lg" />
             ))}
           </div>
         ) : (
           <>
-            <div className="flex items-center justify-between px-3 pb-1 pt-3">
+            <div className="flex items-center justify-between px-2 pb-1 pt-3">
               <div className="flex items-center gap-1.5 text-[13px] font-semibold">
                 {([
                   ['conversations', t.chatTabRecent],
@@ -1551,7 +1555,7 @@ export const Sidebar = memo(function Sidebar({
                 document.body,
               )}
             {activeTab === 'projects' && (
-            <section key="projects" className="chat-motion-tab-in group/projects px-3 pb-2 pt-1">
+            <section key="projects" className="chat-motion-tab-in group/projects px-2 pb-2 pt-1">
                 <div className="mt-1.5 space-y-1">
                   {visibleProjects.map((project) => {
                     const active = selectedProject?.id === project.id
@@ -1694,7 +1698,7 @@ export const Sidebar = memo(function Sidebar({
             )}
 
             {activeTab === 'sets' && (
-            <section key="sets" className="chat-motion-tab-in group/sets px-3 pb-2 pt-1">
+            <section key="sets" className="chat-motion-tab-in group/sets px-2 pb-2 pt-1">
                 <div className="mt-1.5 space-y-1">
                   {sets.length === 0 ? (
                     <button
@@ -1847,7 +1851,7 @@ export const Sidebar = memo(function Sidebar({
             )}
 
             {activeTab === 'conversations' && (
-            <section key="conversations" className="chat-motion-tab-in group/conversations px-3 pb-5 pt-1">
+            <section key="conversations" className="chat-motion-tab-in group/conversations px-2 pb-5 pt-1">
               {sectionMenuAnchor && (
                 <ChatSectionMenu
                   anchor={sectionMenuAnchor}

@@ -34,4 +34,26 @@ describe('ComposerAddMenu', () => {
     expect(screen.getByText('添加附件')).toBeTruthy()
     expect(screen.queryByText('添加文件夹')).toBeNull()
   })
+
+  it('nests sources under the plus menu', () => {
+    render(
+      <ComposerAddMenu
+        onAddAttachment={() => undefined}
+        sourcesPanel={<div>sources-body</div>}
+      />,
+    )
+
+    fireEvent.click(screen.getByLabelText('添加'))
+    expect(screen.getByText('添加附件')).toBeTruthy()
+    expect(screen.getByText('信息来源')).toBeTruthy()
+    expect(screen.queryByText('sources-body')).toBeNull()
+
+    fireEvent.click(screen.getByText('信息来源'))
+    expect(screen.getByText('sources-body')).toBeTruthy()
+    expect(screen.queryByText('添加附件')).toBeNull()
+
+    fireEvent.keyDown(window, { key: 'Escape' })
+    expect(screen.getByText('添加附件')).toBeTruthy()
+    expect(screen.queryByText('sources-body')).toBeNull()
+  })
 })

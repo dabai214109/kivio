@@ -36,6 +36,7 @@ interface UseMessageQueueParams {
     options: { conversationOverride: Conversation },
   ) => Promise<boolean>
   onRestoreToComposer: (message: QueuedMessage) => void
+  onPendingChange?: (conversationId: string, pending: boolean) => void
 }
 
 let steerSeq = 0
@@ -51,7 +52,7 @@ function nextQueuedId(): string {
  * 只在内存里。`steer` / `followUp` 成功只标记已提交，**不出队**；出队等插话卡
  * （实时事件或落库对账）。收尾一律走 `settleAfterRun`。
  */
-export function useMessageQueue({ onSendMessage, onRestoreToComposer }: UseMessageQueueParams) {
+export function useMessageQueue({ onSendMessage, onRestoreToComposer, onPendingChange }: UseMessageQueueParams) {
   const [queued, setQueued] = useState<Record<string, QueuedMessage[]>>({})
   const queuedRef = useRef(queued)
   /**
@@ -60,8 +61,8 @@ export function useMessageQueue({ onSendMessage, onRestoreToComposer }: UseMessa
    * 又会调 drain —— 标志此刻仍然挂着，第二条就永远发不出去了。
    */
   const claimedRef = useRef<Set<string>>(new Set())
-  const callbacksRef = useRef({ onSendMessage, onRestoreToComposer })
-  callbacksRef.current = { onSendMessage, onRestoreToComposer }
+  const callbacksRef = useRef({ onSendMessage, onRestoreToComposer, onPendingChange })
+  callbacksRef.current = { onSendMessage, onRestoreToComposer, onPendingChange }
 
   const patch = useCallback((
     conversationId: string,
@@ -79,6 +80,10 @@ export function useMessageQueue({ onSendMessage, onRestoreToComposer }: UseMessa
     }
     queuedRef.current = next
     setQueued(next)
+    callbacksRef.current.onPendingChange?.(
+      conversationId,
+      nextItems.some((item) => !isQueuedSubmitted(item)),
+    )
   }, [])
 
   const find = (conversationId: string, messageId: string) => (
@@ -113,6 +118,25 @@ export function useMessageQueue({ onSendMessage, onRestoreToComposer }: UseMessa
     if (!message || isQueuedSubmitted(message)) return
     patch(conversationId, (items) => items.filter((item) => item.id !== messageId))
     callbacksRef.current.onRestoreToComposer(message)
+  }, [patch])
+
+  /** Pi `clear_queue` 退回的原文：出队（含已提交）并写回输入框。 */
+  const restoreClearedQueue = useCallback((conversationId: string, texts: string[]) => {
+    const trimmed = texts.map((text) => text.trim()).filter(Boolean)
+    if (trimmed.length === 0) return
+    const pending = new Set(trimmed)
+    patch(conversationId, (items) => items.filter((item) => {
+      const content = item.content.trim()
+      if (!pending.has(content)) return true
+      pending.delete(content)
+      return false
+    }))
+    callbacksRef.current.onRestoreToComposer({
+      id: nextQueuedId(),
+      content: trimmed.join('\n\n'),
+      attachments: [],
+      steering: false,
+    })
   }, [patch])
 
   const clearConversation = useCallback((conversationId: string) => {
@@ -255,6 +279,7 @@ export function useMessageQueue({ onSendMessage, onRestoreToComposer }: UseMessa
     enqueue,
     remove,
     restoreToComposer,
+    restoreClearedQueue,
     clearConversation,
     drain,
     steer,

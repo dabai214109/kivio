@@ -215,9 +215,16 @@ fn granted_codex_permissions(params: &Value) -> Value {
     permissions
 }
 
+fn is_codex_elicitation(method: &str) -> bool {
+    method == "mcpServer/elicitation/request" || method.starts_with("openai/elicitation")
+}
+
 /// Approve payload when the user allows (or the 「完全」档 auto-allows). Each method
 /// maps to a different response shape (see the `*RequestApprovalResponse` schemas).
 fn approval_response(method: &str, params: &Value) -> Option<Value> {
+    if is_codex_elicitation(method) {
+        return Some(json!({ "action": "decline", "content": null }));
+    }
     match method {
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
             Some(json!({ "decision": "acceptForSession" }))
@@ -230,7 +237,6 @@ fn approval_response(method: &str, params: &Value) -> Option<Value> {
             "permissions": granted_codex_permissions(params),
             "scope": "session"
         })),
-        "mcpServer/elicitation/request" => Some(json!({ "action": "decline", "content": null })),
         _ => None,
     }
 }
@@ -238,6 +244,9 @@ fn approval_response(method: &str, params: &Value) -> Option<Value> {
 /// Deny payload. `interrupt` maps to Codex's cancel/abort (stop the turn); otherwise the
 /// agent continues and tries something else.
 fn approval_deny_response(method: &str, interrupt: bool) -> Option<Value> {
+    if is_codex_elicitation(method) {
+        return Some(json!({ "action": "decline", "content": null }));
+    }
     match method {
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
             Some(json!({
@@ -253,7 +262,6 @@ fn approval_deny_response(method: &str, interrupt: bool) -> Option<Value> {
             "permissions": {},
             "scope": "turn"
         })),
-        "mcpServer/elicitation/request" => Some(json!({ "action": "decline", "content": null })),
         _ => None,
     }
 }
@@ -675,6 +683,56 @@ fn emit_thread_item(
     include_result: bool,
 ) {
     match item.get("type").and_then(|v| v.as_str()) {
+        Some("agentMessage") if include_result => {
+            // 0.153 async questions are notifications, not reverse RPC. Emit a completed
+            // display card; its answer is an ordinary user message, never an approval reply.
+            let questions: Vec<Value> = item
+                .get("questions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .enumerate()
+                .filter_map(|(index, question)| {
+                    let title = json_str(question, "title")?;
+                    let options: Vec<Value> = question
+                        .get("options")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .enumerate()
+                        .filter_map(|(oi, option)| {
+                            let label = option.as_str()?.trim();
+                            (!label.is_empty())
+                                .then(|| json!({ "id": oi.to_string(), "label": label }))
+                        })
+                        .collect();
+                    Some(
+                        json!({ "id": index.to_string(), "prompt": title, "options": options,
+                        "allow_custom": true, "allow_multiple": false }),
+                    )
+                })
+                .collect();
+            if questions.is_empty() {
+                return;
+            }
+            let Some(id) = item_id(item).map(|id| format!("codex-async-{id}")) else {
+                return;
+            };
+            if !emitted_tools.insert(id.clone()) {
+                return;
+            }
+            sink(UnifiedAgentEvent::ToolUse {
+                id: id.clone(),
+                name: "request_user_input_async".to_string(),
+                input: json!({ "askUser": { "phase": "awaiting", "async": true,
+                    "questions": questions, "answers": {} } }),
+            });
+            sink(UnifiedAgentEvent::ToolResult {
+                tool_use_id: id,
+                content: String::new(),
+                is_error: false,
+            });
+        }
         Some("commandExecution") => {
             emit_command_execution(item, emitted_tools, sink, include_result)
         }
@@ -766,6 +824,37 @@ fn emit_thread_item(
                     Some(ms) => format!("{ms}ms"),
                     None => duration_ms.to_string(),
                 },
+            );
+        }
+        Some("clock") => {
+            let duration_ms = item.get("durationMs").cloned().unwrap_or(Value::Null);
+            let current_time = map_str(item, "currentTime")
+                .or_else(|| map_str(item, "time"))
+                .or_else(|| map_str(item, "now"))
+                .map(str::to_string);
+            let result = if let Some(time) = current_time.as_deref() {
+                time.to_string()
+            } else {
+                match duration_ms.as_u64() {
+                    Some(ms) => format!("{ms}ms"),
+                    None => item
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .unwrap_or("completed")
+                        .to_string(),
+                }
+            };
+            emit_named_tool(
+                item,
+                emitted_tools,
+                sink,
+                include_result,
+                "clock",
+                json!({
+                    "durationMs": duration_ms,
+                    "currentTime": current_time,
+                }),
+                result,
             );
         }
         Some("collabToolCall") | Some("collabAgentToolCall") => {
@@ -1592,7 +1681,12 @@ async fn answer_codex_server_request(
     if let Some(result) = approval_response(method, params) {
         return write_rpc_result(stdin, id, result).await;
     }
-    write_rpc_error(stdin, id, -32601, &format!("Method not found: {method}")).await
+    write_rpc_result(stdin, id, unknown_server_request_result()).await
+}
+
+/// 未知的带 `id` 请求：回 decline 结果而不是 `-32601`，避免这一轮挂死。
+fn unknown_server_request_result() -> Value {
+    json!({ "decision": "decline" })
 }
 
 async fn answer_codex_tool_approval(
@@ -1818,7 +1912,7 @@ async fn answer_handshake_request(
     if let Some(result) = approval_response(method, params) {
         write_rpc_result(stdin, id, result).await
     } else {
-        write_rpc_error(stdin, id, -32601, &format!("Method not found: {method}")).await
+        write_rpc_result(stdin, id, unknown_server_request_result()).await
     }
 }
 
@@ -2446,6 +2540,58 @@ pub fn spawn_codex_session_actor(
 mod tests {
     use super::*;
 
+    #[test]
+    fn async_questions_emit_one_nonblocking_card_only_on_completion() {
+        let params = json!({"item": {"type": "agentMessage", "id": "msg-1",
+        "text": "fallback", "questions": [
+            {"title": "Choose a color", "options": ["Red", "Blue"]},
+            {"title": "Anything else?", "options": null}
+        ]}});
+        let mut emitted = HashSet::new();
+        let mut events = Vec::new();
+        for method in ["item/started", "item/completed", "item/completed"] {
+            assert_eq!(
+                map_codex_notification(method, &params, &mut emitted, &mut |event| events
+                    .push(event)),
+                CodexMapResult::Continue
+            );
+            if method == "item/started" {
+                assert!(events.is_empty());
+            }
+        }
+        assert_eq!(events.len(), 2);
+        let UnifiedAgentEvent::ToolUse { input, .. } = &events[0] else {
+            panic!("card missing");
+        };
+        assert_eq!(input["askUser"]["async"], true);
+        assert_eq!(
+            input["askUser"]["questions"][0]["options"][1]["label"],
+            "Blue"
+        );
+        assert_eq!(input["askUser"]["questions"][1]["options"], json!([]));
+        assert!(matches!(
+            &events[1],
+            UnifiedAgentEvent::ToolResult {
+                is_error: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn legacy_agent_messages_and_empty_questions_do_not_create_cards() {
+        for questions in [Value::Null, json!([]), json!([{"title": " "}])] {
+            let (events, _) = collect(
+                "item/completed",
+                &json!({"item": {
+                    "type": "agentMessage", "id": "legacy", "questions": questions
+                }})
+                .to_string(),
+            );
+            assert!(events.is_empty());
+        }
+    }
+
     fn collect(method: &str, raw: &str) -> (Vec<UnifiedAgentEvent>, CodexMapResult) {
         let params: Value = serde_json::from_str(raw).unwrap();
         let mut events = Vec::new();
@@ -3065,6 +3211,7 @@ mod tests {
             UnifiedAgentEvent::CliCompacted { .. } => "CliCompacted",
             UnifiedAgentEvent::UserSteer { .. } => "UserSteer",
             UnifiedAgentEvent::UserFollowUp { .. } => "UserFollowUp",
+            UnifiedAgentEvent::QueuedTextsRestored { .. } => "QueuedTextsRestored",
             UnifiedAgentEvent::StatusNote { .. } => "StatusNote",
             UnifiedAgentEvent::BackgroundTask { .. } => "BackgroundTask",
             UnifiedAgentEvent::TodoWrite { .. } => "TodoWrite",
@@ -3502,6 +3649,22 @@ mod tests {
             approval_deny_response("item/permissions/requestApproval", false),
             Some(json!({ "permissions": {}, "scope": "turn" }))
         );
+        assert_eq!(
+            approval_response("mcpServer/elicitation/request", &empty),
+            Some(json!({ "action": "decline", "content": null }))
+        );
+        assert_eq!(
+            approval_response("openai/elicitation/create", &empty),
+            Some(json!({ "action": "decline", "content": null }))
+        );
+        assert_eq!(
+            approval_deny_response("openai/elicitation", false),
+            Some(json!({ "action": "decline", "content": null }))
+        );
+        assert_eq!(
+            unknown_server_request_result(),
+            json!({ "decision": "decline" })
+        );
     }
 
     #[test]
@@ -3733,6 +3896,33 @@ mod tests {
             event,
             UnifiedAgentEvent::ToolResult { tool_use_id, content, .. }
                 if tool_use_id == "slp-1" && content == "1500ms"
+        )));
+    }
+
+    #[test]
+    fn clock_item_emits_tool_card() {
+        let clock = json!({
+            "item": {
+                "type": "clock",
+                "id": "clk-1",
+                "status": "completed",
+                "currentTime": "2026-09-01T15:00:00Z"
+            }
+        });
+        let mut events = Vec::new();
+        let mut tools = HashSet::new();
+        map_codex_notification("item/started", &clock, &mut tools, &mut |e| events.push(e));
+        map_codex_notification("item/completed", &clock, &mut tools, &mut |e| {
+            events.push(e)
+        });
+        assert!(events.iter().any(|event| matches!(
+            event,
+            UnifiedAgentEvent::ToolUse { name, .. } if name == "clock"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            UnifiedAgentEvent::ToolResult { tool_use_id, content, .. }
+                if tool_use_id == "clk-1" && content == "2026-09-01T15:00:00Z"
         )));
     }
 

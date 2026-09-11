@@ -3,11 +3,11 @@
  *
  * Assign a stable virtualizer row key at run start (`live-turn-N` /
  * `live-group-<id>`). On settle, alias the committed twin onto that key so the
- * first history mount reuses the live estimate/cache identity.
+ * committed row reuses the live estimate/cache and React identity.
  *
- * Live rides outside the virtualizer; key continuity stabilizes the twin's
- * first history mount, not DOM reuse. Pure and DOM-free — MessageList feeds
- * run/history facts each render.
+ * Live rides outside the virtualizer's measurements, but shares a keyed parent
+ * with historical rows so visible content survives the handoff. Pure and
+ * DOM-free — MessageList feeds run/history facts each render.
  */
 
 export type LiveRowSyncInput = {
@@ -52,6 +52,8 @@ type Turn = {
   /** historyAssistantIds.length when the turn started — twins are only after this. */
   assistantCountAtStart: number
   groupId: string | null
+  /** Keep the last streamed id after completion clears the visible snapshot. */
+  messageId: string | null
 }
 
 function groupLiveKey(groupId: string): string {
@@ -86,7 +88,8 @@ export function createLiveRowModel(): LiveRowModel {
   ): boolean => {
     if (turn.groupId) return false
     const candidates: string[] = []
-    if (preferredTwinId) candidates.push(preferredTwinId)
+    const knownTwinId = preferredTwinId ?? turn.messageId
+    if (knownTwinId) candidates.push(knownTwinId)
     for (let i = historyAssistantIds.length - 1; i >= turn.assistantCountAtStart; i -= 1) {
       const id = historyAssistantIds[i]
       if (id && !candidates.includes(id)) candidates.push(id)
@@ -142,6 +145,7 @@ export function createLiveRowModel(): LiveRowModel {
             conversationId,
             assistantCountAtStart: input.historyAssistantIds.length,
             groupId: nextGroupId,
+            messageId: null,
           }
         } else {
           activeTurn = {
@@ -149,8 +153,13 @@ export function createLiveRowModel(): LiveRowModel {
             conversationId,
             assistantCountAtStart: input.historyAssistantIds.length,
             groupId: null,
+            messageId: input.preferredTwinId,
           }
         }
+      }
+
+      if (activeTurn && !activeTurn.groupId && input.preferredTwinId) {
+        activeTurn.messageId = input.preferredTwinId
       }
 
       // Twin aliasing only on settle (or pendingSettle lag). During stream Kivio

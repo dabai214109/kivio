@@ -2,7 +2,7 @@
 // （无会话则以该专家开新对话）；底部「管理 / 创建专家」跳 AssistantCenter 整页。
 // 弹层贴按钮、紧凑宽度，不再铺满输入框。
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Bot, Check, Settings2 } from 'lucide-react'
+import { Award, Check, CircleOff, Settings2 } from 'lucide-react'
 import { useT } from '../settings/i18n'
 import { chatApi } from './api'
 import { api } from '../api/tauri'
@@ -64,8 +64,7 @@ export function AssistantPicker({
   useEffect(() => {
     if (!open) return
     const onDown = (e: MouseEvent) => {
-      const t = e.target as Node
-      if (ref.current?.contains(t)) return
+      if (ref.current?.contains(e.target as Node)) return
       setOpen(false)
     }
     document.addEventListener('mousedown', onDown)
@@ -90,7 +89,7 @@ export function AssistantPicker({
         size="sm"
         shape="circle"
         disabled={disabled}
-        onClick={() => setOpen((v) => !v)}
+        onClick={() => setOpen((value) => !value)}
         className={`focus-visible:ring-2 focus-visible:ring-neutral-300/60 dark:focus-visible:ring-neutral-600 ${
           open
             ? 'bg-neutral-200 text-neutral-700 dark:bg-neutral-700 dark:text-neutral-100'
@@ -104,8 +103,8 @@ export function AssistantPicker({
         title={assistantChipLabel}
       >
         {currentAssistant
-          ? builtinAssistantGlyph(currentAssistant.id, 18) ?? <Bot size={18} strokeWidth={1.75} />
-          : <Bot size={18} strokeWidth={1.75} />}
+          ? builtinAssistantGlyph(currentAssistant.id, 18) ?? <Award size={18} strokeWidth={1.75} />
+          : <Award size={18} strokeWidth={1.75} />}
       </IconButton>
       {open && (
         <div
@@ -122,7 +121,7 @@ export function AssistantPicker({
               className="kv-menu-item"
             >
               <span className="grid size-4 shrink-0 place-items-center">
-                <Bot size={13} strokeWidth={1.75} />
+                <CircleOff size={13} strokeWidth={1.75} />
               </span>
               {t.chatNoAssistant}
             </button>
@@ -144,7 +143,7 @@ export function AssistantPicker({
                   }`}
                 >
                   <span className="grid size-4 shrink-0 place-items-center text-indigo-500 dark:text-indigo-300">
-                    {builtinAssistantGlyph(assistant.id, 14) ?? <Bot size={13} strokeWidth={1.75} />}
+                    {builtinAssistantGlyph(assistant.id, 14) ?? <Award size={13} strokeWidth={1.75} />}
                   </span>
                   <span className="min-w-0 flex-1 truncate">{assistant.name}</span>
                   {active && <Check size={12} strokeWidth={2.5} className="shrink-0 text-indigo-500 dark:text-indigo-300" />}

@@ -18,7 +18,8 @@ import type {
   ChatRunEventEnvelope,
   ChatSegmentPayload as GeneratedChatSegmentPayload,
 } from '../generated/chatProtocol'
-import type { Automation, AutomationChangedEvent, AutomationMeta, AutomationRunEvent, AutomationRunStarted, AutomationRunSummary } from '../chat/automation/types'
+import type { Automation, AutomationChangedEvent, AutomationMeta, AutomationRun, AutomationRunEvent, AutomationRunStarted, AutomationRunSummary } from '../chat/automation/types'
+import type { GoalState } from '../chat/types'
 
 // ========== 类型定义 ==========
 
@@ -211,6 +212,11 @@ export type ChatPlanState = {
 export type ChatPlanPayload = {
   conversationId: string
   planState: ChatPlanState
+}
+
+export type ChatGoalPayload = {
+  conversationId: string
+  goalState: GoalState | null
 }
 
 export type ChatToolStatus =
@@ -985,7 +991,26 @@ export type ModelInfo = {
 // AI 模型提供商配置
 // apiKeys 是密钥池；activeKeyIndex 是用户点选的当前 Key。
 // 鉴权/配额失败时后端仍会自动切到池里其它 Key。
+export type ProviderOAuthConfig = { provider: 'codex' | 'kimi' | 'antigravity'; credentialId?: string }
+export type ProviderOAuthAccount = { email: string | null; name: string | null; accountId: string | null }
+export type ProviderOAuthUsage = { plan: string | null; fetchedAt: number; windows: { label: string; usedPercent: number | null; used: number | null; limit: number | null; resetsAt: number | null; resetHint?: string | null }[] }
+export type ProviderOAuthLogin = { loginId: string; userCode: string; verificationUrl: string; interval: number; expiresAt: number }
+export type ProviderOAuthPoll = { status: 'pending' | 'authorized'; interval: number; auth: ProviderOAuthConfig | null }
+
+export function isOpenCodeFree(provider: ModelProvider): boolean {
+  return !provider.request?.oauth
+    && (!provider.apiFormat || provider.apiFormat === 'openai_chat')
+    && provider.baseUrl.trim().replace(/\/+$/, '') === 'https://opencode.ai/zen/v1'
+    && provider.apiKeys.every(key => !key.trim())
+}
+
+export function providerHasCredentials(provider: ModelProvider): boolean {
+  if (isOpenCodeFree(provider)) return true
+  return provider.request?.oauth ? Boolean(provider.request.oauth.credentialId) : provider.apiKeys.some(key => key.trim() !== '')
+}
+
 export type ProviderRequestConfig = {
+  oauth?: ProviderOAuthConfig | null
   /** 附加到该供应商所有请求上的自定义头。同名时覆盖 CLI 身份预设。 */
   customHeaders?: { key: string; value: string }[]
   /** 是否跟随系统代理。默认 true；关掉走直连。 */
@@ -1177,6 +1202,8 @@ export type Settings = {
   launchMinimizedToTray: boolean
   /** 关闭聊天窗口时隐藏复用（默认 false = 销毁）。下次打开无需重新加载，占用更多内存。 */
   keepChatWindowAlive?: boolean
+  /** 回复完成时发送系统通知，默认关闭；开启后正在查看该对话时不提醒。 */
+  chatCompletionNotifications?: boolean
   translatorProviderId: string
   translatorModel: string
   chatProviderId: string
@@ -1575,6 +1602,7 @@ function normalizeProvider(provider: ModelProvider): ModelProvider {
     compressRequestBody: provider.compressRequestBody === true,
     apiFormat: normalizeProviderApiFormat(provider.apiFormat),
     request: {
+      oauth: provider.request?.oauth ?? null,
       customHeaders: Array.isArray(provider.request?.customHeaders)
         ? provider.request.customHeaders
         : [],
@@ -1628,7 +1656,12 @@ export function isOfficialDeepSeekApi(baseUrl?: string): boolean {
   }
 }
 
-export function builtinWebSearchSupported(apiFormat?: string, baseUrl?: string): boolean {
+export function resolveProviderWebSearchMode<T extends 'off' | 'builtin' | 'third_party' | undefined>(mode: T, oauthProvider?: string): T | 'third_party' {
+  return oauthProvider === 'antigravity' && mode === 'builtin' ? 'third_party' : mode
+}
+
+export function builtinWebSearchSupported(apiFormat?: string, baseUrl?: string, oauthProvider?: string): boolean {
+  if (oauthProvider === 'antigravity') return false
   const kind = normalizeProviderApiFormat(apiFormat)
   if (
     kind === 'openai_responses' ||
@@ -1788,7 +1821,7 @@ function isDefaultModelConfigured(selection: DefaultModelSelection): boolean {
 
 function providerHasUsableConfig(provider: ModelProvider): boolean {
   return provider.enabled !== false
-    && provider.apiKeys.some((key) => key.trim() !== '')
+    && providerHasCredentials(provider)
     && provider.enabledModels.length > 0
 }
 
@@ -1851,6 +1884,7 @@ export function normalizeSettings(settings: Settings): Settings {
     launchAtStartup: current.launchAtStartup ?? false,
     launchMinimizedToTray: current.launchMinimizedToTray ?? false,
     keepChatWindowAlive: current.keepChatWindowAlive ?? false,
+    chatCompletionNotifications: current.chatCompletionNotifications ?? false,
     translatorProviderId: current.translatorProviderId ?? '',
     translatorModel: current.translatorModel ?? '',
     chatProviderId: effectiveChatModel.providerId,
@@ -2025,6 +2059,13 @@ async function onChatProtocol(
 // ========== API 导出 ==========
 
 export const api = {
+  providerOAuthStart: (provider: ProviderOAuthConfig['provider'], useSystemProxy = true) =>
+    invoke<ProviderOAuthLogin>('provider_oauth_start', { provider, useSystemProxy }),
+  providerOAuthPoll: (loginId: string) => invoke<ProviderOAuthPoll>('provider_oauth_poll', { loginId }),
+  providerOAuthCancel: (loginId: string) => invoke<void>('provider_oauth_cancel', { loginId }),
+  providerOAuthAccount: (provider: ModelProvider) => invoke<ProviderOAuthAccount>('provider_oauth_account', { provider }),
+  providerOAuthUsage: (provider: ModelProvider) => invoke<ProviderOAuthUsage>('provider_oauth_usage', { provider }),
+  providerOAuthDisconnect: (credentialId: string) => invoke<void>('provider_oauth_disconnect', { credentialId }),
   // 设置相关
   getSettings: async () => normalizeSettings(await invoke<Settings>('get_settings')),
   // Kivio Remote（远程连接）
@@ -2034,6 +2075,7 @@ export const api = {
   remoteBridgeCancelPairing: () => invoke<void>('remote_bridge_cancel_pairing'),
   remoteBridgeStatus: () => invoke<RemoteBridgeStatus>('remote_bridge_status'),
   imGatewayStatus: () => invoke<ImGatewayStatusInfo>('im_gateway_status'),
+  onKivioConfigurationChanged: (listener: () => void) => on('kivio-configuration-changed', () => listener()),
   // 某模型可选的思考等级列表（用户覆盖 modelOverrides → 模型库 reasoningEfforts → 家族兜底）。
   reasoningEffortsForModel: (model: string, providerId?: string) =>
     invoke<string[]>('chat_reasoning_efforts_for_model', { model, providerId }),
@@ -2150,6 +2192,12 @@ export const api = {
     invoke<void>('automation_export', { id, path }),
   automationImport: (path: string) => invoke<Automation>('automation_import', { path }),
   automationRunsList: (id: string) => invoke<AutomationRunSummary[]>('automation_runs_list', { id }),
+  automationActiveRun: (id: string) => invoke<AutomationRun | null>('automation_active_run', { id }),
+  automationRunGet: (id: string, runId: string) => invoke<AutomationRun>('automation_run_get', { id, runId }),
+  automationTestNode: (id: string, nodeId: string, input: import('../chat/automation/types').NodeOutput) =>
+    invoke<AutomationRunStarted>('automation_test_node', { id, nodeId, input }),
+  automationValidate: (automation: Automation) =>
+    invoke<import('../chat/automation/types').ValidationIssue[]>('automation_validate', { automation }),
   onAutomationRun: (listener: (payload: AutomationRunEvent) => void) =>
     on<AutomationRunEvent>('automation-run', listener),
   onAutomationChanged: (listener: (payload: AutomationChangedEvent) => void) =>
@@ -2167,6 +2215,8 @@ export const api = {
   /** macOS 交通灯中心距内容顶缘的真实距离（CSS px）。取不到返回 null，前端退回默认值。 */
   chatTrafficLightCenterY: (): Promise<number | null> =>
     invoke('chat_traffic_light_center_y'),
+  chatReportNotificationView: (route: string, viewing: boolean): Promise<void> =>
+    invoke('chat_report_notification_view', { route, viewing }),
   resizeWindow: async (width: number, height: number) => {
     const win = getCurrentWindow()
     await win.setSize(new LogicalSize(width, height))
@@ -2267,6 +2317,13 @@ export const api = {
       listener({ conversationId: event.conversationId, planState: event.planState as ChatPlanState })
     })
   },
+  onChatGoal: (listener: (payload: ChatGoalPayload) => void) => {
+    if (!isTauriRuntime()) return Promise.resolve(() => {})
+    return onChatProtocol((event) => {
+      if (event.type !== 'goal_updated' || event.scope !== 'conversation') return
+      listener({ conversationId: event.conversationId, goalState: (event.goalState as GoalState | null) ?? null })
+    })
+  },
   onChatTool: (listener: (payload: ChatToolProgressPayload) => void) => {
     if (!isTauriRuntime()) return Promise.resolve(() => {})
     return onChatProtocol((event) => {
@@ -2294,6 +2351,20 @@ export const api = {
         hookName: event.hookName,
         event: event.event,
         message: event.message,
+      })
+    })
+  },
+  /** Pi `clear_queue` 退回的立刻引导 / follow-up 原文，写回输入框。快照回放忽略。 */
+  onChatQueuedTextsRestored: (
+    listener: (payload: { conversationId: string; texts: string[] }) => void,
+  ) => {
+    if (!isTauriRuntime()) return Promise.resolve(() => {})
+    return onChatProtocol((event, delivery) => {
+      if (event.scope !== 'run' || event.type !== 'queued_texts_restored') return
+      if (delivery.source === 'snapshot') return
+      listener({
+        conversationId: event.conversationId,
+        texts: event.texts,
       })
     })
   },

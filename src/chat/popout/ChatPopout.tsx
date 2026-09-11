@@ -5,13 +5,16 @@ import { configureChatProtocolFilter } from '../../api/chatProtocol'
 import { ApprovalCard } from '../ApprovalCard'
 import { AskUserBlock } from '../AskUserBlock'
 import { InputBar } from '../InputBar'
+import { GoalCard } from '../GoalCard'
+import { composerGoal } from '../goalPresentation'
 import { ChatTitlebar } from '../ChatTitlebar'
 import { usesNativeTitlebar } from '../platform'
 import { IconButton } from '../../components/Button'
 import { i18n, LangContext, type Lang } from '../../settings/i18n'
 import {
+  isClaudePlanApproval,
+  isCursorPlanApproval,
   isEnterPlanApproval,
-  isPlanApproval,
   PLAN_APPROVAL_ACTIONS,
   toolApprovalTitle,
 } from '../toolApproval'
@@ -73,7 +76,7 @@ function PopoutPendingSlot({
             subtitle={`${pendingToolConfirm.source}${pendingToolConfirm.serverId ? ` · ${pendingToolConfirm.serverId}` : ''}`}
             detail={pendingToolConfirm.argumentsPreview}
             error={toolConfirmError}
-            actions={isPlanApproval(pendingToolConfirm)
+            actions={isClaudePlanApproval(pendingToolConfirm)
               ? [
                 { label: '拒绝 / 让它改', disabled: toolConfirmSubmitting, onSelect: () => { void resolveToolConfirm(false) } },
                 ...PLAN_APPROVAL_ACTIONS.map((action, index) => ({
@@ -83,6 +86,11 @@ function PopoutPendingSlot({
                   onSelect: () => { void resolveToolConfirm(true, false, action.mode) },
                 })),
               ]
+              : isCursorPlanApproval(pendingToolConfirm)
+                ? [
+                  { label: '拒绝 / 让它改', disabled: toolConfirmSubmitting, onSelect: () => { void resolveToolConfirm(false) } },
+                  { label: '批准', primary: true, disabled: toolConfirmSubmitting, onSelect: () => { void resolveToolConfirm(true) } },
+                ]
               : isEnterPlanApproval(pendingToolConfirm)
                 ? [
                   { label: '不用，直接做', disabled: toolConfirmSubmitting, onSelect: () => { void resolveToolConfirm(false) } },
@@ -118,6 +126,8 @@ function ChatPopoutBody({
   lang: Lang
 }) {
   const session = usePopoutSession(conversationId, lang)
+  const visibleGoal = composerGoal(session.conversation?.goal_state ?? session.conversation?.goalState,
+    session.conversation?.messages ?? [])
   const titlebar = (
     <PopoutTitlebar
       conversation={session.conversation}
@@ -166,7 +176,15 @@ function ChatPopoutBody({
         <MessageList key={conversationId} {...session.messageListProps} />
       </Suspense>
       <PopoutPendingSlot session={session} />
-      <InputBar {...session.inputBarProps} />
+      <InputBar {...session.inputBarProps} goalSlot={visibleGoal && (
+        <GoalCard
+          goal={visibleGoal}
+          onEdit={session.editGoal}
+          onPause={session.pauseGoal}
+          onResume={session.resumeGoal}
+          onCancel={session.cancelGoal}
+        />
+      )} />
     </>
   )
 

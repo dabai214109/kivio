@@ -1,8 +1,8 @@
 import { isValidElement, memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { Code2, ExternalLink, Eye, Loader2 } from 'lucide-react'
-import type { Components, UrlTransform } from 'streamdown'
-import { defaultRemarkPlugins, Streamdown } from 'streamdown'
+import type { BlockProps, Components, UrlTransform } from 'streamdown'
+import { Block, defaultRemarkPlugins, Streamdown } from 'streamdown'
 import type { PluggableList } from 'unified'
 import { cjk } from '@streamdown/cjk'
 import { code } from '@streamdown/code'
@@ -19,12 +19,19 @@ import { citationPopoverPosition, type CitationPopoverPosition } from './citatio
 import { isWebCitation } from './webSearchCitations'
 import { ChatInlineImage } from './ChatInlineImage'
 import { MarkdownStreamingContext } from './markdownStreaming'
-import { getSettledMarkdownCacheEntry } from './settledMarkdownCache'
+import { getSettledMarkdownCacheEntry, getSettledMarkdownOutline, type SettledMarkdownCacheEntry } from './settledMarkdownCache'
+import {
+  markdownHeadingAnchorId,
+  type MarkdownHeadingOutlineItem,
+  parseMarkdownHeadingOutline,
+} from './markdownHeadingOutline'
 import { ChatHeavyIsland } from './ChatHeavyIsland'
 import { useConversationTransition } from './conversationTransitionStore'
 import { api } from '../api/tauri'
 import { copyToClipboard } from '../utils/clipboard'
 import { IconButton } from '../components/Button'
+import { CliCommandReport } from './CliCommandReport'
+import { normalizeLegacyCliReport, parseCliReport } from './cliCommandReportData'
 
 interface ChatMarkdownProps {
   content: string
@@ -35,7 +42,22 @@ interface ChatMarkdownProps {
   variant?: 'default' | 'reasoning' | 'lens' | 'lens-muted'
   /** 引用：把答案里的 `[n]` 渲染成可点来源片段（n → KB 命中片段或联网来源）。 */
   citations?: Map<number, CitationView>
+  /** 已完成助手回答才传入；ChatMarkdown 负责把同一份规范化 Markdown 的标题注册给消息目录。 */
+  outlineSource?: ChatMarkdownOutlineSource
 }
+
+export type MarkdownOutlineSourceUpdate = {
+  ownerMessageId: string
+  sourceId: string
+  items: MarkdownHeadingOutlineItem[] | null
+}
+
+export type ChatMarkdownOutlineSource = {
+  ownerMessageId: string
+  sourceId: string
+  onChange: (update: MarkdownOutlineSourceUpdate) => void
+}
+
 
 // 排版只走 Streamdown 默认样式；变体只改外壳字号/颜色。
 // 代码块 / 表格 / 本地链接 / artifact 图仍用 components 做应用能力，不改正文排版。
@@ -746,14 +768,21 @@ function HtmlCodePreview({ html }: { html: string }) {
 }
 
 function MarkdownPre({ children }: { children?: ReactNode }) {
-  // 流式中避免 ChatHeavyIsland 延迟 hydrate：fallback(112px) → 真代码块 的高度跳变
-  // 会在贴底 pin 之后再撑开，整段生成内容看起来「往下闪」一下。
+  // 流式与落库走**同一个** DeferredCodeBlock 外壳：流式下它 eager（`eager={streaming}`，
+  // useState 初始化就 hydrated，没有 fallback 112px → 真身的高度跳变），但 island 的
+  // 包装 div 与历史气泡一致。之前流式直接渲染裸 <figure>，settle 后 twin 多一层 div，
+  // figure 的 my-3 与根 space-y-4 的外边距折叠结果不同（下边 12px vs 16px），每个代码块
+  // 差 4px，长回答在生成结束那一刻整篇往下挪。
   const streaming = useContext(MarkdownStreamingContext)
   const child = Array.isArray(children) ? children[0] : children
   if (isValidElement<{ className?: string; children?: unknown }>(child)) {
     const languageMatch = /language-([\w-]+)/.exec(child.props.className ?? '')
     const language = normalizeCodeLanguage(languageMatch?.[1])
     const code = codeChildrenToString(child.props.children)
+    if (language === 'kivio-cli-report') {
+      const report = parseCliReport(code)
+      if (report) return <CliCommandReport report={report} />
+    }
     if (language === 'html') {
       return <HtmlCodePreview html={code} />
     }
@@ -765,10 +794,8 @@ function MarkdownPre({ children }: { children?: ReactNode }) {
     if (language === 'kivio-error-details') {
       return <ErrorDetails detail={code} />
     }
-    if (streaming) return <CodeBlock code={code} language={language} />
     return <DeferredCodeBlock code={code} language={language} />
   }
-  if (streaming) return <CodeBlock code={codeChildrenToString(children)} language="" />
   return <DeferredCodeBlock code={codeChildrenToString(children)} language="" />
 }
 
@@ -1102,57 +1129,114 @@ const streamdownRemarkPlugins: PluggableList = [
   remarkBreaks,
 ]
 
-const FullSettledMarkdown = memo(function FullSettledMarkdown({
+// Streamdown 2.5 can leave a block stale after a non-prefix replacement. Scope
+// that recovery to the affected block: resetting the entire document also
+// destroys unchanged code, math, image and preview state on every correction.
+const ChatMarkdownBlock = memo(function ChatMarkdownBlock(props: BlockProps) {
+  const previousContentRef = useRef(props.content)
+  const revisionRef = useRef(0)
+  const previous = previousContentRef.current
+  if (typeof previous === 'string' && previous
+    && typeof props.content === 'string' && !props.content.startsWith(previous)) {
+    revisionRef.current += 1
+  }
+  previousContentRef.current = props.content
+  return <Block key={revisionRef.current} {...props} />
+})
+
+const MarkdownDocument = memo(function MarkdownDocument({
   content,
   components,
   remarkPlugins,
-  useCache,
   streaming,
+  outlineSource,
+  documentRoot,
 }: {
   content: string
   components: Components
   remarkPlugins: PluggableList
-  useCache: boolean
   streaming: boolean
+  outlineSource?: ChatMarkdownOutlineSource
+  documentRoot: HTMLDivElement | null
 }) {
-  const normalized = useMemo(() => {
+  const outlineSourceId = outlineSource?.sourceId
+  const outlineOwnerMessageId = outlineSource?.ownerMessageId
+  const onOutlineSourceChange = outlineSource?.onChange
+  const entry = useMemo<SettledMarkdownCacheEntry>(() => {
     const build = () => {
       const normalizedContent = preserveLocalMarkdownLinks(
-        normalizeMarkdownForRender(normalizeLegacyErrorDetails(content)),
+        normalizeMarkdownForRender(normalizeLegacyCliReport(normalizeLegacyErrorDetails(content))),
       )
       return { normalized: normalizedContent }
     }
-    return useCache
-      ? getSettledMarkdownCacheEntry(content, build).normalized
-      : build().normalized
-  }, [content, useCache])
-
-  // Streamdown streaming 模式对「非前缀扩展」的整段替换可能卡住旧块（如 frame 0→frame 1）。
-  // 真实流式几乎总是前缀增长；一旦不是，换 key 强制重挂，避免 DOM 停在旧正文。
-  const streamEpochRef = useRef(0)
-  const prevStreamContentRef = useRef(content)
-  if (streaming) {
-    const prev = prevStreamContentRef.current
-    if (prev && content !== prev && !content.startsWith(prev)) {
-      streamEpochRef.current += 1
-
+    if (streaming) return build()
+    if (outlineSourceId) {
+      return getSettledMarkdownOutline(content, build, parseMarkdownHeadingOutline)
     }
-    prevStreamContentRef.current = content
-  } else {
-    prevStreamContentRef.current = content
-  }
-  const streamEpoch = streamEpochRef.current
+    return getSettledMarkdownCacheEntry(content, build)
+  }, [content, outlineSourceId, streaming])
+  const outlineItems = useMemo<MarkdownHeadingOutlineItem[]>(() => {
+    if (!outlineSourceId || streaming || !entry.outline) return []
+    return entry.outline.map((heading) => ({
+      ...heading,
+      sourceId: outlineSourceId,
+      anchorId: markdownHeadingAnchorId(outlineSourceId, heading.ordinal),
+    }))
+  }, [entry.outline, outlineSourceId, streaming])
+  useLayoutEffect(() => {
+    if (!outlineSourceId || !outlineOwnerMessageId || !onOutlineSourceChange || streaming) return
+    const root = documentRoot
+    if (!root) return
+    let frame: number | null = null
+    let published = false
+    const apply = () => {
+      // Match the outline parser's root-only heading policy. Nested headings
+      // and empty headings must not shift every subsequent anchor by one.
+      const headings = [...root.querySelectorAll<HTMLElement>('h1, h2, h3')].filter((heading) => (
+        !heading.closest('blockquote, li, details')
+        && (heading.textContent?.trim() || [...heading.querySelectorAll('img')].some((image) => image.alt.trim()))
+      ))
+      if (headings.length < outlineItems.length) return
+      outlineItems.forEach((item, index) => {
+        const heading = headings[index]
+        if (heading) heading.id = item.anchorId
+      })
+      if (!published) {
+        published = true
+        onOutlineSourceChange({ ownerMessageId: outlineOwnerMessageId, sourceId: outlineSourceId, items: outlineItems })
+      }
+    }
+    const observer = typeof MutationObserver === 'undefined'
+      ? null
+      : new MutationObserver(apply)
+    observer?.observe(root, { childList: true, subtree: true })
+    apply()
+    // Streamdown 可在父级 layout effect 之后才提交异步 block；下一帧补一次让目录只在
+    // 可定位的 heading DOM 已存在时注册。
+    frame = requestAnimationFrame(apply)
+    return () => {
+      if (frame != null) cancelAnimationFrame(frame)
+      observer?.disconnect()
+      onOutlineSourceChange({ ownerMessageId: outlineOwnerMessageId, sourceId: outlineSourceId, items: null })
+    }
+  }, [
+    documentRoot,
+    outlineItems,
+    onOutlineSourceChange,
+    outlineOwnerMessageId,
+    outlineSourceId,
+    streaming,
+  ])
 
-  // 对齐 LiveAgent Markdown：
-  // - 流式消息固定走 Streamdown streaming 模式（块级 memo + parseIncomplete），
-  //   不要在每个 token 上整篇 static 重解析——那会放大行高抖动。
-  // - isAnimating 跟「还在出字」绑定；animated 始终 false（不做字级动画）。
-  // - 模式只由 streaming 上下文决定；settled 后才切 static，避免中途整树重挂。
+  // Keep one parser mode and document identity through completion. Static mode
+  // parses the whole document differently from streaming's memoized blocks,
+  // changing cross-block syntax and spacing. Only corrected blocks remount.
   return (
     <Streamdown
-      key={streaming ? `stream-${streamEpoch}` : 'static'}
-      mode={streaming ? 'streaming' : 'static'}
-      dir="auto"
+      mode="streaming"
+      BlockComponent={ChatMarkdownBlock}
+      // The outer shell owns dir="auto". Streamdown's dir wrappers use
+      // display:contents, which breaks the block spacing selectors.
       parseIncompleteMarkdown
       normalizeHtmlIndentation
       plugins={streamdownPlugins}
@@ -1169,7 +1253,7 @@ const FullSettledMarkdown = memo(function FullSettledMarkdown({
       urlTransform={chatMarkdownUrlTransform}
       linkSafety={{ enabled: false }}
     >
-      {normalized}
+      {entry.normalized}
     </Streamdown>
   )
 })
@@ -1182,8 +1266,10 @@ function ChatMarkdownComponent({
   onImageClick,
   variant = 'default',
   citations,
+  outlineSource,
 }: ChatMarkdownProps) {
   const streaming = useContext(MarkdownStreamingContext)
+  const [documentRoot, setDocumentRoot] = useState<HTMLDivElement | null>(null)
   const remarkPlugins = useMemo<PluggableList>(() => {
     const plugins: PluggableList = [...streamdownRemarkPlugins]
     if (citations && citations.size > 0) {
@@ -1226,14 +1312,20 @@ function ChatMarkdownComponent({
   }, [artifacts, conversationId, onImageClick, citations])
 
   return (
-    <div className={markdownShellClass(variant)}>
+    <div
+      className={markdownShellClass(variant)}
+      dir="auto"
+      ref={setDocumentRoot}
+      data-chat-outline-source-id={outlineSource && !streaming ? outlineSource.sourceId : undefined}
+    >
       <MarkdownErrorBoundary fallbackText={content}>
-        <FullSettledMarkdown
+        <MarkdownDocument
           content={content}
           components={components}
           remarkPlugins={remarkPlugins}
-          useCache={!streaming}
           streaming={streaming}
+          outlineSource={outlineSource}
+          documentRoot={documentRoot}
         />
       </MarkdownErrorBoundary>
     </div>

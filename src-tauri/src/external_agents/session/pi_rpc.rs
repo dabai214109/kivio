@@ -22,6 +22,100 @@ use crate::external_agents::types::{
 use crate::proc::NoConsoleWindow;
 
 type SharedPiWriter<W> = Arc<Mutex<W>>;
+
+pub struct PiModelsProbe {
+    pub models: Vec<RuntimeModelOption>,
+    pub reasoning_by_model: HashMap<String, Vec<RuntimeModelOption>>,
+    pub current_model: Option<String>,
+    pub current_reasoning: Option<String>,
+}
+
+/// Same capability semantics as Pi's getSupportedThinkingLevels (0.84.4–0.85.1).
+/// Null disables a level; xhigh/max require an explicit non-null mapping.
+fn pi_model_reasoning(model: &Value) -> Vec<RuntimeModelOption> {
+    if model.get("reasoning").and_then(Value::as_bool) != Some(true) {
+        return Vec::new();
+    }
+    let map = model.get("thinkingLevelMap");
+    let mut options = vec![default_model_option()];
+    for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+        let mapped = map.and_then(|map| map.get(level));
+        if mapped.is_some_and(Value::is_null)
+            || (matches!(level, "xhigh" | "max") && mapped.is_none())
+        {
+            continue;
+        }
+        options.push(RuntimeModelOption {
+            id: level.to_string(),
+            label: level.to_string(),
+            context_window_tokens: None,
+        });
+    }
+    options
+}
+
+/// Read-only RPC discovery. No set_model (which persists settings), no prompt or session file.
+pub async fn detect_pi_models(bin: &Path, cwd: &Path, timeout_secs: u64) -> Option<PiModelsProbe> {
+    let def = &crate::external_agents::defs::pi::PI_AGENT_DEF;
+    let mut child = crate::external_agents::spawn::agent_probe_command(def, bin)
+        .args(["--mode", "rpc", "--no-session"])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .no_console_window()
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let result = timeout(Duration::from_secs(timeout_secs), async {
+        let mut stdin = child.stdin.take()?;
+        let mut reader = BufReader::new(child.stdout.take()?).lines();
+        stdin.write_all(b"{\"id\":\"models\",\"type\":\"get_available_models\"}\n{\"id\":\"state\",\"type\":\"get_state\"}\n").await.ok()?;
+        let mut models = None;
+        let mut state = None;
+        while let Some(line) = reader.next_line().await.ok()? {
+            let Ok(value) = serde_json::from_str::<Value>(&line) else { continue; };
+            if value.get("type").and_then(Value::as_str) != Some("response") { continue; }
+            match value.get("id").and_then(Value::as_str) {
+                Some("models") => {
+                    if value.get("success").and_then(Value::as_bool) != Some(true) { return None; }
+                    models = value.pointer("/data/models").and_then(Value::as_array).cloned();
+                    if models.is_none() { return None; }
+                }
+                Some("state") => state = Some(value.get("data").cloned().unwrap_or(Value::Null)),
+                _ => {}
+            }
+            if models.is_some() && state.is_some() { break; }
+        }
+        let mut out = PiModelsProbe {
+            models: vec![default_model_option()], reasoning_by_model: HashMap::new(),
+            current_model: None, current_reasoning: None,
+        };
+        for model in models? {
+            let provider = model.get("provider")?.as_str()?;
+            let id = model.get("id")?.as_str()?;
+            let full_id = format!("{provider}/{id}");
+            out.reasoning_by_model.insert(full_id.clone(), pi_model_reasoning(&model));
+            out.models.push(RuntimeModelOption {
+                id: full_id, label: format!("{id} · {provider}"),
+                context_window_tokens: model.get("contextWindow").and_then(Value::as_u64)
+                    .and_then(|tokens| u32::try_from(tokens).ok()),
+            });
+        }
+        if let Some(state) = state {
+            if let Some(model) = state.get("model").filter(|model| model.is_object()) {
+                out.reasoning_by_model.insert("default".to_string(), pi_model_reasoning(model));
+                out.current_model = model.get("provider").and_then(Value::as_str).zip(model.get("id").and_then(Value::as_str))
+                    .map(|(provider, id)| format!("{provider}/{id}"));
+            }
+            out.current_reasoning = state.get("thinkingLevel").and_then(Value::as_str).map(str::to_string);
+        }
+        (out.models.len() > 1).then_some(out)
+    }).await.ok().flatten();
+    let _ = child.start_kill();
+    let _ = child.wait().await;
+    result
+}
 struct PiControlWaiter {
     completion: oneshot::Sender<Result<(), String>>,
     injection: Option<(MessageInjectionKind, String, String)>,
@@ -87,6 +181,63 @@ where
         return Err(error);
     }
     Ok(rx)
+}
+
+fn pi_string_list(data: &Value, key: &str) -> Vec<String> {
+    data.get(key)
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    item.as_str()
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Pi `clear_queue` 成功响应：`data.steering` + `data.followUp`（偶发 `follow_up`）。
+fn pi_cleared_queue_texts(value: &Value) -> Vec<String> {
+    let data = value.get("data").unwrap_or(value);
+    let mut texts = pi_string_list(data, "steering");
+    let follow_up = pi_string_list(data, "followUp");
+    texts.extend(if follow_up.is_empty() {
+        pi_string_list(data, "follow_up")
+    } else {
+        follow_up
+    });
+    texts
+}
+
+async fn abort_pi_turn<W>(
+    stdin: &SharedPiWriter<W>,
+    waiters: &PiControlWaiters,
+    next_control_id: &mut u64,
+) -> Result<(), String>
+where
+    W: AsyncWrite + Unpin,
+{
+    // Pi 0.84.4：匹配 Esc 必须先 `clear_queue` 再 `abort`，否则已受理的立刻引导 /
+    // follow-up 会留在 Pi 队列里、下一轮 prompt 被悄悄注入。退回的原文由 drain
+    // 读 `clear_queue` 响应后发 `QueuedTextsRestored`，前端写回输入框。
+    let clear_id = format!("kivio-control-{next_control_id}");
+    *next_control_id = next_control_id.saturating_add(1);
+    let _ = issue_control_command(
+        stdin,
+        waiters,
+        clear_id,
+        None,
+        json!({ "type": "clear_queue" }),
+    )
+    .await;
+    let abort_id = format!("kivio-control-{next_control_id}");
+    *next_control_id = next_control_id.saturating_add(1);
+    issue_control_command(stdin, waiters, abort_id, None, json!({ "type": "abort" })).await?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1062,6 +1213,12 @@ where
                 if let Some(waiter) = waiters.lock().await.remove(id) {
                     let succeeded = value.get("success").and_then(Value::as_bool) == Some(true);
                     if succeeded {
+                        if value.get("command").and_then(Value::as_str) == Some("clear_queue") {
+                            let texts = pi_cleared_queue_texts(&value);
+                            if !texts.is_empty() {
+                                sink(UnifiedAgentEvent::QueuedTextsRestored { texts });
+                            }
+                        }
                         if let Some((kind, id, text)) = waiter.injection {
                             match kind {
                                 MessageInjectionKind::Steer => {
@@ -1520,14 +1677,10 @@ pub fn spawn_pi_rpc_session_actor(
                                 match next {
                                     Some(SessionCommand::Cancel) => {
                                         cancelled.store(true, Ordering::Release);
-                                        let request_id = format!("kivio-control-{}", next_control_id);
-                                        next_control_id = next_control_id.saturating_add(1);
-                                        if issue_control_command(
+                                        if abort_pi_turn(
                                             &session.stdin,
                                             &pending_controls,
-                                            request_id,
-                                            None,
-                                            json!({ "type": "abort" }),
+                                            &mut next_control_id,
                                         )
                                         .await
                                         .is_err()
@@ -1627,6 +1780,31 @@ mod tests {
 
     use super::*;
     use tokio::io::{duplex, sink, AsyncReadExt};
+
+    #[test]
+    fn model_thinking_map_preserves_holes_and_explicit_extended_levels() {
+        let levels = |model: Value| {
+            pi_model_reasoning(&model)
+                .into_iter()
+                .map(|option| option.id)
+                .collect::<Vec<_>>()
+        };
+        assert!(levels(json!({"reasoning": false})).is_empty());
+        assert_eq!(
+            levels(json!({"reasoning": true})),
+            ["default", "off", "minimal", "low", "medium", "high"]
+        );
+        assert_eq!(
+            levels(json!({"reasoning": true, "thinkingLevelMap": {
+                "off": null, "minimal": null, "medium": null, "xhigh": "xhigh", "max": "max"
+            }})),
+            ["default", "low", "high", "xhigh", "max"]
+        );
+        assert!(
+            !levels(json!({"reasoning": true, "thinkingLevelMap": {"max": null}}))
+                .contains(&"max".to_string())
+        );
+    }
 
     #[tokio::test]
     #[ignore = "requires live pi CLI on PATH"]
@@ -2605,6 +2783,90 @@ mod tests {
         .await;
         assert_eq!(result, Err("cancelled".to_string()));
         assert!(matches!(response.await, Ok(Ok(()))));
+    }
+
+    #[tokio::test]
+    async fn abort_sends_clear_queue_before_abort() {
+        let (mut output_reader, output_writer) = duplex(2048);
+        let stdin = Arc::new(Mutex::new(output_writer));
+        let waiters: PiControlWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let mut next_control_id = 2_u64;
+        abort_pi_turn(&stdin, &waiters, &mut next_control_id)
+            .await
+            .expect("abort");
+        let mut lines = BufReader::new(&mut output_reader).lines();
+        let first: Value =
+            serde_json::from_str(&lines.next_line().await.expect("read").expect("clear_queue"))
+                .expect("json");
+        let second: Value =
+            serde_json::from_str(&lines.next_line().await.expect("read").expect("abort"))
+                .expect("json");
+        assert_eq!(first["type"], "clear_queue");
+        assert_eq!(second["type"], "abort");
+        assert_eq!(first["id"], "kivio-control-2");
+        assert_eq!(second["id"], "kivio-control-3");
+    }
+
+    #[test]
+    fn clear_queue_response_collects_steering_and_follow_up() {
+        let value = json!({
+            "type": "response",
+            "command": "clear_queue",
+            "success": true,
+            "data": {
+                "steering": ["Change direction", "  "],
+                "followUp": ["Summarize when finished"]
+            }
+        });
+        assert_eq!(
+            pi_cleared_queue_texts(&value),
+            vec![
+                "Change direction".to_string(),
+                "Summarize when finished".to_string()
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_queue_response_emits_restored_texts() {
+        let (stdout_reader, mut stdout_writer) = duplex(2048);
+        let stdin = Arc::new(Mutex::new(sink()));
+        let waiters: PiControlWaiters = Arc::new(Mutex::new(HashMap::new()));
+        let response = issue_control_command(
+            &stdin,
+            &waiters,
+            "clear-1".to_string(),
+            None,
+            json!({ "type": "clear_queue" }),
+        )
+        .await
+        .expect("issue clear_queue");
+        stdout_writer
+            .write_all(
+                b"{\"id\":\"clear-1\",\"type\":\"response\",\"command\":\"clear_queue\",\"success\":true,\"data\":{\"steering\":[\"Change direction\"],\"followUp\":[\"Summarize\"]}}\n{\"type\":\"agent_settled\"}\n",
+            )
+            .await
+            .expect("events");
+        let mut events = Vec::new();
+        let result = drain_pi_rpc_lines(
+            &mut BufReader::new(stdout_reader).lines(),
+            &stdin,
+            &mut |event| events.push(event),
+            None,
+            Some(&waiters),
+            || false,
+            None,
+            false,
+            true,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert!(matches!(response.await, Ok(Ok(()))));
+        assert!(matches!(
+            events.as_slice(),
+            [UnifiedAgentEvent::QueuedTextsRestored { texts }]
+                if texts == &["Change direction".to_string(), "Summarize".to_string()]
+        ));
     }
 
     #[tokio::test]

@@ -45,6 +45,9 @@ pub struct ProviderCustomHeader {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProviderRequestConfig {
+    /// OAuth metadata only; secrets live in the operating system credential store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<crate::provider_oauth::OAuthConfig>,
     /// 附加到该供应商所有请求上的自定义头。同名时覆盖 CLI 身份预设。
     pub custom_headers: Vec<ProviderCustomHeader>,
     /// 是否跟随系统代理。默认 true —— 与加这个开关之前的行为一致；关掉才走直连。
@@ -66,6 +69,7 @@ pub struct ProviderRequestConfig {
 impl Default for ProviderRequestConfig {
     fn default() -> Self {
         Self {
+            oauth: None,
             custom_headers: Vec::new(),
             use_system_proxy: true,
             prompt_caching: None,
@@ -166,6 +170,21 @@ impl ProviderApiFormat {
 }
 
 impl ModelProvider {
+    pub fn is_opencode_free(&self) -> bool {
+        self.request.oauth.is_none()
+            && self.api_format_kind() == ProviderApiFormat::OpenAiChat
+            && crate::opencode_free::is_endpoint(&self.base_url)
+            && self.api_keys.iter().all(|key| key.trim().is_empty())
+    }
+
+    pub fn has_credentials(&self) -> bool {
+        if self.is_opencode_free() { return true; }
+        if let Some(auth) = &self.request.oauth {
+            return auth.credential_id.is_some();
+        }
+        self.api_keys.iter().any(|key| !key.trim().is_empty())
+    }
+
     pub fn api_format_kind(&self) -> ProviderApiFormat {
         ProviderApiFormat::from_raw(&self.api_format)
     }
@@ -1737,6 +1756,9 @@ pub struct Settings {
     /// 高频开关 / 低配机可避免每次冷创建的启动延迟和风扇起来。
     #[serde(default = "default_false")]
     pub keep_chat_window_alive: bool,
+    /// 回复完成时发送系统通知；默认关闭，开启后正在查看该对话时不提醒。
+    #[serde(default = "default_false")]
+    pub chat_completion_notifications: bool,
     #[serde(default)]
     pub translator_provider_id: String,
     #[serde(default = "default_openai_model")]
@@ -1957,6 +1979,7 @@ impl Default for Settings {
             launch_at_startup: false,
             launch_minimized_to_tray: false,
             keep_chat_window_alive: false,
+            chat_completion_notifications: false,
             translator_provider_id: "default-translator".to_string(),
             translator_model: "gpt-4o".to_string(),
             chat_provider_id: String::new(),
@@ -3017,7 +3040,7 @@ fn onboarding_status_is_set(raw: &str) -> bool {
 
 fn provider_has_usable_config(provider: &ModelProvider) -> bool {
     provider.enabled
-        && provider.api_keys.iter().any(|k| !k.trim().is_empty())
+        && provider.has_credentials()
         && !provider.enabled_models.is_empty()
 }
 
@@ -3422,6 +3445,26 @@ mod tests {
         let settings: Settings =
             serde_json::from_str("{}").expect("legacy settings should deserialize");
         assert!(!settings.keep_chat_window_alive);
+    }
+
+    #[test]
+    fn chat_completion_notifications_are_disabled_for_new_and_legacy_settings() {
+        assert!(!Settings::default().chat_completion_notifications);
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.chat_completion_notifications);
+    }
+
+    #[test]
+    fn chat_completion_notifications_preserve_explicit_setting_on_save_and_reload() {
+        for enabled in [false, true] {
+            let settings: Settings = serde_json::from_value(serde_json::json!({
+                "chatCompletionNotifications": enabled
+            })).unwrap();
+            let saved = serde_json::to_value(&settings).unwrap();
+            assert_eq!(saved["chatCompletionNotifications"], enabled);
+            let reloaded: Settings = serde_json::from_value(saved).unwrap();
+            assert_eq!(reloaded.chat_completion_notifications, enabled);
+        }
     }
 
     #[test]

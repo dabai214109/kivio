@@ -148,17 +148,13 @@ pub(crate) async fn chat_get_conversation(
 ) -> Result<serde_json::Value, String> {
     let repository = crate::chat::repository::repository(&app);
     // 存量迁移：老会话的 `model_messages` 里可能还躺着图片 base64（外置是后来才补的）。
-    // 打开时顺手外置一次，之后这份 JSON 就回到 KB 量级。谓词是廉价扫描，无图零开销；
+    // 打开时顺手外置一次，之后这份 JSON 就回到 KB 量级。一次读盘；无图不写。
     // 迁移失败只记警告——它是优化，绝不该挡住打开会话。
     let mut conversation = match repository
         .externalize_stored_images(&app, &conversation_id)
         .await
     {
-        Ok(Some(migrated)) => migrated,
-        Ok(None) => repository
-            .get(&app, &conversation_id)
-            .await
-            .map_err(crate::chat::repository::repository_error)?,
+        Ok(conversation) => conversation,
         Err(err) => {
             eprintln!("externalize stored images failed ({conversation_id}): {err}");
             repository
@@ -204,7 +200,7 @@ pub(super) fn reconcile_conversation_orphan_tool_segments(conversation: &mut Con
 /// ⚠️ 中断草稿（`stream_outcome == Some("interrupted")`）的转录是「继续」恢复工具上下文
 /// 所必需的（见 commit 9d247b0），**绝不剥**。仅剥已完成的 assistant 消息（至多保留最后
 /// 一条中断草稿的转录，体积有界）。
-pub(super) fn strip_transcripts_for_frontend(conversation: &mut Conversation) {
+pub(crate) fn strip_transcripts_for_frontend(conversation: &mut Conversation) {
     for message in conversation.messages.iter_mut() {
         if message.role != "assistant" {
             continue;
@@ -427,6 +423,7 @@ pub(crate) async fn create_chat_conversation_internal(
                 context_state: ConversationContextState::default(),
                 agent_todo_state: AgentTodoState::default(),
                 agent_plan_state: AgentPlanState::default(),
+                goal_state: None,
                 knowledge_base_ids: Vec::new(),
                 force_knowledge_search: false,
                 additional_directories: Vec::new(),
@@ -793,6 +790,7 @@ pub(crate) async fn chat_create_builder_conversation(
         context_state: ConversationContextState::default(),
         agent_todo_state: AgentTodoState::default(),
         agent_plan_state: AgentPlanState::default(),
+        goal_state: None,
         knowledge_base_ids: Vec::new(),
         force_knowledge_search: false,
         additional_directories: Vec::new(),

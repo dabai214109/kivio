@@ -1,4 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { flushSync } from 'react-dom'
 import { ChevronDown, RotateCw } from 'lucide-react'
 import {
   defaultRangeExtractor,
@@ -11,7 +12,11 @@ import type { AgentPlanState, ChatMessage, ConversationContextState, DegradedAns
 import { MessageBubble } from './MessageBubble'
 import { DegradedAnswerCard } from './DegradedAnswerCard'
 import { MessageGroup } from './MessageGroup'
+import { useMultiAnswerViewMode } from './multiAnswerViewMode'
 import { MessageNavigator } from './ChatMessageNavigator'
+import { ChatHeadingOutline } from './ChatHeadingOutline'
+import type { MarkdownOutlineSourceUpdate } from './ChatMarkdown'
+import type { MarkdownHeadingOutlineItem } from './markdownHeadingOutline'
 import { MessageContextMenu, type MessageMenuAnchor } from './MessageContextMenu'
 import { AddSelectionToChat } from './AddSelectionToChat'
 import { copyToClipboard } from '../utils/clipboard'
@@ -34,9 +39,7 @@ import { StreamStatusLine } from './StreamStatusLine'
 import { getActiveGroup, useGroupVersion } from './groupStreamingStore'
 import { useScrollFollow } from './scroll/useScrollFollow'
 import {
-  canReuseLiveRowHeight,
   chatMessageLayoutRevision,
-  contentRevision,
   estimateMessageRenderHeight,
   estimateMessageRenderCost,
   getCachedRowMeasurement,
@@ -57,6 +60,8 @@ import {
   resetMessageNavigationStore,
 } from './messageNavigationStore'
 import { createLiveRowModel } from './liveRowModel'
+import { useLiveRowMeasurement } from './hooks/useLiveRowMeasurement'
+import { useChatWidthLayout } from './hooks/useChatWidthLayout'
 
 
 export interface AssistantStreamStats {
@@ -64,6 +69,19 @@ export interface AssistantStreamStats {
   tokensPerSec: number
   reasoningDurationMs?: number | null
   reasoningDurationMsBySegmentId?: Record<string, number>
+}
+
+type OutlineSourceRecord = {
+  ownerMessageId: string
+  sourceId: string
+  items: MarkdownHeadingOutlineItem[]
+}
+
+function sameOutlineItems(a: readonly MarkdownHeadingOutlineItem[], b: readonly MarkdownHeadingOutlineItem[]): boolean {
+  return a.length === b.length && a.every((item, index) => {
+    const other = b[index]
+    return item.anchorId === other.anchorId && item.title === other.title && item.depth === other.depth
+  })
 }
 
 export interface MessageListProps {
@@ -99,14 +117,7 @@ export interface MessageListProps {
 }
 
 const LIST_EDGE_PADDING_PX = 16
-
-// 内容宽度量化桶。layoutKey 里带着 contentWidth：若用原始 px，拖侧栏/Dock/改窗口宽时
-// 每变 1px 就换一个 key 空间 —— TanStack itemSizeCache 全 miss（所有行退回估算高、
-// totalSize 猛变、滚动位置跳），且 measurementBuckets 只留 8 个桶，一次拖动扫过上百个
-// 宽度值会把原宽度的桶也挤掉。旧实现（virtua 时代）有 MIGRATION_STEP 量化，TanStack
-// 重写时丢了（8791000）。行高对 32px 内的宽度差不敏感（换行差 ~4 个拉丁字符），
-// 真实高度由 measureElement 兜底。
-const CONTENT_WIDTH_BUCKET_PX = 32
+const MESSAGE_NAVIGATOR_MIN_TURNS = 2
 
 // 导航器高亮同步的最小间隔。这趟同步是 querySelectorAll + 逐行 getBoundingClientRect，
 // 若 virtualizer 在同一帧里刚写过 DOM，第一下 gBCR 就是整文档强制 reflow——每帧跑一次
@@ -127,6 +138,7 @@ const NAVIGATOR_UNLOCK_FRAMES = 10
 // 只认 heavy island；data-chat-markdown-pending 从未写入，留着只会制造「假覆盖」。
 const NAVIGATOR_PENDING_SELECTOR = '[data-chat-heavy-hydrated="false"], [data-chat-async-pending="true"]'
 const NAVIGATOR_ALIGN_EPSILON_PX = 1
+const HEADING_NAVIGATOR_TOP_INSET_PX = 16
 // 会话切换遮罩：重内容一直晃也不能无限等，超时强制揭开。
 const OPEN_SETTLE_MAX_MS = 2_000
 
@@ -135,21 +147,31 @@ const OPEN_SETTLE_MAX_MS = 2_000
 
 // 列表里每一项的统一形态。整条会话全量喂给虚拟列表（消息都在内存，virtualizer 只渲可见项），
 // 屏外的气泡连同其 KaTeX host / Markdown / 图片 DOM 真正从 DOM 卸载。
-type RenderItem =
+type HistoryRenderItem =
   | { kind: 'spacer'; key: 'padding-top' | 'padding-bottom'; size: number }
   | { kind: 'message'; key: string; message: ChatMessage; sentModels?: GroupModelLabel[] }
   | { kind: 'group'; key: string; groupId: string; messages: ChatMessage[] }
-  | { kind: 'live-group'; key: string; groupId: string }
-  | { kind: 'streaming'; key: string; message: ChatMessage; messageStreaming: boolean; reasoningStreaming: boolean }
-  | { kind: 'error'; key: 'error'; text: string; retryMessageId: string | null }
-  | { kind: 'tail'; key: 'tail' }
   | { kind: 'compaction-divider'; key: string; boundary: CompactionBoundaryView; animate: boolean }
   | { kind: 'compaction-summary'; key: string; boundary: CompactionBoundaryView }
   | { kind: 'compaction-progress'; key: string; afterIndex: number }
   | { kind: 'context-clear-divider'; key: string; boundary: ContextClearBoundaryView; animate: boolean }
 
+type LiveRenderItem =
+  | { kind: 'live-group'; key: string; groupId: string }
+  | {
+    kind: 'streaming'
+    key: string
+    message: ChatMessage
+    messageStreaming: boolean
+    markdownStreaming: boolean
+    reasoningStreaming: boolean
+  }
+
+type RenderItem = HistoryRenderItem | LiveRenderItem
+  | { kind: 'error'; key: 'error'; text: string; retryMessageId: string | null }
+
 function measurementKey(item: RenderItem): string {
-  if (item.kind === 'message') {
+  if (item.kind === 'message' || item.kind === 'streaming') {
     return `${item.key}:${chatMessageLayoutRevision(item.message)}`
   }
   if (item.kind === 'group') {
@@ -160,15 +182,6 @@ function measurementKey(item: RenderItem): string {
       chatMessageLayoutRevision(message),
     ].join(':')).join('|')}`
   }
-  if (item.kind === 'streaming') {
-    return `${item.key}:${chatMessageLayoutRevision(item.message)}`
-  }
-  return item.key
-}
-
-function virtualItemIdentity(item: RenderItem): string {
-  // Stable TanStack/React identity. Geometry changes go through measureChatVirtualRow
-  // and the measurement cache; putting the revision in getItemKey remounts settled rows.
   return item.key
 }
 
@@ -259,18 +272,7 @@ function MessageListBase({
   ), [liveGroupColumns, liveGroupId, liveGroupModelsKey])
   const streaming = coarse.streaming
   const streamFrozen = coarse.streamFrozen
-  // live → 历史 的同帧：先开短窗 eager，再让本帧新挂的 DeferredCodeBlock 读到 flag。
-  // 必须在 render 期同步调用，useEffect 会晚一帧，首挂仍走 180ms 延迟。
   const liveRowActive = streaming || streamFrozen
-  const prevLiveRowActiveRef = useRef(liveRowActive)
-  const liveEndingThisFrame = prevLiveRowActiveRef.current && !liveRowActive
-  if (liveEndingThisFrame) {
-    beginStreamSettleEagerHydrate()
-  }
-  prevLiveRowActiveRef.current = liveRowActive
-  // Last measured outside-live height; filled every streaming layout, consumed on settle seed.
-  const liveBubbleHeightRef = useRef(0)
-  const lastLiveMessageRef = useRef<ChatMessage | null>(null)
 
   const error = coarse.streamError
   const streamingContent = snapshot.content
@@ -297,17 +299,9 @@ function MessageListBase({
     return messages.filter((message) => !activeMessageIds.has(message.id))
   }, [liveGroup, messages, snapshot.messageId, streamFrozen, streaming])
 
-  // Stable live keys for the in-list experiment + twin estimate identity on settle.
-  // Default external path still aliases so the history twin reuses the live key
-  // for measurement cache continuity (DOM is not reused across the outside→inside handoff).
+  // A committed answer adopts its live key for both measurements and React
+  // identity. Live and historical rows share a parent in renderTail below.
   const liveRowModelRef = useRef(createLiveRowModel())
-  const liveRowModelConversationRef = useRef<string | null | undefined>(conversationId)
-  if (liveRowModelConversationRef.current !== conversationId) {
-    liveRowModelRef.current.reset()
-    liveRowModelConversationRef.current = conversationId
-    liveBubbleHeightRef.current = 0
-    lastLiveMessageRef.current = null
-  }
   const historyAssistantIds = useMemo(
     () => messages.filter((message) => message.role === 'assistant').map((message) => message.id),
     [messages],
@@ -334,8 +328,6 @@ function MessageListBase({
   // hook 需要通过 state 拿到元素以便重新绑定监听；virtualizer 需要 RefObject。回调 ref 同时喂两者。
   const [viewportEl, setViewportEl] = useState<HTMLDivElement | null>(null)
   const [contentEl, setContentEl] = useState<HTMLDivElement | null>(null)
-  // 初值取常见聊天列宽落进的桶（704 = 22×32），首个 RO tick 会立刻校正。
-  const [contentWidth, setContentWidth] = useState(704)
   const setScrollEl = useCallback((el: HTMLDivElement | null) => {
     scrollRef.current = el
     setViewportEl(el)
@@ -430,26 +422,12 @@ function MessageListBase({
     return finish
   }, [conversationId, contentEl])
 
-  useLayoutEffect(() => {
-    if (!contentEl) return
-    const updateWidth = (width: number) => {
-      // 量化到桶再落 state：拖动过程中只在跨桶时重渲/换 layoutKey（见 CONTENT_WIDTH_BUCKET_PX）。
-      const next = Math.max(280, Math.round(width / CONTENT_WIDTH_BUCKET_PX) * CONTENT_WIDTH_BUCKET_PX)
-      setContentWidth((current) => current === next ? current : next)
-    }
-    const rect = contentEl.getBoundingClientRect()
-    updateWidth(Math.max(0, rect.width - 48))
-    if (typeof ResizeObserver === 'undefined') return
-    const observer = new ResizeObserver((entries) => {
-      const width = entries[0]?.contentRect.width
-      if (typeof width === 'number') updateWidth(width)
-    })
-    observer.observe(contentEl)
-    return () => observer.disconnect()
-  }, [contentEl])
   const prevMessageCountRef = useRef(0)
   const [activeNavigatorNodeId, setActiveNavigatorNodeId] = useState<string | null>(null)
   const [visibleNavigatorNodeIds, setVisibleNavigatorNodeIds] = useState<string[]>([])
+  const [outlineSources, setOutlineSources] = useState<Map<string, OutlineSourceRecord>>(() => new Map())
+  const [activeOutlineOwnerId, setActiveOutlineOwnerId] = useState<string | null>(null)
+  const [activeOutlineAnchorId, setActiveOutlineAnchorId] = useState<string | null>(null)
   const navigatorNodesRef = useRef<MessageNavigatorNode[]>([])
   const activeNavigatorNodeIdRef = useRef<string | null>(null)
   const visibleNavigatorNodeIdsRef = useRef<string[]>([])
@@ -458,6 +436,7 @@ function MessageListBase({
   // endNavigatorSession 的解锁 rAF 链；clear 时必须 cancel，避免卸载后 setState。
   const navigatorUnlockRafRef = useRef<number | null>(null)
   const navigatorUnlockGenerationRef = useRef(0)
+  const headingNavigationTargetRef = useRef<{ anchorId: string; targetIndex: number } | null>(null)
 
   // 导航「先渲染再跳」：在当前视口不动的前提下，把目标行附近强制挂进 DOM 测高。
   const [forceMountRenderIndex, setForceMountRenderIndex] = useState<number | null>(null)
@@ -465,6 +444,7 @@ function MessageListBase({
   forceMountRenderIndexRef.current = forceMountRenderIndex
   // 导航全程锁：禁止 virtualizer 因测高改 scrollTop（那是上下抽的主因）。
   const navigationLockRef = useRef(false)
+  const disclosureAnchorRef = useRef<{ key: string | number | bigint; button: HTMLElement } | null>(null)
   // 准备阶段冻结的阅读位置；hold 跳转前绝不能被动挪走。
   const navigatorFrozenScrollTopRef = useRef<number | null>(null)
   // 跳转后 paint 前钉住。jumped=false 时只在 layout 里跳一次，避免 rAF 跳完再被测高扯。
@@ -486,9 +466,7 @@ function MessageListBase({
   } | null>(null)
   const [navigatorHoldEpoch, setNavigatorHoldEpoch] = useState(0)
   const [bottomHoldEpoch, setBottomHoldEpoch] = useState(0)
-  // Bumped when bottomHold ends: send-reserve 的 minHeight→spacer 转移已在 settle 帧
-  // 立即完成（见 apply() 注释），这里只是 hold 期间几何变化后的幂等重算兜底
-  // （hold 中 hydrate/图片可能改 span，结束时再对一次账）。
+  // Recalculate reserve after hydrated content changes height during bottomHold.
   const [reserveEpoch, setReserveEpoch] = useState(0)
   const [navigatorLockActive, setNavigatorLockActive] = useState(false)
 
@@ -510,9 +488,11 @@ function MessageListBase({
     trackKeys: true,
     growthSignal: streamGrowthSignal,
   })
+  const { contentWidth, anchorRef: widthAnchorRef, prepareWidthChange, restoreAnchor: restoreWidthAnchor } = useChatWidthLayout(
+    contentEl, viewportEl, followHandle, navigationLockRef,
+  )
 
-  // 流式期间是否在跟随：交接时以它为准（不能只看交接瞬间的 isFollowing——
-  // 外置 live 卸载会先把高度砸矮，scroll 可能被误判成 user 解除跟随）。
+  // Preserve the reader's follow intent while the row changes positioning at settle.
   const streamFollowIntentRef = useRef(true)
   if (streaming || streamFrozen) {
     streamFollowIntentRef.current = following
@@ -581,7 +561,7 @@ function MessageListBase({
   )
 
   const appendCompactionItems = useCallback((
-    list: RenderItem[],
+    list: HistoryRenderItem[],
     afterIndex: number,
   ) => {
     const boundaries = boundariesByAfterIndex.get(afterIndex)
@@ -603,7 +583,7 @@ function MessageListBase({
   }, [animateCompactionBoundaryId, boundariesByAfterIndex])
 
   const appendCompactionSlot = useCallback((
-    list: RenderItem[],
+    list: HistoryRenderItem[],
     afterIndex: number,
   ) => {
     const hasBoundary = boundariesByAfterIndex.has(afterIndex)
@@ -643,22 +623,21 @@ function MessageListBase({
   // Live content updates every token, but the **row key** is stable (liveRowKey).
   // Keeping live out of the historyItems useMemo deps means committed rows do not rebuild
   // per token — same split LiveAgent uses (history cache + live tail).
-  const liveItem = useMemo<RenderItem | null>(() => {
+  const liveItem = useMemo<LiveRenderItem | null>(() => {
     if (!liveRowKey) return null
-    const hasLiveGroup = Boolean(liveGroup && liveRowActive)
-    if (hasLiveGroup && liveGroup) {
+    if (liveGroup) {
       return { kind: 'live-group', key: liveRowKey, groupId: liveGroup.groupId }
     }
-    const hasStreamingPreview =
-      streamingContent || streamingReasoning || streamingToolCalls.length > 0 || streamingSegments.length > 0
-    // Keep the live row mounted for the whole run even before the first token so the
-    // key is claimed early and the settle twin can adopt it.
-    if (!hasStreamingPreview && !liveRowActive) return null
-    if (!liveRowActive) return null
+    // Claim the stable row key before the first token.
     return {
       kind: 'streaming',
       key: liveRowKey,
       messageStreaming: streaming && !streamFrozen,
+      // 冻结帧（settle 等 twin 落地 / 本地取消等 invoke 返回）里 Markdown 上下文保持
+      // 「出字中」：mermaid 继续显示源码、岛保持 eager，把源码→出图这类内容变化留给
+      // twin 首挂一次完成，而不是 live 行先变一次、twin 再变一次。出错后长期停留的冻结
+      // 预览没有 twin 来接手，才切回落库态，让 mermaid 出图、控件可用。
+      markdownStreaming: streaming || !error,
       reasoningStreaming: reasoningStreaming && !streamFrozen,
       message: {
         // Prefer real message id when known so context-menu / navigator can target it;
@@ -674,8 +653,8 @@ function MessageListBase({
       },
     }
   }, [
+    error,
     liveGroup,
-    liveRowActive,
     liveRowKey,
     reasoningStreaming,
     snapshot.messageId,
@@ -686,17 +665,10 @@ function MessageListBase({
     streamingSegments,
     streamingToolCalls,
   ])
-  if (liveItem?.kind === 'streaming') {
-    lastLiveMessageRef.current = liveItem.message
-  } else if (liveItem?.kind === 'live-group') {
-    // A live multi-answer group does not share the geometry of one settled message.
-    lastLiveMessageRef.current = null
-  }
-
   // 历史项只在消息/压缩边界/组模型身份变化时重建。高频流式文本不进入依赖；
   // live 行单独挂在 virtualizer 外的文档流尾部。
-  const historyItems = useMemo<RenderItem[]>(() => {
-    const list: RenderItem[] = [
+  const historyItems = useMemo<HistoryRenderItem[]>(() => {
+    const list: HistoryRenderItem[] = [
       { kind: 'spacer', key: 'padding-top', size: LIST_EDGE_PADDING_PX },
     ]
 
@@ -759,10 +731,6 @@ function MessageListBase({
   // not rebuild committed rows.
   }, [appendCompactionSlot, folded, liveGroupModels, liveRowModel, messageIndexById])
 
-  // Live rides the chrome tail outside the virtualizer. Token growth only
-  // moves scrollHeight → contentGrowth pin.
-  const dynamicItem = liveItem
-
   const errorItem = useMemo<RenderItem | null>(() => {
     if (!error) return null
     const last = messages[messages.length - 1]
@@ -770,37 +738,18 @@ function MessageListBase({
     return { kind: 'error', key: 'error', text: error, retryMessageId }
   }, [error, messages])
 
-  const layoutKey = `${conversationId ?? 'empty'}:${contentWidth}`
-  const tailMeasurementKey = streaming || streamFrozen
-    ? `tail:live:${snapshot.runId ?? snapshot.messageId ?? 'anonymous'}`
-    : `tail:settled:${error ? contentRevision(error) : 'empty'}`
-  const historyMeasurementRevision = useMemo(
+  const [multiAnswerViewMode] = useMultiAnswerViewMode()
+  const hasWideGroups = multiAnswerViewMode === 'columns'
+    && (Boolean(liveGroup) || historyItems.some((item) => item.kind === 'group'))
+  const layoutKey = `${conversationId ?? 'empty'}:${contentWidth}:${multiAnswerViewMode}`
+  const { liveRowRef, getLiveRowSize, measureRow } = useLiveRowMeasurement(layoutKey, liveRowKey)
+  const measurementRevision = useMemo(
     () => historyItems.map(measurementKey).join('|'),
     [historyItems],
   )
-  const measurementRevision = `${historyMeasurementRevision}|tail=${tailMeasurementKey}`
 
-  // 计算每一行的初始估算高度。真实高度由 TanStack Virtual 的 measureElement
-  // 覆盖；估算只负责首次切换/首次滚动时快速建立窗口，不再把整份历史拆成两套 DOM。
-  //
-  // Settle frame: seed the twin's height into the row-measurement cache *before*
-  // estimates are read, so the first virtualizer layout matches the outside
-  // bubble (layoutEffect seed is one paint too late → height collapse flash).
-  // Keep this side effect outside useMemo — memo must stay pure.
-  if (liveEndingThisFrame && liveBubbleHeightRef.current > 0) {
-    const settlingId = snapshot.messageId
-      || [...messages].reverse().find((message) => message.role === 'assistant')?.id
-      || null
-    if (settlingId) {
-      const settling = messages.find((message) => message.id === settlingId)
-      const liveMessage = lastLiveMessageRef.current
-      if (settling && liveMessage && canReuseLiveRowHeight(liveMessage, settling)) {
-        const rid = liveRowModel.resolveMessageKey(settling.id)
-        const h = Math.round(liveBubbleHeightRef.current)
-        setCachedRowMeasurement(layoutKey, `${rid}:${chatMessageLayoutRevision(settling)}`, h)
-      }
-    }
-  }
+  // Persistent measurements apply only to history. The live handoff has one
+  // temporary estimate, consumed by measureRow when the committed row mounts.
   const estimatedSizeByKey = useMemo(() => {
     const map = new Map<string, number>()
     for (const item of historyItems) {
@@ -816,9 +765,7 @@ function MessageListBase({
       }
       const messages = item.kind === 'message'
         ? [item.message]
-        : item.kind === 'group' ? item.messages
-          : item.kind === 'streaming' ? [item.message]
-            : []
+        : item.kind === 'group' ? item.messages : []
       let cost = 0
       let height = 0
       for (const message of messages) {
@@ -838,7 +785,8 @@ function MessageListBase({
         })
         height += estimateMessageRenderHeight({
           texts,
-          width: contentWidth,
+          // Ordinary replies keep their reading width even when a group widens the list.
+          width: Math.min(contentWidth, 848),
           toolCallCount: toolCalls.length,
           attachmentCount: (message.attachments ?? []).length,
           artifactCount,
@@ -849,16 +797,13 @@ function MessageListBase({
       // rendered pixels so a long answer does not begin hundreds of pixels short.
       map.set(item.key, Math.max(base, height + (cost > 800 ? 24 : 0)))
     }
-    map.set('tail', getCachedRowMeasurement(layoutKey, tailMeasurementKey) ?? 96)
-    // liveEndingThisFrame in deps: re-read cache after the settle-frame seed above.
     return map
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- liveEndingThisFrame 刻意入依赖：settle 帧种子写入后强制重建，重读缓存
-  }, [contentWidth, historyItems, layoutKey, liveEndingThisFrame, tailMeasurementKey])
+  }, [contentWidth, historyItems, layoutKey])
 
   // Live is not a virtualizer row — chrome tail below carries live +
   // status/error/send-reserve, so token growth never remeasures a combined tail.
   const itemCount = historyItems.length
-  const historyItemsRef = useRef<RenderItem[]>(historyItems)
+  const historyItemsRef = useRef<HistoryRenderItem[]>(historyItems)
   historyItemsRef.current = historyItems
   const itemAt = useCallback((index: number) => historyItemsRef.current[index], [])
   const estimateSizeRef = useRef(estimatedSizeByKey)
@@ -874,25 +819,18 @@ function MessageListBase({
     () => restoreMeasurementSnapshot(conversationId, layoutKey, measurementRevision),
     [conversationId, layoutKey, measurementRevision],
   )
+  const widthAnchorIndex = widthAnchorRef.current?.index ?? null
   const virtualizer = useVirtualizer<HTMLDivElement, HTMLDivElement>({
     count: itemCount,
     enabled: true,
     getScrollElement: () => scrollRef.current,
-    // Share scroll authority with follow pinning (source-classified writes).
-    // LiveAgent keeps anchorTo:end always on; the follow corrector re-pins any
-    // residual gap to true scrollHeight (which includes outside chrome).
-    // Do NOT replace end-anchor with pin-only here — delta compensation is what
-    // keeps token growth smooth; the corrector fixes chrome geometry.
+    // All scroll writes go through the same follow controller.
     scrollToFn: (offset, options) => followHandle.scrollToOffset(offset, options),
     observeElementRect: observeRect,
     estimateSize: (index) => {
       const item = itemAt(index)
       if (!item) return 96
-      const cached = estimateSizeRef.current.get(item.key)
-      if (cached !== undefined) return cached
-      // Live tail: prefer last measured height under the stable live key.
-      if (item.kind === 'streaming' || item.kind === 'live-group') return 160
-      return 96
+      return getLiveRowSize(item.key) ?? estimateSizeRef.current.get(item.key) ?? 96
     },
     // Include the measured content width in TanStack's key space. A stable
     // message key must remain stable within one layout, but a width change is
@@ -900,10 +838,11 @@ function MessageListBase({
     // not be reused for rows that have not been mounted again yet.
     getItemKey: (index) => {
       const item = itemAt(index)
-      return layoutScopedVirtualKey(layoutKey, item ? virtualItemIdentity(item) : `row-${index}`)
+      return layoutScopedVirtualKey(layoutKey, item?.key ?? `row-${index}`)
     },
     initialMeasurementsCache,
     measureElement: (element, entry, instance) => {
+      if (entry) prepareWidthChange(entry.borderBoxSize?.[0]?.inlineSize ?? element.offsetWidth)
       // TanStack's default sync path returns itemSizeCache when present. For
       // absolutely positioned chat rows that can leave the next row 10s of px
       // too early, so a mount must synchronously replace cache with real DOM size.
@@ -917,7 +856,8 @@ function MessageListBase({
         const size = Math.max(1, measured)
         const index = Number(element.dataset.index)
         const virtualKey = Number.isInteger(index) ? instance.options.getItemKey(index) : key
-        const logicalKey = Number.isInteger(index) ? itemAt(index)?.key : undefined
+        const rowItem = Number.isInteger(index) ? itemAt(index) : undefined
+        const logicalKey = rowItem?.key
         const previousSize = instance.itemSizeCache.get(virtualKey)
         if (previousSize === undefined || Math.abs(previousSize - size) > 0.5) {
           // Remeasure compensation. External live never hits this for token growth.
@@ -930,6 +870,12 @@ function MessageListBase({
           if (logicalKey) estimateSizeRef.current.set(logicalKey, size)
           setCachedRowMeasurement(layoutKey, key, size)
         }
+        // ResizeObserver runs before paint. During a manual height animation,
+        // commit sibling positions now so they cannot lag behind by one frame.
+        // Ref measurements have no entry and must never flush inside React.
+        if (entry && previousSize !== size && element.querySelector('[data-chat-disclosure-animating]')) {
+          flushSync(() => instance.resizeItem(index, size))
+        }
         return size
       }
       return measured
@@ -937,8 +883,8 @@ function MessageListBase({
     rangeExtractor: useCallback((range: Range) => {
       let indexes = defaultRangeExtractor(range)
       // 消息导航：目标行附近强制挂载渲染测高，再一次性跳转。
-      const forced = forceMountRenderIndex
-      if (forced != null && itemCount > 0) {
+      for (const forced of [forceMountRenderIndex, widthAnchorIndex]) {
+        if (forced == null || itemCount === 0) continue
         const from = Math.max(0, forced - NAVIGATOR_FORCE_MOUNT_RADIUS)
         const to = Math.min(itemCount - 1, forced + NAVIGATOR_FORCE_MOUNT_RADIUS)
         const set = new Set(indexes)
@@ -946,7 +892,7 @@ function MessageListBase({
         indexes = [...set].sort((a, b) => a - b)
       }
       return indexes
-    }, [forceMountRenderIndex, itemCount]),
+    }, [forceMountRenderIndex, itemCount, widthAnchorIndex]),
 
 
     overscan: 6,
@@ -954,10 +900,9 @@ function MessageListBase({
     // a conservative initial viewport keeps the first render useful while the
     // real browser immediately replaces it with the measured client rect.
     initialRect: { width: 0, height: viewportEl?.clientHeight || 800 },
-    // LiveAgent: always end-anchored. While following, live-row growth
-    // compensates by total-size delta; residual gap is corrected by the
-    // follow reducer (pin to full scrollHeight including chrome reserve).
-    anchorTo: 'end',
+    // TanStack's end anchoring bypasses shouldAdjustScrollPositionOnItemSizeChange.
+    // Disable it when the reader takes over, including disclosure clicks at bottom.
+    anchorTo: following ? 'end' : 'start',
     scrollEndThreshold: 12,
     followOnAppend: false,
     useAnimationFrameWithResizeObserver: false,
@@ -965,7 +910,15 @@ function MessageListBase({
   })
   virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (item, _delta, instance) => {
     // 导航 prepare/hold 期间禁止测高改 scrollTop：那是点导航后上下抽的主因。
-    if (navigationLockRef.current) return false
+    if (navigationLockRef.current || widthAnchorRef.current) return false
+    const anchor = disclosureAnchorRef.current
+    if (anchor?.key === item.key && anchor.button.isConnected && viewportEl) {
+      const button = anchor.button.getBoundingClientRect()
+      const viewport = viewportEl.getBoundingClientRect()
+      // The clicked heading stays in place while details below it resize,
+      // even when the containing virtual row starts above the viewport.
+      if (button.bottom > viewport.top && button.top < viewport.bottom) return false
+    }
     return shouldAdjustChatItemSizeChange(item, {
       scrollOffset: instance.scrollOffset ?? 0,
       scrollAdjustments: instance.scrollAdjustments,
@@ -975,6 +928,10 @@ function MessageListBase({
   }
 
   const virtualItems = virtualizer.getVirtualItems()
+  const measureHistoryRow = useCallback((element: HTMLDivElement | null) => {
+    measureRow(element, virtualizer)
+  }, [measureRow, virtualizer])
+  useLayoutEffect(() => { restoreWidthAnchor(virtualizer) })
   // Row ResizeObservers and TanStack's own viewport observer update mounted rows.
   // Avoid a blanket measure(): it clears the virtualizer's measured cache and makes
   // detached readers pay the estimate-to-real-height correction for every row.
@@ -1007,14 +964,38 @@ function MessageListBase({
     const renderIndexByKey = new Map(historyItems.map((item, index) => [item.key, index]))
     return buildMessageNavigatorNodes({ folded, boundaries, clearBoundaries, renderIndexByKey })
   }, [boundaries, clearBoundaries, folded, historyItems])
+  const outlineItemsByOwner = useMemo(() => {
+    const byOwner = new Map<string, MarkdownHeadingOutlineItem[]>()
+    for (const source of outlineSources.values()) {
+      const current = byOwner.get(source.ownerMessageId) ?? []
+      current.push(...source.items)
+      byOwner.set(source.ownerMessageId, current)
+    }
+    return byOwner
+  }, [outlineSources])
+  const outlineRenderIndexByOwner = useMemo(() => {
+    const indexByOwner = new Map<string, number>()
+    historyItems.forEach((item, index) => {
+      if (item.kind === 'message' && item.message.role === 'assistant') {
+        indexByOwner.set(item.message.id, index)
+      }
+      if (item.kind === 'group') {
+        for (const message of item.messages) indexByOwner.set(message.id, index)
+      }
+    })
+    return indexByOwner
+  }, [historyItems])
+  const activeOutlineItems = activeOutlineOwnerId
+    ? outlineItemsByOwner.get(activeOutlineOwnerId) ?? []
+    : []
   navigatorNodesRef.current = navigatorNodes
   const navigatorTurnCount = navigatorNodes.reduce(
     (count, node) => count + (node.kind === 'turn' ? 1 : 0),
     0,
   )
-  // 滚动回调里读，走 ref：导航器没渲染（< 4 轮）就别做整列表测量。
+  // 标题目录在第一轮即可出现，也需要滚动同步；两个导航器都没有时才跳过测量。
   const navigatorEnabledRef = useRef(false)
-  navigatorEnabledRef.current = navigatorTurnCount >= 4
+  navigatorEnabledRef.current = navigatorTurnCount >= MESSAGE_NAVIGATOR_MIN_TURNS || outlineSources.size > 0
 
   const updateActiveNavigatorNode = useCallback((nodeId: string | null) => {
     if (activeNavigatorNodeIdRef.current === nodeId) return
@@ -1027,6 +1008,32 @@ function MessageListBase({
     if (previous.length === nodeIds.length && previous.every((id, index) => id === nodeIds[index])) return
     visibleNavigatorNodeIdsRef.current = nodeIds
     setVisibleNavigatorNodeIds(nodeIds)
+  }, [])
+
+  const handleOutlineSourceChange = useCallback((update: MarkdownOutlineSourceUpdate) => {
+    setOutlineSources((current) => {
+      const existing = current.get(update.sourceId)
+      if (update.items == null) {
+        if (!existing) return current
+        const next = new Map(current)
+        next.delete(update.sourceId)
+        return next
+      }
+      if (
+        existing
+        && existing.ownerMessageId === update.ownerMessageId
+        && sameOutlineItems(existing.items, update.items)
+      ) {
+        return current
+      }
+      const next = new Map(current)
+      next.set(update.sourceId, {
+        ownerMessageId: update.ownerMessageId,
+        sourceId: update.sourceId,
+        items: update.items,
+      })
+      return next
+    })
   }, [])
 
   const cancelNavigatorSettle = useCallback(() => {
@@ -1059,10 +1066,7 @@ function MessageListBase({
       setForceMountRenderIndex(null)
     }
     endMessageNavigationHydrate(generation)
-    // Streaming kept reserve on wrap.minHeight through bottomHold. Now that hold
-    // is done, re-run send-reserve so minHeight clears and the spacer takes the
-    // remainder — otherwise total height stays inflated and stick-to-bottom
-    // parks the viewport on empty space (content "jumps up").
+    // The reserve already transferred at settle; refresh it after media hydrates.
     if (hadBottomHold) {
       setReserveEpoch((value) => value + 1)
     }
@@ -1092,6 +1096,7 @@ function MessageListBase({
     navigatorHoldRef.current = null
     bottomHoldRef.current = null
     navigatorFrozenScrollTopRef.current = null
+    headingNavigationTargetRef.current = null
     if (forceMountRenderIndexRef.current != null) {
       setForceMountRenderIndex(null)
     }
@@ -1116,6 +1121,30 @@ function MessageListBase({
     }
     return true
   }, [contentEl, followHandle])
+
+  const alignViewportToHeading = useCallback((anchorId: string) => {
+    const el = scrollRef.current
+    const heading = contentEl?.querySelector(`#${CSS.escape(anchorId)}`) as HTMLElement | null
+    if (!heading || !el) return false
+    const column = heading.closest<HTMLElement>('.chat-message-group-col-body')
+    if (column) {
+      column.scrollTop += heading.getBoundingClientRect().top - column.getBoundingClientRect().top - HEADING_NAVIGATOR_TOP_INSET_PX
+    }
+    const nextOffset = Math.max(
+      0,
+      heading.getBoundingClientRect().top - el.getBoundingClientRect().top + el.scrollTop - HEADING_NAVIGATOR_TOP_INSET_PX,
+    )
+    if (Math.abs(el.scrollTop - nextOffset) > NAVIGATOR_ALIGN_EPSILON_PX) {
+      followHandle.scrollToOffset(nextOffset)
+    }
+    return true
+  }, [contentEl, followHandle])
+
+  const alignViewportToNavigationTarget = useCallback((targetRenderIndex: number) => {
+    const target = headingNavigationTargetRef.current
+    if (target?.targetIndex === targetRenderIndex && alignViewportToHeading(target.anchorId)) return true
+    return alignViewportToRowIndex(targetRenderIndex)
+  }, [alignViewportToHeading, alignViewportToRowIndex])
 
   const rowHasPendingMedia = useCallback((row: HTMLElement) => {
     if (row.querySelector(NAVIGATOR_PENDING_SELECTOR)) return true
@@ -1146,10 +1175,20 @@ function MessageListBase({
     if (!(height > 0)) {
       return { ready: false as const, height: 0, offsetPx: Number.POSITIVE_INFINITY }
     }
+    const headingTarget = headingNavigationTargetRef.current
+    const heading = headingTarget?.targetIndex === targetRenderIndex
+      ? row.querySelector<HTMLElement>(`#${CSS.escape(headingTarget.anchorId)}`)
+      : null
+    // Heading jumps settle at the heading, rather than waiting for the whole
+    // answer's top to align (which never happens for a heading midway down it).
+    const desiredOffset = heading
+      ? Math.max(0, Math.min(el.scrollHeight - el.clientHeight,
+        heading.getBoundingClientRect().top - viewportRect.top + el.scrollTop - HEADING_NAVIGATOR_TOP_INSET_PX))
+      : null
     return {
       ready: true as const,
       height,
-      offsetPx: Math.abs(rowRect.top - viewportRect.top),
+      offsetPx: desiredOffset == null ? Math.abs(rowRect.top - viewportRect.top) : Math.abs(el.scrollTop - desiredOffset),
     }
   }, [contentEl, rowHasPendingMedia])
 
@@ -1242,7 +1281,7 @@ function MessageListBase({
     }
 
     setNavigationLock(true)
-    alignViewportToRowIndex(hold.targetIndex)
+    alignViewportToNavigationTarget(hold.targetIndex)
     hold.jumped = true
     hold.frames += 1
 
@@ -1274,7 +1313,7 @@ function MessageListBase({
     })
     return () => cancelAnimationFrame(raf)
   }, [
-    alignViewportToRowIndex,
+    alignViewportToNavigationTarget,
     endNavigatorSession,
     navigatorHoldEpoch,
     readNavigatorTargetMetrics,
@@ -1287,6 +1326,7 @@ function MessageListBase({
   const navigateToNavigatorNode = useCallback((node: MessageNavigatorNode) => {
     // 跳到上方消息：先脱离跟随，否则跟随纠正器会把视口又钉回底部。
     followHandle.releaseFollow()
+    headingNavigationTargetRef.current = null
     updateActiveNavigatorNode(node.id)
 
     if (node.targetRenderIndex < 0 || node.targetRenderIndex >= historyItems.length) {
@@ -1309,6 +1349,26 @@ function MessageListBase({
     updateActiveNavigatorNode,
   ])
 
+  const navigateToOutlineHeading = useCallback((item: MarkdownHeadingOutlineItem) => {
+    const targetIndex = outlineRenderIndexByOwner.get(activeOutlineOwnerId ?? '')
+    if (targetIndex == null || targetIndex < 0 || targetIndex >= historyItems.length) return
+    followHandle.releaseFollow()
+    setActiveOutlineAnchorId(item.anchorId)
+    const generation = beginMessageNavigationHydrate()
+    navigatorSettleGenerationRef.current = generation
+    clearNavigatorPrepare()
+    headingNavigationTargetRef.current = { anchorId: item.anchorId, targetIndex }
+    setForceMountRenderIndex(targetIndex)
+    prepareThenJumpToNavigatorNode(generation, targetIndex)
+  }, [
+    activeOutlineOwnerId,
+    clearNavigatorPrepare,
+    followHandle,
+    historyItems.length,
+    outlineRenderIndexByOwner,
+    prepareThenJumpToNavigatorNode,
+  ])
+
 
   useEffect(() => () => {
     clearNavigatorPrepare()
@@ -1319,6 +1379,10 @@ function MessageListBase({
     // 切换会话时清掉上一会话未完成的 settle，避免 eager / force-mount 残留。
     clearNavigatorPrepare()
     resetMessageNavigationStore()
+    headingNavigationTargetRef.current = null
+    setOutlineSources(new Map())
+    setActiveOutlineOwnerId(null)
+    setActiveOutlineAnchorId(null)
   }, [clearNavigatorPrepare, conversationId])
 
   // 全局搜索：打开会话后滚到命中消息，并短暂闪一下高亮。
@@ -1515,6 +1579,44 @@ function MessageListBase({
   ])
 
 
+  const syncHeadingOutlineFromDom = useCallback((readingY: number, viewportTop: number, viewportBottom: number) => {
+    const el = scrollRef.current
+    if (!el) return
+    const roots = [...el.querySelectorAll<HTMLElement>('[data-chat-outline-owner]')]
+      .filter((root) => (outlineItemsByOwner.get(root.dataset.chatOutlineOwner ?? '')?.length ?? 0) >= 2)
+      .filter((root) => root.closest('[data-chat-message-group-focused]')?.getAttribute('data-chat-message-group-focused') !== 'false')
+    let target = roots.find((root) => {
+      const rect = root.getBoundingClientRect()
+      return rect.top <= readingY && rect.bottom >= readingY
+    })
+    if (!target) {
+      target = roots
+        .filter((root) => {
+          const rect = root.getBoundingClientRect()
+          return rect.top >= readingY && rect.top < viewportBottom && rect.bottom > viewportTop
+        })
+        .sort((left, right) => left.getBoundingClientRect().top - right.getBoundingClientRect().top)[0]
+    }
+    const ownerMessageId = target?.dataset.chatOutlineOwner ?? null
+    setActiveOutlineOwnerId((current) => current === ownerMessageId ? current : ownerMessageId)
+    if (!target || !ownerMessageId) {
+      setActiveOutlineAnchorId((current) => current == null ? current : null)
+      return
+    }
+    const items = outlineItemsByOwner.get(ownerMessageId) ?? []
+    const column = target.closest<HTMLElement>('.chat-message-group-col-body')
+    const headingReadingY = column
+      ? column.getBoundingClientRect().top + column.clientHeight * 0.3
+      : readingY
+    let active: MarkdownHeadingOutlineItem | null = null
+    for (const item of items) {
+      const heading = target.querySelector(`#${CSS.escape(item.anchorId)}`) as HTMLElement | null
+      if (heading && heading.getBoundingClientRect().top <= headingReadingY) active = item
+    }
+    active ??= items[0] ?? null
+    setActiveOutlineAnchorId((current) => current === active?.anchorId ? current : active?.anchorId ?? null)
+  }, [outlineItemsByOwner])
+
   // 滚动监听：用 DOM 行几何更新导航器（兼容「上方虚拟 + 底部实挂载」）。
   // 跟随钉底由 useScrollFollow 独立处理。
   const syncNavigatorFromDom = useCallback(() => {
@@ -1523,6 +1625,7 @@ function MessageListBase({
     const viewportTop = el.getBoundingClientRect().top
     const viewportBottom = viewportTop + el.clientHeight
     const readingY = viewportTop + el.clientHeight * 0.3
+    syncHeadingOutlineFromDom(readingY, viewportTop, viewportBottom)
     const rows = el.querySelectorAll<HTMLElement>('[data-chat-row-index]')
     let activeIndex: number | null = null
     let firstVisible = Number.POSITIVE_INFINITY
@@ -1554,7 +1657,7 @@ function MessageListBase({
         lastVisible,
       ))
     }
-  }, [updateActiveNavigatorNode, updateVisibleNavigatorNodes])
+  }, [syncHeadingOutlineFromDom, updateActiveNavigatorNode, updateVisibleNavigatorNodes])
 
   // 滚动回调只保留导航器的低频同步；虚拟窗口和尺寸补偿由同一个 virtualizer 管理。
   // 导航器同步是整列表测量（querySelectorAll + 逐行 gBCR，virtualizer 同帧写过 DOM 时
@@ -1588,6 +1691,12 @@ function MessageListBase({
     })
   }, [syncNavigatorFromDom])
 
+  useEffect(() => {
+    if (outlineSources.size === 0) return
+    const frame = requestAnimationFrame(syncNavigatorFromDom)
+    return () => cancelAnimationFrame(frame)
+  }, [outlineSources, syncNavigatorFromDom])
+
   const handleNavigatorScroll = useCallback(() => {
     // hold 期间硬钉：消息导航钉目标行；回到底部钉底。
     if (navigationLockRef.current) {
@@ -1597,12 +1706,12 @@ function MessageListBase({
       } else {
         const hold = navigatorHoldRef.current
         if (hold?.jumped) {
-          alignViewportToRowIndex(hold.targetIndex)
+          alignViewportToNavigationTarget(hold.targetIndex)
         }
       }
     }
     scheduleNavigatorSync()
-  }, [alignViewportToRowIndex, followHandle, scheduleNavigatorSync])
+  }, [alignViewportToNavigationTarget, followHandle, scheduleNavigatorSync])
 
   // 用户滚轮 = 用户接管视口。回底/导航 hold 期间若继续硬钉：wheel(up) 先解除跟随，
   // 下一个 scroll 事件又被 handleNavigatorScroll 的 jumpToBottom()（forceFollow）钉回，
@@ -1627,6 +1736,21 @@ function MessageListBase({
     return () => viewportEl.removeEventListener('wheel', handleWheel)
   }, [cancelNavigatorSettle, endNavigatorSession, viewportEl])
 
+
+  const handleDisclosureClick = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    const button = (event.target as Element).closest<HTMLElement>('[data-chat-disclosure]')
+    if (!button) return
+    // Capture runs before the toggle changes height, including keyboard clicks.
+    // Reading details takes over from stream following and navigation holds.
+    followHandle.releaseFollow()
+    clearNavigatorPrepare()
+    endMessageNavigationHydrate(navigatorSettleGenerationRef.current)
+    const row = button.closest<HTMLElement>('[data-chat-row-index]')
+    const index = row ? Number(row.dataset.chatRowIndex) : -1
+    disclosureAnchorRef.current = index >= 0
+      ? { key: virtualizer.options.getItemKey(index), button }
+      : null
+  }, [clearNavigatorPrepare, followHandle, virtualizer])
 
   // 消息区右键：读取当前选中文本 + 命中的消息，弹内置菜单。两者都空则不弹（放行给全局屏蔽）。
   const handleContextMenu = useCallback((e: React.MouseEvent) => {
@@ -1663,8 +1787,7 @@ function MessageListBase({
     updateVisibleNavigatorNodes(lastNode ? [lastNode.id] : [])
   }, [conversationId, followHandle, updateActiveNavigatorNode, updateVisibleNavigatorNodes])
 
-  // 自己发出新消息时强制回到底部（即使刚才正往上翻历史）。assistant 落库会替换列表外的
-  // streaming 节点；若仍在跟随，完成这次结构交接后也明确补钉，不能只依赖 ResizeObserver 时序。
+  // New user messages force follow; committed answers keep an existing follow intent.
   useLayoutEffect(() => {
     const count = messages.length
 
@@ -1677,55 +1800,15 @@ function MessageListBase({
     prevMessageCountRef.current = count
   }, [messages, followHandle])
 
-  // live → 历史 交接。
-  //
-  // Primary path: live is OUTSIDE the virtualizer (document flow). Streaming
-  // pin is contentGrowth-only and stable. On settle the outside bubble unmounts
-  // and the twin remounts inside the virtualizer at estimate height — height
-  // collapses then re-expands. Seed cache from the last live height and run the
-  // same multi-frame bottomHold as "jump to bottom" so pin survives hydrate.
-  // live 行高度用 RO 持续跟踪（settle 帧种子消费）。原实现在 layout effect 里每个
-  // token querySelector + getBoundingClientRect —— 每帧一次强制布局读，长回答白白累积。
-  // RO 回调在布局后、绘制前投递，此时读 gBCR 拿的是新鲜布局，不触发额外 reflow。
-  useLayoutEffect(() => {
-    if (!liveRowActive || !contentEl) return
-    const liveEl = contentEl.querySelector(
-      '[data-chat-message-list-item="streaming"], [data-chat-message-list-item="live-group"]',
-    ) as HTMLElement | null
-    if (!liveEl) return
-    const record = () => {
-      const height = liveEl.getBoundingClientRect().height
-      if (height > 0) liveBubbleHeightRef.current = height
-    }
-    record()
-    if (typeof ResizeObserver === 'undefined') return
-    const observer = new ResizeObserver(record)
-    observer.observe(liveEl)
-    return () => observer.disconnect()
-  }, [contentEl, liveRowActive])
-
+  // After the row ref measures the handoff, keep following while heavy content hydrates.
   const liveScrollHandoffRef = useRef(liveRowActive)
   useLayoutEffect(() => {
     const wasLive = liveScrollHandoffRef.current
     liveScrollHandoffRef.current = liveRowActive
     if (!wasLive || liveRowActive) return
-    if (!streamFollowIntentRef.current && !followHandle.isFollowing()) return
-
-    const liveHeight = Math.round(liveBubbleHeightRef.current)
-    liveBubbleHeightRef.current = 0
-    if (liveHeight > 0) {
-      const settlingId = snapshot.messageId
-        || [...messages].reverse().find((message) => message.role === 'assistant')?.id
-        || null
-      if (settlingId) {
-        const settling = messages.find((message) => message.id === settlingId)
-        const liveMessage = lastLiveMessageRef.current
-        if (settling && liveMessage && canReuseLiveRowHeight(liveMessage, settling)) {
-          const rowKey = `${liveRowModel.resolveMessageKey(settling.id)}:${chatMessageLayoutRevision(settling)}`
-          setCachedRowMeasurement(layoutKey, rowKey, liveHeight)
-          estimateSizeRef.current.set(liveRowModel.resolveMessageKey(settling.id), liveHeight)
-        }
-      }
+    if (!streamFollowIntentRef.current && !followHandle.isFollowing()) {
+      beginStreamSettleEagerHydrate()
+      return
     }
 
     cancelNavigatorSettle()
@@ -1741,12 +1824,7 @@ function MessageListBase({
     }
 
     followHandle.markLayoutCompensation()
-    // Prefer pin-if-following over forceFollow: avoids a hard jump when height
-    // continuity already holds; bottomHold still re-pins while hydrate settles.
-    followHandle.pinIfFollowing()
-    if (followHandle.isFollowing() || streamFollowIntentRef.current) {
-      followHandle.stickToBottom()
-    }
+    followHandle.stickToBottom()
     bottomHoldRef.current = {
       generation,
       frames: 0,
@@ -1758,23 +1836,13 @@ function MessageListBase({
     cancelNavigatorSettle,
     followHandle,
     historyItems.length,
-    layoutKey,
     liveRowActive,
-    liveRowModel,
-    messages,
     setNavigationLock,
-    snapshot.messageId,
   ])
 
-  // 发送后的尾部预留，两个阶段一处算：
-  // - **运行中**：撑在尾部 wrapper 的 minHeight 上（是 min，回答长过它就自然吃掉，不用逐帧算）。
-  // - **结束后**：同一段预留补到底部留白上。两阶段量的是同一段跨度（最后一条 user 的底边 →
-  //   内容底边）、同一个 reserve 值，所以交接前后总高相等，视图不动（短回答不再往下沉）。
-  //
-  // 基准必须是**滚动视口**的高度，不是窗口高（dvh）：ask_user 面板吊在输入框上方、在滚动区
-  // 之外，它一出现视口就矮一大截，按窗口算的预留会比视口还高，把上一条消息整个顶出屏幕。
-  // 再夹一道 `视口 - 锚点行高`：不管比例给多大，那条刚发出的消息必须留在屏幕里。
-  // 只在「本次会话里刚生成完」时接管留白：切换/打开会话不给预留，老会话的样子不变。
+  // During generation minHeight reserves space below the latest user message.
+  // On settle transfer the same reserve to the spacer before paint. Ordinary
+  // conversation opens do not inherit this send-time whitespace.
   const reserveHandoffRef = useRef(false)
   useLayoutEffect(() => {
     reserveHandoffRef.current = false
@@ -1792,14 +1860,7 @@ function MessageListBase({
         : null
       const anchorH = row?.getBoundingClientRect().height ?? 0
       const reserve = sendReserveHeight(viewportEl.clientHeight, anchorH, LIST_EDGE_PADDING_PX)
-      // ⚠️ 只在 streaming/frozen 期间保留 minHeight，settle 帧**立即**转移，不等 bottomHold。
-      // 曾经这里多一个 `|| bottomHoldRef.current`：settle 帧 live 气泡已经搬进 virtualizer，
-      // wrapper 里只剩状态线 + spacer（~30px），再压 reserve 的 minHeight 就是往文档里
-      // 凭空插一条 ~45% 视口高的空带 —— 钉底把答案顶上去（闪一下），hold 结束转移时
-      // 又缩回来（抽一下）。立即转移在两种回答长度下总高都恒等：长回答 minHeight 本来
-      // 就被内容吃掉（清掉不变高、row 已虚拟化卸载 → spacer 16px）；短回答 row 还在，
-      // spacer = reserve − span 精确补齐。本 effect 在交接 effect 之后同一 commit 运行，
-      // twin 已在 DOM 里，span 量得到。
+      // Clear minHeight in the handoff commit; retaining it would count the reserve twice.
       if (streaming || streamFrozen) {
         wrap.style.minHeight = `${Math.round(reserve)}px`
         // 留白交还给 minHeight：不还的话上一轮量出来的高度会和 minHeight 叠成两段预留。
@@ -1873,6 +1934,8 @@ function MessageListBase({
               onSaveMessageToNote={onSaveMessageToNote}
               agentPlanOverride={msg.id === legacyPlanMessageId ? agentPlanState : null}
               onExecuteAgentPlan={msg.role === 'assistant' ? onExecuteAgentPlan : undefined}
+              outlineEligible={msg.role === 'assistant' && !streamFrozen}
+              onOutlineSourceChange={handleOutlineSourceChange}
             />
           )
         }
@@ -1903,6 +1966,8 @@ function MessageListBase({
               onForkMessage={streaming || streamFrozen ? undefined : onForkMessage}
               onDeleteMessage={onDeleteMessage}
               onSaveMessageToNote={onSaveMessageToNote}
+              outlineEligible={!streamFrozen}
+              onOutlineSourceChange={handleOutlineSourceChange}
             />
           )
         }
@@ -1921,6 +1986,7 @@ function MessageListBase({
               message={item.message}
               conversationId={conversationId}
               messageStreaming={item.messageStreaming}
+              markdownStreaming={item.markdownStreaming}
               reasoningStreaming={item.reasoningStreaming}
               reasoningDurationMs={streamingReasoningDurationMs}
               reasoningDurationMsBySegmentId={streamingReasoningDurationMsBySegmentId}
@@ -1990,38 +2056,72 @@ function MessageListBase({
       messages,
       groupSelections,
       onSetGroupSelection,
+      handleOutlineSourceChange,
       streamingReasoningDurationMs,
       streamingReasoningDurationMsBySegmentId,
       lang,
     ],
   )
 
-  const renderTail = useCallback(() => (
+  // Historical rows stay absolutely positioned; live growth stays in normal
+  // flow outside the virtualizer's measurements. Both use ONE keyed sibling
+  // array and parent, so committing only changes position/props, never mounts
+  // a replacement MessageBubble/MessageGroup. The spacer preserves the original
+  // history + live + chrome geometry, including the send reserve.
+  const visibleRows = virtualItems.flatMap((virtualItem) => {
+    const item = itemAt(virtualItem.index)
+    return item ? [{ item, virtualItem }] : []
+  })
+  const rows: Array<{ item: RenderItem; virtualItem?: (typeof virtualItems)[number] }> = visibleRows
+  if (liveItem) rows.push({ item: liveItem })
+
+  const renderTail = () => (
     <div ref={tailWrapRef}>
-      {dynamicItem && (
+      {rows.map(({ item, virtualItem }) => (
         <div
-          className="pb-0.5"
-          data-chat-message-list-item={dynamicItem.kind}
-          data-message-id={dynamicItem.kind === 'streaming' ? dynamicItem.message.id : undefined}
+          key={`${conversationId ?? 'empty'}:${item.key}`}
+          ref={virtualItem
+            ? (import.meta.env.MODE !== 'test' ? measureHistoryRow : undefined)
+            : liveRowRef}
+          data-index={virtualItem?.index}
+          data-chat-item-key={virtualItem ? measurementKey(item) : undefined}
+          data-chat-row-index={virtualItem?.index}
+          data-chat-reading-row={item.kind !== 'spacer' ? '' : undefined}
+          data-message-id={item.kind === 'message' || item.kind === 'streaming' ? item.message.id : undefined}
+          data-chat-message-list-item={item.kind}
+          className={virtualItem ? 'absolute left-0 top-0 w-full pb-0.5' : 'w-full pb-0.5'}
+          style={virtualItem ? { transform: `translateY(${virtualItem.start}px)` } : undefined}
         >
-          {renderItem(dynamicItem)}
+          {item.kind === 'group' || item.kind === 'live-group'
+            ? renderItem(item)
+            : <div className="chat-reading-content">{renderItem(item)}</div>}
         </div>
-      )}
+      ))}
       {errorItem && (
-        <div className="pb-0.5" data-chat-message-list-item={errorItem.kind}>
+        <div className="chat-reading-content pb-0.5" data-chat-message-list-item={errorItem.kind}>
           {renderItem(errorItem)}
         </div>
       )}
       {(messages.length > 0 || streaming) && (
-        <StreamStatusLine active={streaming && !streamFrozen && !liveGroup} />
+        <div className="chat-reading-content">
+          <StreamStatusLine active={streaming && !streamFrozen && !liveGroup} />
+        </div>
       )}
       <div ref={tailSpacerRef} aria-hidden="true" style={{ height: LIST_EDGE_PADDING_PX }} />
     </div>
-  ), [dynamicItem, errorItem, liveGroup, messages.length, renderItem, streaming, streamFrozen])
+  )
 
   return (
-    <div className={`relative flex min-h-0 flex-1 flex-col ${navigatorTurnCount >= 4 ? 'has-message-navigator' : ''}`}>
-      {navigatorTurnCount >= 4 && (
+    <div className={`relative flex min-h-0 flex-1 flex-col ${navigatorTurnCount >= MESSAGE_NAVIGATOR_MIN_TURNS ? 'has-message-navigator' : ''} ${activeOutlineItems.length >= 2 ? 'has-heading-navigator' : ''}`}>
+      {activeOutlineOwnerId && activeOutlineItems.length >= 2 && (
+        <ChatHeadingOutline
+          ownerMessageId={activeOutlineOwnerId}
+          items={activeOutlineItems}
+          activeAnchorId={activeOutlineAnchorId}
+          onNavigate={navigateToOutlineHeading}
+        />
+      )}
+      {navigatorTurnCount >= MESSAGE_NAVIGATOR_MIN_TURNS && (
         <MessageNavigator
           nodes={navigatorNodes}
           activeNodeId={activeNavigatorNodeId}
@@ -2033,44 +2133,24 @@ function MessageListBase({
       <div
         ref={setScrollEl}
         onContextMenu={handleContextMenu}
+        onClickCapture={handleDisclosureClick}
         onScroll={handleNavigatorScroll}
+        onScrollCapture={(event) => {
+          if (event.target !== event.currentTarget) scheduleNavigatorSync()
+        }}
+        onMouseOverCapture={(event) => {
+          if (event.target instanceof Element && event.target.closest('.chat-message-group-col')) scheduleNavigatorSync()
+        }}
         className={`chat-scroll-viewport chat-motion-view-in custom-scrollbar flex-1 overflow-y-auto ${navigatorLockActive ? 'is-navigator-locking' : ''}`}
 
 
       >
-        <div ref={setContentEl} className="chat-message-list-inner mx-auto w-full max-w-4xl px-6">
-          <div
-            className="relative w-full"
-            style={{ height: virtualizer.getTotalSize() }}
-          >
-            {virtualItems.map((virtualItem) => {
-              const item = itemAt(virtualItem.index)
-              if (!item) return null
-              const messageId = item.kind === 'message'
-                ? item.message.id
-                : item.kind === 'streaming'
-                  ? item.message.id
-                  : undefined
-              return (
-                <div
-                  key={virtualItem.key}
-                  ref={import.meta.env.MODE === 'test' ? undefined : virtualizer.measureElement}
-                  data-index={virtualItem.index}
-                  data-chat-item-key={measurementKey(item)}
-                  data-chat-row-index={virtualItem.index}
-                  data-message-id={messageId}
-                  data-chat-message-list-item={item.kind}
-                  className="absolute left-0 top-0 w-full pb-0.5"
-                  style={{ transform: `translateY(${virtualItem.start}px)` }}
-                >
-                  {renderItem(item)}
-                </div>
-              )
-            })}
-          </div>
-          {/* Chrome always outside: live + status/error/send-reserve. */}
-          <div data-chat-message-list-item="tail" className="w-full pb-0.5">
-            {renderTail()}
+        <div ref={setContentEl} className={`chat-message-list-inner mx-auto w-full px-6 ${hasWideGroups ? 'chat-message-list-inner--wide' : 'max-w-4xl'}`}>
+          <div data-chat-rows-root className="relative w-full">
+            <div aria-hidden="true" style={{ height: virtualizer.getTotalSize() }} />
+            <div data-chat-message-list-item="tail" className="w-full pb-0.5">
+              {renderTail()}
+            </div>
           </div>
         </div>
       </div>

@@ -299,7 +299,7 @@ pub(crate) async fn translate_text(
         .get_provider(&settings.translator_provider_id)
         .ok_or_else(|| "Translator provider not found".to_string())?;
 
-    if provider.api_keys.is_empty() {
+    if !provider.has_credentials() {
         return Ok("Missing API Key".to_string());
     }
     if settings.translator_model.trim().is_empty() {
@@ -719,6 +719,7 @@ fn apply_provider_auth(
     api_format: ProviderApiFormat,
     api_key: &str,
 ) -> reqwest::RequestBuilder {
+    if api_key.is_empty() { return request; }
     match api_format {
         ProviderApiFormat::AnthropicMessages => request
             .header("x-api-key", api_key)
@@ -838,10 +839,26 @@ pub(crate) async fn fetch_models(
     provider: Option<ProviderConnectionInput>,
 ) -> Result<Vec<String>, String> {
     let settings = state.settings_read().clone();
+    let mut oauth_provider = effective_request_provider(&settings, &provider_id, provider.as_ref().and_then(|p| p.request.clone()));
+    if let Some(input) = provider.as_ref() {
+        if input.id.as_deref().is_some_and(|id| !id.is_empty() && id != provider_id) {
+            return Err("Provider ID mismatch".into());
+        }
+        oauth_provider.base_url = input.base_url.clone();
+        if let Some(format) = &input.api_format { oauth_provider.api_format = format.clone(); }
+    }
+    if oauth_provider.request.oauth.is_some() {
+        return crate::provider_oauth::models(&state, &oauth_provider).await;
+    }
+
     let api_format = resolve_api_format(&settings, &provider_id, provider.as_ref());
     let request_override = provider.as_ref().and_then(|p| p.request.clone());
     let preferred_idx = provider.as_ref().and_then(|p| p.active_key_index);
-    let (base_url, api_keys) = resolve_provider_credentials(&settings, &provider_id, provider)?;
+    let (base_url, mut api_keys) = resolve_provider_credentials(&settings, &provider_id, provider)?;
+    let anonymous = api_format == ProviderApiFormat::OpenAiChat
+        && crate::opencode_free::is_endpoint(&base_url)
+        && api_keys.iter().all(|key| key.trim().is_empty());
+    if anonymous { api_keys = vec![String::new()]; }
     let retry_attempts = effective_retry_attempts(&settings);
     let effective = effective_request_provider(&settings, &provider_id, request_override);
 
@@ -886,7 +903,9 @@ pub(crate) async fn fetch_models(
         .await
         .map_err(|e| format!("Failed to parse models response JSON: {e}"))?;
 
-    parse_model_list_ids(&value)
+    let mut ids = parse_model_list_ids(&value)?;
+    if anonymous { ids.retain(|id| crate::opencode_free::is_free_model(id)); }
+    Ok(ids)
 }
 
 /// 测试供应商连接是否可用
@@ -902,6 +921,23 @@ pub(crate) async fn test_provider_connection(
     provider: Option<ProviderConnectionInput>,
 ) -> Result<serde_json::Value, String> {
     let settings = state.settings_read().clone();
+    let mut oauth_provider = effective_request_provider(&settings, &provider_id, provider.as_ref().and_then(|p| p.request.clone()));
+    if let Some(input) = provider.as_ref() {
+        if input.id.as_deref().is_some_and(|id| !id.is_empty() && id != provider_id) {
+            return Err("Provider ID mismatch".into());
+        }
+        oauth_provider.base_url = input.base_url.clone();
+        if let Some(format) = &input.api_format { oauth_provider.api_format = format.clone(); }
+    }
+    if oauth_provider.request.oauth.is_some() {
+        let model = provider.as_ref().and_then(|p| p.model.as_deref()).filter(|m| !m.trim().is_empty());
+        let result = crate::provider_oauth::test_connection(&state, &oauth_provider, model).await;
+        return Ok(match result {
+            Ok(()) => serde_json::json!({"success": true}),
+            Err(error) => serde_json::json!({"success": false, "error": error}),
+        });
+    }
+
     let model = provider.as_ref().and_then(|p| p.model.clone());
     // 协议优先取前端传入（未保存的编辑中配置），缺省回退 settings 里已保存的。
     let api_format = resolve_api_format(&settings, &provider_id, provider.as_ref());
@@ -915,9 +951,13 @@ pub(crate) async fn test_provider_connection(
                 .map(|p| p.clamped_active_key_index())
         })
         .unwrap_or(0);
-    let (base_url, api_keys) = resolve_provider_credentials(&settings, &provider_id, provider)?;
+    let (base_url, mut api_keys) = resolve_provider_credentials(&settings, &provider_id, provider)?;
+    let anonymous = api_format == ProviderApiFormat::OpenAiChat
+        && crate::opencode_free::is_endpoint(&base_url)
+        && api_keys.iter().all(|key| key.trim().is_empty());
+    if anonymous { api_keys = vec![String::new()]; }
 
-    let api_key = match crate::api::pick_key_at(&api_keys, preferred_idx) {
+    let api_key = match if anonymous { Some(String::new()) } else { crate::api::pick_key_at(&api_keys, preferred_idx) } {
         Some(k) => k,
         None => {
             return Ok(serde_json::json!({
@@ -940,6 +980,9 @@ pub(crate) async fn test_provider_connection(
 
     let result = match model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
         Some(model) => {
+            if anonymous && !crate::opencode_free::is_free_model(model) {
+                return Ok(serde_json::json!({"success": false, "error": "OpenCode Free only supports free models"}));
+            }
             let (url, body) = connection_test_url_and_body(api_format, base, model);
             send_with_retry("Provider API", retry_attempts, || {
                 let request = apply_provider_auth(

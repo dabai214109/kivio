@@ -23,14 +23,19 @@ pub mod offline_models;
 pub mod path_env;
 pub mod plugins;
 pub mod proc;
+#[cfg(any(target_os = "macos", test))]
+mod macos_hang_watchdog;
 pub mod prompts;
 pub mod provider_request;
+pub mod provider_oauth;
+mod opencode_free;
 pub mod rapidocr;
 pub mod remote_bridge;
 pub mod replace_translation;
 #[cfg(target_os = "macos")]
 pub mod sck;
 pub mod screenshot;
+pub mod self_config;
 pub mod settings;
 pub mod shortcuts;
 pub mod skills;
@@ -168,6 +173,7 @@ pub fn run() {
                         .keep_chat_window_alive;
                     if keep_alive {
                         api.prevent_close();
+                        chat::notification_viewing::clear_window(window.label());
                         hide_chat_window(window.app_handle(), window);
                     }
                     return;
@@ -206,6 +212,9 @@ pub fn run() {
                     return;
                 }
             }
+            tauri::WindowEvent::Focused(false) => {
+                chat::notification_viewing::clear_window(window.label());
+            }
             tauri::WindowEvent::Focused(true) =>
             {
                 #[cfg(target_os = "macos")]
@@ -219,6 +228,7 @@ pub fn run() {
             }
             tauri::WindowEvent::Destroyed => {
                 let label = window.label();
+                chat::notification_viewing::clear_window(label);
                 if crate::chat::popout::is_popout_label(label) {
                     crate::chat::popout::on_popout_destroyed(window.app_handle(), label);
                 } else if label == "chat" {
@@ -373,6 +383,9 @@ pub fn run() {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     chat::draft_journal::recover_orphan_drafts(&handle).await;
+                    if let Err(error) = chat::goal::pause_unfinished_after_restart(&handle).await {
+                        eprintln!("Failed to pause unfinished Goals after restart: {error}");
+                    }
                 });
             }
             // Dock 的 workspace 文件监听服务（文件树 / Git 面板的秒级刷新源）。
@@ -536,13 +549,22 @@ pub fn run() {
                     }
                 });
             }
+            #[cfg(target_os = "macos")]
+            macos_hang_watchdog::start(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            provider_oauth::provider_oauth_start,
+            provider_oauth::provider_oauth_poll,
+            provider_oauth::provider_oauth_cancel,
+            provider_oauth::provider_oauth_disconnect,
+            provider_oauth::usage::provider_oauth_usage,
+            provider_oauth::account::provider_oauth_account,
             commands::get_settings,
             windows::chat_window_apply_mica,
             windows::chat_window_set_opaque,
             windows::chat_traffic_light_center_y,
+            chat::notification_viewing::chat_report_notification_view,
             windows::chat_remember_last_route,
             fonts::list_system_fonts,
             commands::get_default_prompt_templates,
@@ -641,6 +663,14 @@ pub fn run() {
             chat::commands::interaction::chat_take_external_sends,
             chat::commands::interaction::chat_set_agent_plan_mode,
             chat::commands::interaction::chat_execute_agent_plan,
+            chat::goal::chat_get_goal,
+            chat::goal::chat_start_goal,
+            chat::goal::chat_edit_goal,
+            chat::goal::chat_pause_goal,
+            chat::goal::chat_resume_goal,
+            chat::goal::chat_cancel_goal,
+            chat::goal::chat_set_goal_user_queue_pending,
+            chat::commands::send::chat_continue_goal,
             chat::commands::send::chat_send_message,
             chat::commands::interaction::chat_cancel_stream,
             im_gateway::im_gateway_status,
@@ -727,6 +757,12 @@ pub fn run() {
             connectors::connector_oauth_connect,
             connectors::obsidian::list_obsidian_vaults_cmd,
             plugins::plugins_list,
+            plugins::packages::plugin_packages_list,
+            plugins::packages::plugin_packages_import,
+            plugins::packages::plugin_packages_set_enabled,
+            plugins::packages::plugin_packages_remove,
+            plugins::packages::workflow_hooks_get,
+            plugins::packages::workflow_hooks_save,
             plugins::plugins_list_cached,
             plugins::plugins_install_brief,
             plugins::plugins_run_official_install,
@@ -749,7 +785,10 @@ pub fn run() {
             automation::commands::automation_delete,
             automation::commands::automation_set_enabled,
             automation::commands::automation_run,
+            automation::commands::automation_test_node,
+            automation::commands::automation_validate,
             automation::commands::automation_cancel,
+            automation::commands::automation_active_run,
             automation::commands::automation_export,
             automation::commands::automation_import,
             automation::commands::automation_runs_list,

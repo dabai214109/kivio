@@ -1,7 +1,7 @@
 # Kivio Rust 后端 Cargo 配置
 [package]
 name = "kivio"
-version = "2.9.5-im.2"
+version = "2.9.8-im.1"
 description = "Kivio Desktop - Screen-level AI assistant for macOS/Windows"
 authors = ["ZM"]
 license = "GPL-3.0-or-later"
@@ -62,7 +62,7 @@ rmcp = { version = "3.0.1", default-features = false, features = [
 
 # HTTP 客户端与异步运行时
 reqwest = { version = "0.13", features = ["json", "rustls", "multipart", "form"] }
-tokio = { version = "1", features = ["time", "process", "io-util", "sync", "rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["time", "process", "io-util", "net", "sync", "rt-multi-thread", "macros"] }
 # IM 网关：OneBot11 连本机 NapCat（ws:// 明文）；QQ 官方机器人网关是 wss://，需 rustls。
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 # Kivio Remote：配对二维码生成（纯矩阵，无图像后端）
@@ -92,6 +92,7 @@ unicode-normalization = "0.1"
 # 工具库
 base64 = "0.22"
 uuid = { version = "1", features = ["v4"] }
+keyring = { version = "3.6.3", features = ["apple-native", "windows-native"] }
 # 连接器 OAuth（PKCE + DCR + loopback）：sha2 算 code_challenge，rand 生成 code_verifier，
 # url 构造/解析 authorize URL 与回调 query。
 sha2 = "0.10"
@@ -118,6 +119,10 @@ ort = { version = "=2.0.0-rc.12", default-features = false, features = ["std", "
 
 # macOS 平台特有依赖（系统 API 调用）
 [target.'cfg(target_os = "macos")'.dependencies]
+block2 = "0.6"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSError", "NSObject", "NSString"] }
+objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "block2", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationTrigger", "UNUserNotificationCenter"] }
 cocoa = "0.26"
 objc = "0.2"
 # objc 0.2.7 内部用的就是 objc_exception 0.1：提供裸 @try/@catch（C 层），用于在 FFI 边界拦截
@@ -167,6 +172,7 @@ windows = { version = "0.61.3", features = [
 custom-protocol = ["tauri/custom-protocol"]
 
 [dev-dependencies]
+tempfile = "3"
 # 测试用：test-util 提供 tokio 暂停时钟（start_paused），让重试退避 sleep 在单测中瞬时跳过。
 tokio = { version = "1", features = ["test-util", "macros", "rt", "rt-multi-thread", "time"] }
 # 测试用：构造 reqwest::Response（不走网络）以驱动 retry/failover 单测。与 reqwest 传递依赖同版本。

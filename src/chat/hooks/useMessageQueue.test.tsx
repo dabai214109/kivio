@@ -35,6 +35,21 @@ beforeEach(() => {
 })
 
 describe('useMessageQueue', () => {
+  it('向后端标记尚未提交的用户输入，提交为 follow-up 后清除标记', async () => {
+    const onPendingChange = vi.fn()
+    const { result } = renderHook(() => useMessageQueue({
+      onSendMessage: vi.fn().mockResolvedValue(true),
+      onRestoreToComposer: vi.fn(),
+      onPendingChange,
+    }))
+    let id = ''
+    act(() => { id = result.current.enqueue('conv-1', '用户优先', [])!.id })
+    expect(onPendingChange).toHaveBeenLastCalledWith('conv-1', true)
+
+    await act(async () => { await result.current.followUp(conversation, id) })
+    expect(onPendingChange).toHaveBeenLastCalledWith('conv-1', false)
+  })
+
   it('入队后 drain 只发队首一条', async () => {
     const { result, onSendMessage } = setup()
     act(() => {
@@ -340,6 +355,22 @@ describe('useMessageQueue', () => {
       expect.objectContaining({ content: '可撤' }),
     )
     expect(result.current.queued['conv-1'].map((item) => item.content)).toEqual(['已引导'])
+  })
+
+  it('clear_queue 退回的原文出队并写回输入框，已提交的也撤', async () => {
+    const { result, onRestoreToComposer } = setup()
+    let id = ''
+    act(() => { id = result.current.enqueue('conv-1', 'Change direction', [])!.id })
+    await act(async () => { await result.current.steer('conv-1', id) })
+    act(() => { result.current.enqueue('conv-1', '留下', []) })
+
+    act(() => {
+      result.current.restoreClearedQueue('conv-1', ['Change direction', 'Summarize'])
+    })
+    expect(onRestoreToComposer).toHaveBeenCalledWith(
+      expect.objectContaining({ content: 'Change direction\n\nSummarize' }),
+    )
+    expect(result.current.queued['conv-1'].map((item) => item.content)).toEqual(['留下'])
   })
 
   it('队列按会话隔离', async () => {

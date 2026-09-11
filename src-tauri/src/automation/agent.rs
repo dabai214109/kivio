@@ -243,7 +243,7 @@ async fn run_builtin_agent_node(
     let (provider_id, model) = resolve_kivio_model(&settings, spec)?;
     let provider = settings
         .get_provider(&provider_id)
-        .filter(|p| p.enabled && !p.api_keys.is_empty())
+        .filter(|p| p.enabled && p.has_credentials())
         .cloned()
         .ok_or_else(|| {
             "Configure a chat provider and model in Settings before running an Agent step"
@@ -577,7 +577,7 @@ async fn run_external_agent_node(
         .map_err(crate::chat::repository::repository_error)?;
 
     let state = app.state::<AppState>();
-    crate::external_agents::run_external_cli_reply(
+    crate::external_agents::run_external_cli_reply_in(
         app,
         &state,
         &mut conversation,
@@ -587,6 +587,7 @@ async fn run_external_agent_node(
         &[],
         spec.skill_ids.first().map(|id| id.as_str()),
         AgentRunEntry::Send,
+        workdir.as_deref(),
     )
     .await?;
 
@@ -659,6 +660,7 @@ async fn load_or_create_external_conversation(
         context_state: ConversationContextState::default(),
         agent_todo_state: AgentTodoState::default(),
         agent_plan_state: AgentPlanState::default(),
+        goal_state: None,
         knowledge_base_ids: Vec::new(),
         force_knowledge_search: false,
         additional_directories: Vec::new(),

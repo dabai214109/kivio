@@ -563,7 +563,7 @@ pub async fn list_acp_sessions(
     let def = get_agent_def(agent_id)?;
     let resolved = resolve_binary(def).await?;
 
-    // ACP 的启动参数是常量（`acp` / `--experimental-acp`），与会话上下文无关，给个空壳即可。
+    // ACP 的启动参数是常量（`acp` / `--acp`），与会话上下文无关，给个空壳即可。
     let ctx = RuntimeContext {
         extra_allowed_dirs: vec![],
         resume_session_id: None,
@@ -1009,6 +1009,7 @@ pub async fn import_one_session(
         context_state: ConversationContextState::default(),
         agent_todo_state: Default::default(),
         agent_plan_state: AgentPlanState::default(),
+        goal_state: None,
         knowledge_base_ids: Vec::new(),
         force_knowledge_search: false,
         additional_directories: Vec::new(),

@@ -3,6 +3,8 @@ import { createPortal } from 'react-dom'
 import { Check, ChevronDown, ExternalLink, X } from 'lucide-react'
 import { formatHotkey, getPlatform, type SelectOption } from './utils'
 import { Button } from '../components/Button'
+import { copyToClipboard, readClipboardText } from '../utils/clipboard'
+import { TextEditContextMenu } from './TextEditContextMenu'
 
 const MENU_GAP = 6
 const MENU_MARGIN = 8
@@ -153,7 +155,7 @@ function SelectMenuPortal({
 /**
  * 下拉选择 — 自绘菜单，避免 macOS 原生 select 的系统高亮/勾选反馈和受控状态不同步。
  */
-export function Select({ value, onChange, options, className = '', disabled: disabledProp = false, title }: {
+export function Select({ value, onChange, options, className = '', disabled: disabledProp = false, title, ariaLabel }: {
   value: string
   onChange: (v: string) => void
   options: SelectOption[]
@@ -161,6 +163,8 @@ export function Select({ value, onChange, options, className = '', disabled: dis
   disabled?: boolean
   /** 覆盖触发按钮的原生 tooltip（默认显示当前选中项）。 */
   title?: string
+  /** 无可关联原生 label 时，为触发按钮提供可访问名称。 */
+  ariaLabel?: string
 }) {
   const [open, setOpen] = useState(false)
   const triggerRef = useRef<HTMLButtonElement | null>(null)
@@ -188,6 +192,7 @@ export function Select({ value, onChange, options, className = '', disabled: dis
         className="kv-select kv-select-button relative h-[30px] w-full min-w-0 max-w-none text-left disabled:cursor-not-allowed disabled:opacity-50"
         aria-haspopup="listbox"
         aria-expanded={open}
+        aria-label={ariaLabel}
         title={title ?? displayTitle}
         data-tauri-drag-region="false"
       >
@@ -322,22 +327,90 @@ export function Input({ value, onChange, type = 'text', placeholder = '', classN
 /**
  * 多行文本输入 — 默认 sans
  */
-export function TextArea({ value, onChange, placeholder = '', rows = 2, mono = false }: {
+export function TextArea({
+  value,
+  onChange,
+  placeholder = '',
+  rows = 2,
+  mono = false,
+}: {
   value: string
   onChange: (v: string) => void
   placeholder?: string
   rows?: number
   mono?: boolean
 }) {
+  const ref = useRef<HTMLTextAreaElement>(null)
+  const caretRef = useRef<{ start: number; end: number } | null>(null)
+  const [menu, setMenu] = useState<{ left: number; top: number; start: number; end: number } | null>(null)
+
+  useLayoutEffect(() => {
+    const el = ref.current
+    const caret = caretRef.current
+    if (!el || !caret) return
+    caretRef.current = null
+    el.focus()
+    el.setSelectionRange(caret.start, caret.end)
+  }, [value])
+
+  const applyEdit = (next: string, start: number, end: number) => {
+    caretRef.current = { start, end }
+    onChange(next)
+  }
+
   return (
-    <textarea
-      value={value}
-      onChange={(e) => onChange(e.target.value)}
-      placeholder={placeholder}
-      rows={rows}
-      className={`kv-textarea w-full ${mono ? 'mono' : ''}`}
-      data-tauri-drag-region="false"
-    />
+    <>
+      <textarea
+        ref={ref}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={placeholder}
+        rows={rows}
+        className={`kv-textarea custom-scrollbar w-full ${mono ? 'mono' : ''}`}
+        data-tauri-drag-region="false"
+        onContextMenu={(event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          const el = event.currentTarget
+          setMenu({
+            left: event.clientX,
+            top: event.clientY,
+            start: el.selectionStart,
+            end: el.selectionEnd,
+          })
+        }}
+      />
+      {menu && (
+        <TextEditContextMenu
+          anchor={{ left: menu.left, top: menu.top }}
+          hasSelection={menu.end > menu.start}
+          onCut={() => {
+            const { start, end } = menu
+            const selected = value.slice(start, end)
+            if (!selected) return
+            void copyToClipboard(selected)
+            applyEdit(`${value.slice(0, start)}${value.slice(end)}`, start, start)
+          }}
+          onCopy={() => {
+            const selected = value.slice(menu.start, menu.end)
+            if (selected) void copyToClipboard(selected)
+          }}
+          onPaste={() => {
+            const { start, end } = menu
+            void readClipboardText().then((text) => {
+              applyEdit(`${value.slice(0, start)}${text}${value.slice(end)}`, start + text.length, start + text.length)
+            })
+          }}
+          onSelectAll={() => {
+            const el = ref.current
+            if (!el) return
+            el.focus()
+            el.setSelectionRange(0, value.length)
+          }}
+          onClose={() => setMenu(null)}
+        />
+      )}
+    </>
   )
 }
 
@@ -603,4 +676,3 @@ export function HotkeyInput({
     </div>
   )
 }
-

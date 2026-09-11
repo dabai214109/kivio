@@ -87,7 +87,7 @@ pub enum NativeToolCall {
     /// resolution because it only needs the conversation id, matching the
     /// legacy `RegistryToolExecutor` special case which never resolved a
     /// workspace for todo tools.
-    Conversation(for<'a> fn(&'a AppHandle, &'a str, &'a str, Value) -> NativeToolFuture<'a>),
+    Conversation(for<'a> fn(&'a AppHandle, &'a NativeToolContext, &'a str, Value) -> NativeToolFuture<'a>),
     /// Host-mediated tool (ask_user): intercepted in
     /// `chat/agent/execute.rs::execute_ask_user_call` and must never reach
     /// the registry dispatcher.
@@ -362,6 +362,26 @@ pub static NATIVE_TOOLS: &[NativeToolEntry] = &[
         call: NativeToolCall::SyncResult(call_present_artifacts),
     },
     NativeToolEntry {
+        name: "kivio_inspect",
+        def: crate::self_config::inspect_definition,
+        enabled: |native, _, _| native.read_file,
+        parallel_safe: false,
+        bypasses_approval: false,
+        read_only: true,
+        requires_session_consent: true,
+        call: NativeToolCall::Async(crate::self_config::inspect),
+    },
+    NativeToolEntry {
+        name: "kivio_configure",
+        def: crate::self_config::configure_definition,
+        enabled: |native, _, _| native.run_command,
+        parallel_safe: false,
+        bypasses_approval: false,
+        read_only: false,
+        requires_session_consent: true,
+        call: NativeToolCall::Async(crate::self_config::configure),
+    },
+    NativeToolEntry {
         name: "memory_read",
         def: native_memory_read_tool,
         enabled: |_, _, memory_enabled| memory_enabled,
@@ -403,6 +423,12 @@ pub static NATIVE_TOOLS: &[NativeToolEntry] = &[
         requires_session_consent: false,
         call: NativeToolCall::Conversation(crate::chat::todo::handle_conversation_tool_call),
     },
+    NativeToolEntry { name: crate::chat::goal::GET_GOAL_TOOL, def: || crate::chat::goal::tool_definitions().remove(0), enabled: |_,_,_| false, parallel_safe: false, bypasses_approval: true, read_only: true, requires_session_consent: false, call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call) },
+    NativeToolEntry { name: crate::chat::goal::INIT_GOAL_CRITERIA_TOOL, def: || crate::chat::goal::tool_definitions().remove(1), enabled: |_,_,_| false, parallel_safe: false, bypasses_approval: true, read_only: false, requires_session_consent: false, call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call) },
+    NativeToolEntry { name: crate::chat::goal::REPORT_GOAL_PROGRESS_TOOL, def: || crate::chat::goal::tool_definitions().remove(2), enabled: |_,_,_| false, parallel_safe: false, bypasses_approval: true, read_only: false, requires_session_consent: false, call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call) },
+    NativeToolEntry { name: crate::chat::goal::COMPLETE_GOAL_TOOL, def: || crate::chat::goal::tool_definitions().remove(3), enabled: |_,_,_| false, parallel_safe: false, bypasses_approval: true, read_only: false, requires_session_consent: false, call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call) },
+    NativeToolEntry { name: crate::chat::goal::BLOCK_GOAL_TOOL, def: || crate::chat::goal::tool_definitions().remove(4), enabled: |_,_,_| false, parallel_safe: false, bypasses_approval: true, read_only: false, requires_session_consent: false, call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call) },
+    NativeToolEntry { name: crate::chat::goal::WAIT_GOAL_TOOL, def: || crate::chat::goal::tool_definitions().remove(5), enabled: |_,_,_| false, parallel_safe: false, bypasses_approval: true, read_only: false, requires_session_consent: false, call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call) },
     NativeToolEntry {
         name: crate::chat::ask_user::ASK_USER_TOOL_NAME,
         def: crate::chat::ask_user::ask_user_tool,
@@ -851,7 +877,7 @@ fn call_advisor(ctx: NativeCallCtx<'_>) -> NativeToolFuture<'_> {
         let Some(provider) = ctx.settings.get_provider(&provider_id).cloned() else {
             return Err("Advisor provider is missing or disabled.".to_string());
         };
-        if provider.api_keys.is_empty() {
+        if !provider.has_credentials() {
             return Err("Advisor provider has no API key configured.".to_string());
         }
 
@@ -1228,10 +1254,18 @@ mod tests {
         "kill_background",
         "save_assistant",
         "present_artifacts",
+        "kivio_inspect",
+        "kivio_configure",
         "memory_read",
         "memory_modify",
         "memory_search",
         "todo_write",
+        "get_goal",
+        "initialize_goal_criteria",
+        "report_goal_progress",
+        "goal_complete",
+        "goal_blocked",
+        "goal_wait",
         "ask_user",
         "agent",
     ];
@@ -1254,12 +1288,14 @@ mod tests {
                 "edit",
                 "bash",
                 "bash_output",
-                "kill_background"
+                "kill_background",
+                "kivio_inspect",
+                "kivio_configure"
             ],
             "session-consent set must be exactly the file/shell tools (read now also \
              lists directories; `ls` is the standalone kivio-code list_dir tool; find \
              is renamed glob) plus the background-command observability tools (gated \
-             identically to bash); a new file/shell tool MUST set \
+             identically to bash) and Kivio configuration tools; a new file/shell tool MUST set \
              requires_session_consent or it silently bypasses the consent gate"
         );
         // The predicate agrees with the flag, and non-file tools are excluded.
@@ -1333,6 +1369,12 @@ mod tests {
                 "memory_modify",
                 "memory_search",
                 "todo_write",
+                "get_goal",
+                "initialize_goal_criteria",
+                "report_goal_progress",
+                "goal_complete",
+                "goal_blocked",
+                "goal_wait",
                 "ask_user",
                 "agent",
             ]
@@ -1362,8 +1404,10 @@ mod tests {
                 "glob",
                 "bash_output",
                 "present_artifacts",
+                "kivio_inspect",
                 "memory_read",
                 "memory_search",
+                "get_goal",
             ],
             "memory_read/memory_search are read-only but deliberately not parallel-safe"
         );
@@ -1449,7 +1493,7 @@ mod tests {
         read_only.read_file = true;
         assert_eq!(
             names(&read_only, false, false),
-            ["read", "grep", "glob", "present_artifacts"]
+            ["read", "grep", "glob", "present_artifacts", "kivio_inspect"]
         );
 
         // The write gate exposes the whole-file write tool only. File cards are
@@ -1524,6 +1568,8 @@ mod tests {
                 "bash_output",
                 "kill_background",
                 "present_artifacts",
+                "kivio_inspect",
+                "kivio_configure",
                 "memory_read",
                 "memory_modify",
                 "memory_search",

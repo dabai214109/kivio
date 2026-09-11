@@ -1577,7 +1577,23 @@ pub(crate) async fn maybe_compact_send_view(env: &LoopEnv<'_>, state: &mut RunSt
                     None,
                 );
             }
-            compacted
+            match crate::chat::workflow_hooks::compact_context(
+                env.host,
+                &config.conversation_id,
+                config.generation,
+            )
+            .await
+            {
+                Ok(context) => crate::chat::workflow_hooks::inject_context(
+                    &mut state.runtime_messages,
+                    &context,
+                ),
+                Err(error) => crate::chat::workflow_hooks::inject_context(
+                    &mut state.runtime_messages,
+                    &[format!("SessionStart compact hook failed: {error}")],
+                ),
+            }
+            state.runtime_messages.clone()
         }
         CompactOutcome::Cancelled => {
             // 用户主动取消进行中的 run：不计入 anti-thrashing（取消 ≠ 压缩无能为力），
@@ -1744,7 +1760,7 @@ async fn compact_conversation_inner(
         .get_provider(&provider_id)
         .ok_or_else(|| "Compression provider not found".to_string())?
         .clone();
-    if provider.api_keys.is_empty() {
+    if !provider.has_credentials() {
         return Err(format_chat_missing_api_key_error(&provider.name));
     }
     if model.trim().is_empty() {
@@ -1929,6 +1945,7 @@ mod tests {
             context_state: Default::default(),
             agent_todo_state: Default::default(),
             agent_plan_state: Default::default(),
+            goal_state: None,
             knowledge_base_ids: Vec::new(),
             force_knowledge_search: false,
             additional_directories: Vec::new(),

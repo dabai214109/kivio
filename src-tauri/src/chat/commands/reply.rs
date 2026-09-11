@@ -40,9 +40,9 @@ use super::messages::{
 use super::reply_runtime::{ArmReplyOutcome, ChatReplyGuard, ReplyArm};
 use super::resolve_thinking;
 use super::tooling::{
-    append_agent_ask_user_tools, append_agent_todo_tools, apply_agent_plan_tool_filter,
+    append_agent_ask_user_tools, append_agent_todo_tools, append_goal_tools, apply_agent_plan_tool_filter,
     apply_chat_mode_tool_filter, apply_inline_code_request_tool_filter,
-    apply_web_search_mode_tool_filter, list_tools_for_chat, resolve_forced_skill_id,
+    apply_web_search_mode_tool_filter, list_tools_for_chat, resolve_request_skill,
 };
 
 pub(super) async fn complete_assistant_reply(
@@ -55,7 +55,7 @@ pub(super) async fn complete_assistant_reply(
     active_skill_id: Option<&str>,
     entry: crate::chat::agent::AgentRunEntry,
 ) -> Result<(), String> {
-    complete_assistant_reply_inner(
+    let mut outcome = complete_assistant_reply_inner(
         app,
         state,
         conversation,
@@ -67,8 +67,40 @@ pub(super) async fn complete_assistant_reply(
         None,
         false,
     )
-    .await
-    .map(|_| ())
+    .await;
+    while outcome.is_ok() {
+        if !conversation.goal_state.as_ref().is_some_and(|goal| crate::chat::goal::is_running(goal.status)) { break; }
+        if state.has_goal_user_queue_pending(&conversation.id) { break; }
+        let continuation_skill = conversation.active_skill_id.clone();
+        let next = complete_assistant_reply_inner(
+            app,
+            state,
+            conversation,
+            None,
+            None,
+            &[],
+            continuation_skill.as_deref(),
+            crate::chat::agent::AgentRunEntry::Send,
+            None,
+            false,
+        ).await;
+        outcome = next;
+    }
+    if let Err(error) = &outcome {
+        if let Some(goal) = conversation.goal_state.as_ref().filter(|goal| crate::chat::goal::is_running(goal.status)).cloned() {
+            if let Ok(updated) = crate::chat::goal::pause_after_error(app, &conversation.id, &goal.id, goal.version, error).await {
+                *conversation = updated;
+            }
+        }
+    }
+    if outcome.is_ok() && !conversation.goal_state.as_ref().is_some_and(|goal| crate::chat::goal::is_running(goal.status)) {
+        crate::chat::completion_notification::notify_reply_completed(
+            app,
+            state.inner(),
+            conversation,
+        );
+    }
+    outcome.map(|_| ())
 }
 
 /// 共享实现：`arm = None` 为单模型现状（直接落盘，返回 `Ok(())` 语义不变）；
@@ -155,7 +187,7 @@ pub(super) async fn complete_assistant_reply_inner(
         .get_provider(&resolved_provider_id)
         .ok_or_else(|| "Chat provider not found".to_string())?
         .clone();
-    if provider.api_keys.is_empty() {
+    if !provider.has_credentials() {
         return Err(format_chat_missing_api_key_error(&provider.name));
     }
     if resolved_model.trim().is_empty() {
@@ -183,9 +215,23 @@ pub(super) async fn complete_assistant_reply_inner(
         !chat_mode && crate::chat::plan::is_orchestrate_mode(&conversation.agent_plan_state);
     let direct_image_model =
         !plan_mode && model_can_generate_images_directly(&provider, &resolved_model);
+    if direct_image_model
+        && conversation.goal_state.as_ref().is_some_and(|goal| crate::chat::goal::is_running(goal.status))
+    {
+        return Err("Goal mode requires a tool-capable text model; direct image models are not supported".into());
+    }
     let run_generation = state.next_chat_generation(&conversation.id);
     let run_id = format!("chat-run-{}-{}", run_generation, Uuid::new_v4());
     let assistant_message_id = format!("msg_{}", Uuid::new_v4());
+    if let Some(goal) = conversation.goal_state.as_ref().filter(|goal| crate::chat::goal::is_running(goal.status)).cloned() {
+        *conversation = crate::chat::goal::claim_run(
+            app,
+            &conversation.id,
+            &goal.id,
+            goal.version,
+            &run_id,
+        ).await?;
+    }
     let recovery = arm.map(|arm| crate::chat::protocol::ChatRunRecoveryMetadata {
         group_id: arm.group_id.clone(),
         group_size: arm.group_size as u32,
@@ -368,27 +414,31 @@ pub(super) async fn complete_assistant_reply_inner(
         skill_cwd.as_deref(),
     )
     .unwrap_or_default();
-    let requested_skill_id = active_skill_id.or(conversation.active_skill_id.as_deref());
-    let skill_id = resolve_forced_skill_id(
-        &settings.chat_tools,
-        conversation.assistant_snapshot.as_ref(),
+    let mut effective_chat_tools = settings.chat_tools.clone();
+    // Read the stored text, before attachment/vision augmentation, so those
+    // documents never become slash arguments. This also covers edited retries.
+    let user_content = conversation
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| message.content.as_str())
+        .unwrap_or_default();
+    let (skill_id, active_skill_detail) = resolve_request_skill(
         &skill_registry,
-        requested_skill_id,
+        &mut effective_chat_tools,
+        conversation.assistant_snapshot.as_ref(),
+        if conversation.agent_runtime.is_chat() {
+            ""
+        } else {
+            user_content
+        },
+        active_skill_id.or(conversation.active_skill_id.as_deref()),
         crate::settings::obsidian_connector_configured(&settings.obsidian_vault_path),
     );
     if skill_id.is_none() && conversation.active_skill_id.is_some() {
         conversation.active_skill_id = None;
     }
-    let active_skill_detail = skill_id.as_deref().and_then(|id| {
-        skills::read_skill_detail_in(
-            app,
-            &settings.chat_tools.skill_scan_paths,
-            id,
-            skill_cwd.as_deref(),
-        )
-        .ok()
-    });
-    let mut effective_chat_tools = settings.chat_tools.clone();
     if arm.is_some() || probe {
         // 多答 fan-out（决策 D1 注）：N 条并行 run 若各自弹工具审批会产生 N 倍弹窗、
         // 且无法对应到具体列。多模型臂内一律自动批准（静默执行）。单模型保持原审批策略。
@@ -436,7 +486,8 @@ pub(super) async fn complete_assistant_reply_inner(
     // 内置搜索走 `config.web_search_mode` → 各适配器请求体注入，不在工具列表里。
     // builder 会话已清空工具（只留 save_assistant），不参与搜索门控。
     let web_search_mode =
-        crate::chat::types::WebSearchMode::resolve(conversation.web_search_mode, &settings);
+        crate::chat::types::WebSearchMode::resolve(conversation.web_search_mode, &settings)
+            .for_provider(&provider);
     if !builder_mode {
         apply_web_search_mode_tool_filter(&mut tools, web_search_mode, &settings);
     }
@@ -451,6 +502,11 @@ pub(super) async fn complete_assistant_reply_inner(
         false
     } else {
         append_agent_todo_tools(&mut tools)
+    };
+    let goal_tools_available = if !chat_mode && !plan_mode && !orchestrate_mode && arm.is_none() {
+        append_goal_tools(&mut tools, conversation.goal_state.as_ref())
+    } else {
+        false
     };
     // Resolved here (rather than further down with the other prompt context) so
     // the sub-agent role registry below can reuse the project root instead of
@@ -545,6 +601,10 @@ pub(super) async fn complete_assistant_reply_inner(
             Some(note) => format!("{system_prompt}\n\n{note}"),
             None => system_prompt,
         };
+    let system_prompt = match crate::chat::goal::format_prompt(conversation.goal_state.as_ref()) {
+        Some(goal_prompt) if goal_tools_available => format!("{system_prompt}\n\n{goal_prompt}"),
+        _ => system_prompt,
+    };
 
     let runtime_messages = match build_chat_api_messages(
         Some(app),
@@ -605,6 +665,20 @@ pub(super) async fn complete_assistant_reply_inner(
     );
 
     let chat_host = ChatAgentHost {
+        workflow_hooks: if chat_mode {
+            Default::default()
+        } else {
+            crate::plugins::packages::hook_runtime(
+                workbench_dir
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(std::env::temp_dir),
+                "main".into(),
+                last_user_idx
+                    .and_then(|index| conversation.messages.get(index))
+                    .map(|m| m.content.clone()),
+            )
+        },
         app: app.clone(),
         state: state.inner(),
         run_id: run_id.clone(),
@@ -843,6 +917,10 @@ pub(super) async fn complete_assistant_reply_inner(
     }
     let terminal_content = result.content.clone();
     let terminal_outcome = result.stream_outcome.clone();
+    let goal_assistant_message_id = assistant_message_id.clone();
+    let goal_run = conversation.goal_state.as_ref().filter(|g| crate::chat::goal::is_running(g.status))
+        .map(|g| (g.id.clone(), g.version));
+    let goal_usage = result.usage.clone();
     let run_plan_update = message_plan.clone();
     push_assistant_message(
         app,
@@ -866,6 +944,19 @@ pub(super) async fn complete_assistant_reply_inner(
         result.degraded,
     )
     .await?;
+    if let Some((goal_id, goal_version)) = goal_run {
+        *conversation = crate::chat::goal::record_run(
+            app,
+            &conversation.id,
+            &goal_id,
+            goal_version,
+            &run_id,
+            &goal_assistant_message_id,
+            &terminal_content,
+            goal_usage.as_ref(),
+            last_user_api_content.is_none(),
+        ).await?;
+    }
     if let Some(plan_state) = run_plan_update {
         crate::chat::protocol::emit_run_event(
             app,

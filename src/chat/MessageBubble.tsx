@@ -15,7 +15,7 @@ import { copyToClipboard } from '../utils/clipboard'
 import { AssistantMessageMeta } from './AssistantMessageMeta'
 import { ChatAttachments } from './ChatAttachments'
 import { ChatDotGridBackground } from './ChatDotGridBackground'
-import { ChatMarkdown } from './ChatMarkdown'
+import { ChatMarkdown, type ChatMarkdownOutlineSource, type MarkdownOutlineSourceUpdate } from './ChatMarkdown'
 import { DegradedAnswerCard } from './DegradedAnswerCard'
 import { GeneratedFileArtifacts } from './GeneratedFileArtifacts'
 import { MarkdownStreamingContext } from './markdownStreaming'
@@ -26,6 +26,7 @@ import { loadArtifactDataUrl } from './attachmentPreview'
 import { openChatImageViewer } from './imageViewer'
 import { ChatInlineImage, CHAT_IMAGE_TILE_MAX_PX } from './ChatInlineImage'
 import { ReasoningBlock } from './ReasoningBlock'
+import { ChatDisclosureBody } from './ChatDisclosureBody'
 import { ModelIcon } from './ModelIcon'
 import { ToolCallBlock, ImageReadCluster } from './ToolCallBlock'
 import { ToolCallErrorBoundary } from './ToolCallErrorBoundary'
@@ -66,6 +67,14 @@ interface MessageBubbleProps {
   reasoningStreaming?: boolean
   /** 这条消息整体是否在流式生成中（仅 streaming-assistant bubble 为 true） */
   messageStreaming?: boolean
+  /**
+   * MarkdownStreamingContext 的值（默认跟 messageStreaming）。它不再决定 Streamdown 的
+   * 模式 / key（整条消息终身 streaming 模式，见 ChatMarkdown），只管「出字中」的内容策略：
+   * mermaid 显示源码还是出图、重内容岛是否 eager、高亮缓存只读。live 行在 settle 冻结帧会把
+   * messageStreaming 置 false（停 shimmer / 入场动画）但把这个值留为 true，让上述变化只在
+   * 落库 twin 首挂时发生一次。
+   */
+  markdownStreaming?: boolean
   /** R8（多模型一问多答）：本条 user 消息这一问发给了哪些模型；多模型时渲染在气泡顶部。 */
   sentModels?: { providerId: string | null; model: string | null }[]
   onUpdateMessage?: (messageId: string, content: string) => Promise<void>
@@ -79,6 +88,9 @@ interface MessageBubbleProps {
   onSaveMessageToNote?: (messageId: string) => Promise<boolean>
   agentPlanOverride?: AgentPlanState | null
   onExecuteAgentPlan?: (messageId: string) => Promise<void> | void
+  /** 仅已落库助手消息注册标题来源；live 行必须保持目录静默到 twin 提交。 */
+  outlineEligible?: boolean
+  onOutlineSourceChange?: (update: MarkdownOutlineSourceUpdate) => void
 }
 
 function markdownImageSources(content: string): Set<string> {
@@ -498,12 +510,14 @@ function TimelineTextSegment({
   citations,
   conversationId,
   process = false,
+  outlineSource,
 }: {
   segment: ChatMessageSegment
   artifacts: ChatToolArtifact[]
   citations?: Map<number, CitationView>
   conversationId?: string | null
   process?: boolean
+  outlineSource?: ChatMarkdownOutlineSource
 }) {
   const text = segmentText(segment).trim()
   if (!text) return null
@@ -516,6 +530,7 @@ function TimelineTextSegment({
         conversationId={conversationId}
         citations={citations}
         onImageClick={handleChatImageClick}
+        outlineSource={outlineSource}
       />
     </div>
   )
@@ -622,7 +637,6 @@ function renderProcessSegments({
   artifacts,
   citations,
   conversationId,
-  messageStreaming,
   reasoningStreaming,
   reasoningDurationMs,
   reasoningDurationMsBySegmentId,
@@ -633,7 +647,6 @@ function renderProcessSegments({
   artifacts: ChatToolArtifact[]
   citations?: Map<number, CitationView>
   conversationId?: string | null
-  messageStreaming: boolean
   reasoningStreaming: boolean
   reasoningDurationMs?: number | null
   reasoningDurationMsBySegmentId?: Record<string, number>
@@ -657,7 +670,7 @@ function renderProcessSegments({
           end += 1
         }
         nodes.push(
-          <div key={segment.id} className={messageStreaming ? 'chat-motion-fade' : undefined}>
+          <div key={segment.id}>
             <ToolCallErrorBoundary>
               <ImageReadCluster toolCalls={imageReads} />
             </ToolCallErrorBoundary>
@@ -668,7 +681,7 @@ function renderProcessSegments({
       }
     }
     nodes.push(
-      <div key={segment.id} className={messageStreaming ? 'chat-motion-fade' : undefined}>
+      <div key={segment.id}>
         <TimelineSegmentNode
           segment={segment}
           index={index}
@@ -693,7 +706,7 @@ function renderProcessSegments({
  * 一轮过程 = 一个 Codex 式 Working 壳。
  * - 「生成中」= 这条消息还在流式、且这是末组：始终展开，避免抖动。
  * - 后面出现终稿/standalone（非末组）或流式结束 → 收成一行 Worked for Xs。
- * - 用户手动点过开关后以用户操作为准（userToggledRef）。
+ * - 用户手动点过开关后以用户操作为准。
  * - 折叠态只留 header，不挂组内 ReasoningBlock / ToolCallBlock / 过程旁白。
  */
 function TimelineGroupBlock({
@@ -733,31 +746,16 @@ function TimelineGroupBlock({
     [segments, toolCalls, toolCallById, reasoningDurationMs],
   )
   const title = workingGroupTitle(generating, durationMs)
-  const [open, setOpen] = useState(generating)
-  const userToggledRef = useRef(false)
-
-  // 自动折叠不能等 effect：生成结束后的第一次 render 仍可能带着旧的 open=true，
-  // 先把整棵 ToolCallBlock/Markdown 子树创建出来，effect 下一拍才卸载。用当前生成态
-  // 直接参与渲染，保证结束这一帧就不创建详情树；用户手动操作后再由 open 接管。
-  const renderDetails = userToggledRef.current ? open : generating
-
-  // 生成中默认展开、完成自动折叠；用户手动操作后不再覆盖。
-  useEffect(() => {
-    if (userToggledRef.current) return
-    setOpen(generating)
-  }, [generating])
-
-  const handleToggle = () => {
-    userToggledRef.current = true
-    setOpen((value) => !value)
-  }
+  const [userOpen, setUserOpen] = useState<boolean | null>(null)
+  const renderDetails = userOpen ?? generating
 
   return (
     <section aria-label="过程分组" className="not-prose">
       <button
         type="button"
-        onClick={handleToggle}
+        onClick={() => setUserOpen(current => !(current ?? generating))}
         aria-expanded={renderDetails}
+        data-chat-disclosure
         data-tauri-drag-region="false"
         className="mb-1 flex w-full items-center gap-1.5 text-left text-[12px] leading-relaxed font-medium text-neutral-400 transition-colors hover:text-neutral-600 dark:text-neutral-500 dark:hover:text-neutral-300"
       >
@@ -788,27 +786,25 @@ function TimelineGroupBlock({
           )}
         </div>
       </button>
-      {renderDetails && (
-        <div className="chat-motion-reveal is-open" aria-hidden={false}>
+      <ChatDisclosureBody open={renderDetails} animate={userOpen !== null}>
+        {() => (
           <div className="space-y-1.5">
-            {/* 段级淡入只在流式中播：历史消息被虚拟列表反复卸载/重挂载，无条件的
-                `both` fill 动画会让回翻时每个重进 DOM 的段落整批重播淡入——外层气泡
-                入场早已为此 gate（playEntranceAnimation），内层段落同理。 */}
+            {/* A new tool can move existing commentary into this group. Keep
+                those segments visible instead of replaying opacity from zero. */}
             {renderProcessSegments({
               segments,
               toolCallById,
               artifacts,
               citations,
               conversationId,
-              messageStreaming,
               reasoningStreaming: reasoningStreaming && isLastGroup,
               reasoningDurationMs,
               reasoningDurationMsBySegmentId,
               reasoningSegmentCount,
             })}
           </div>
-        </div>
-      )}
+        )}
+      </ChatDisclosureBody>
     </section>
   )
 }
@@ -822,6 +818,9 @@ function TimelineSegments({
   reasoningStreaming,
   reasoningDurationMs,
   reasoningDurationMsBySegmentId,
+  outlineEligible = false,
+  ownerMessageId,
+  onOutlineSourceChange,
 }: {
   segments: ChatMessageSegment[]
   toolCalls: ToolCallRecord[]
@@ -831,6 +830,9 @@ function TimelineSegments({
   reasoningStreaming: boolean
   reasoningDurationMs?: number | null
   reasoningDurationMsBySegmentId?: Record<string, number>
+  outlineEligible?: boolean
+  ownerMessageId: string
+  onOutlineSourceChange?: (update: MarkdownOutlineSourceUpdate) => void
 }) {
   const prepared = useMemo(() => {
     const ordered = orderedSegments(segments)
@@ -880,14 +882,24 @@ function TimelineSegments({
       {groupItems.map((item: TimelineGroupItem, index) => {
         if (item.type === 'text') {
           if (!segmentText(item.segment).trim()) return null
-          // 每个时间线分段单独淡入：流式中新分段顺次出现而非"啪"地弹出。
+          // Segments can be regrouped as tools arrive; entrance fades would
+          // briefly hide text the user has already read.
           return (
-            <div key={item.segment.id} className={messageStreaming ? 'chat-motion-fade' : undefined}>
+            <div key={item.segment.id}>
               <TimelineTextSegment
                 segment={item.segment}
                 artifacts={artifacts}
                 citations={citations}
                 conversationId={conversationId}
+                outlineSource={
+                  outlineEligible && onOutlineSourceChange
+                    ? {
+                      ownerMessageId,
+                      sourceId: item.segment.id,
+                      onChange: onOutlineSourceChange,
+                    }
+                    : undefined
+                }
               />
             </div>
           )
@@ -898,7 +910,7 @@ function TimelineSegments({
           const toolCall = toolCallById.get(id)
           if (!toolCall) return null
           return (
-            <div key={item.segment.id} className={messageStreaming ? 'chat-motion-fade' : undefined}>
+            <div key={item.segment.id}>
               {isUserInjectedToolCall(toolCall) ? (
                 <UserSteerSegment toolCall={toolCall} />
               ) : isArtifactPresentationToolCall(toolCall) ? (
@@ -917,7 +929,7 @@ function TimelineSegments({
         }
         const groupKey = item.segments[0]?.id ?? `group-${index}`
         return (
-          <div key={groupKey} className={messageStreaming ? 'chat-motion-fade' : undefined}>
+          <div key={groupKey}>
             <TimelineGroupBlock
               segments={item.segments}
               toolCalls={toolCalls}
@@ -939,7 +951,6 @@ function TimelineSegments({
         toolCalls={orphanTools}
         artifacts={artifacts}
         conversationId={conversationId}
-        itemClassName={messageStreaming ? 'chat-motion-fade' : undefined}
       />
     </section>
   )
@@ -953,6 +964,7 @@ function MessageBubbleComponent({
   reasoningDurationMsBySegmentId,
   reasoningStreaming = false,
   messageStreaming = false,
+  markdownStreaming = messageStreaming,
   sentModels,
   onUpdateMessage,
   onRegenerateMessage,
@@ -964,6 +976,8 @@ function MessageBubbleComponent({
   onSaveMessageToNote,
   agentPlanOverride = null,
   onExecuteAgentPlan,
+  outlineEligible = false,
+  onOutlineSourceChange,
 }: MessageBubbleProps) {
   const isUser = message.role === 'user'
   // 历史消息会被虚拟列表反复卸载/挂载；只让真正的流式预览播放进入动画，
@@ -1048,6 +1062,14 @@ function MessageBubbleComponent({
     hasGeneratedImages,
     hasGeneratedFiles,
   } = prepared
+  const outlineSource = useMemo<ChatMarkdownOutlineSource | undefined>(() => {
+    if (!outlineEligible || messageStreaming || !onOutlineSourceChange) return undefined
+    return {
+      ownerMessageId: message.id,
+      sourceId: message.id,
+      onChange: onOutlineSourceChange,
+    }
+  }, [message.id, messageStreaming, onOutlineSourceChange, outlineEligible])
   // 后端 recovery.rs 产出的降级描述；旧会话无此字段 → undefined → 不渲染卡片。
   // content 仍保留同一段文本（旧前端 / 外部 CLI 只读 content），但卡片已经完整表达了
   // 同样的信息 —— 这里不再把它当正文渲染，避免一模一样的内容出现两遍。
@@ -1190,10 +1212,11 @@ function MessageBubbleComponent({
   }
 
   return (
-    <MarkdownStreamingContext.Provider value={messageStreaming}>
+    <MarkdownStreamingContext.Provider value={markdownStreaming}>
     <div
       {...hoverProps}
       className={`flex justify-start py-3 ${playEntranceAnimation ? 'chat-motion-bubble-in' : ''}`}
+      data-chat-outline-owner={outlineEligible ? message.id : undefined}
     >
       <div className="w-full min-w-0">
         {toolCalls.length > 0 && !hasTimelineSegments && (
@@ -1207,6 +1230,7 @@ function MessageBubbleComponent({
                 onClick={() => setToolsExpanded((value) => !value)}
                 className="mb-1 flex w-full items-center gap-1 text-left text-[11px] font-medium text-neutral-400 transition-colors hover:text-neutral-600 dark:text-neutral-500 dark:hover:text-neutral-300"
                 aria-expanded={toolsExpanded}
+                data-chat-disclosure
                 data-tauri-drag-region="false"
               >
                 <span>
@@ -1218,14 +1242,14 @@ function MessageBubbleComponent({
                 工具调用
               </div>
             )}
-            {toolsCollapsible && toolsExpanded && (
-              <div className="chat-motion-reveal is-open">
+            {toolsCollapsible && (
+              <ChatDisclosureBody open={toolsExpanded}>
                 <ClusteredToolCalls
                   toolCalls={toolCalls}
                   artifacts={renderArtifacts}
                   conversationId={conversationId}
                 />
-              </div>
+              </ChatDisclosureBody>
             )}
             {!toolsCollapsible && (
               <ClusteredToolCalls
@@ -1237,9 +1261,9 @@ function MessageBubbleComponent({
           </section>
         )}
 
-        {message.reasoning && !hasTimelineSegments && (
+        {Boolean((message.reasoning ?? '').trim()) && !hasTimelineSegments && (
           <ReasoningBlock
-            reasoning={message.reasoning}
+            reasoning={message.reasoning ?? ''}
             streaming={reasoningStreaming}
             durationMs={reasoningDurationMs}
           />
@@ -1258,6 +1282,9 @@ function MessageBubbleComponent({
               reasoningStreaming={reasoningStreaming}
               reasoningDurationMs={reasoningDurationMs}
               reasoningDurationMsBySegmentId={reasoningDurationMsBySegmentId}
+              outlineEligible={outlineEligible}
+              ownerMessageId={message.id}
+              onOutlineSourceChange={onOutlineSourceChange}
             />
             {hasGeneratedImages && (
               <GeneratedImageArtifacts
@@ -1281,6 +1308,7 @@ function MessageBubbleComponent({
                   artifacts={renderArtifacts}
                   conversationId={conversationId}
                   onImageClick={handleChatImageClick}
+                  outlineSource={outlineSource}
                 />
               )}
               {hasGeneratedImages && (

@@ -23,6 +23,7 @@ import {
   Square,
   Terminal,
   TextQuote,
+  Target,
   WandSparkles,
   Wrench,
   X,
@@ -153,6 +154,7 @@ function nextBlankProjectName(projects: ChatProject[], t: I18n): string {
 
 type SlashCommandId =
   | 'help'
+  | 'goal'
   | 'plan'
   | 'orchestrate'
   | 'new'
@@ -178,6 +180,15 @@ const LOCAL_SLASH_COMMANDS: LocalSlashCommand[] = [
     category: 'Local',
     kind: 'action',
     keywords: ['help', 'commands', '帮助', '命令'],
+  },
+  {
+    id: 'goal',
+    slash: '/goal',
+    title: '/goal',
+    description: 'Start or manage a persistent Goal',
+    category: 'Local',
+    kind: 'action',
+    keywords: ['goal', 'objective', '目标', '持续执行'],
   },
   {
     id: 'plan',
@@ -265,6 +276,8 @@ function slashCommandIcon(command: SlashCommandDefinition) {
       return CircleHelp
     case 'plan':
       return ListChecks
+    case 'goal':
+      return Target
     case 'orchestrate':
       return Network
     case 'new':
@@ -387,6 +400,7 @@ export interface InputBarProps {
   sendDisabledReason?: string
   agentPlanState?: AgentPlanState | null
   agentTodoState?: AgentTodoState | null
+  goalSlot?: ReactNode
   onAgentPlanModeChange?: (mode: AgentPlanMode) => void | Promise<void>
   enabledSkills?: SlashSkill[]
   onOpenSkillSettings?: () => void
@@ -413,6 +427,8 @@ export interface InputBarProps {
   usesChatRuntime?: boolean
   externalAgentName?: string | null
   conversationId?: string | null
+  /** 当前会话的用户消息，按发送时间从旧到新排列。 */
+  inputHistory?: readonly string[]
   /** 本会话挂载的知识库 id；缺省时 knowledge_search 检索全部库 */
   knowledgeBaseIds?: string[]
   onChangeKnowledgeBaseIds?: (ids: string[]) => void | Promise<void>
@@ -474,6 +490,7 @@ export const InputBar = memo(function InputBar({
   sendDisabledReason,
   agentPlanState = null,
   agentTodoState = null,
+  goalSlot,
   onAgentPlanModeChange,
   enabledSkills = [],
   onOpenSkillSettings,
@@ -492,6 +509,7 @@ export const InputBar = memo(function InputBar({
   usesChatRuntime = false,
   externalAgentName = null,
   conversationId = null,
+  inputHistory = [],
   knowledgeBaseIds = [],
   onChangeKnowledgeBaseIds,
   forceKnowledgeSearch = false,
@@ -528,6 +546,13 @@ export const InputBar = memo(function InputBar({
   const composerLocked = (Boolean(disabled) || sendPending) && !queueMode
   const draftKeyValue = draftKey(conversationId)
   const [input, setInput] = useState(() => getComposerDraft(draftKeyValue)?.input ?? '')
+  const historyRef = useRef<{ entries: string[]; index: number; draft: string } | null>(null)
+  const historyCaretRef = useRef<number | null>(null)
+  useLayoutEffect(() => {
+    if (historyCaretRef.current === null) return
+    textareaRef.current?.setSelectionRange(historyCaretRef.current, historyCaretRef.current)
+    historyCaretRef.current = null
+  }, [input])
   const [quotes, setQuotes] = useState<string[]>(() => getComposerDraft(draftKeyValue)?.quotes ?? [])
   const [attachments, setAttachments] = useState<PendingAttachment[]>(() => getComposerDraft(draftKeyValue)?.attachments ?? [])
   const [attachmentError, setAttachmentError] = useState('')
@@ -566,6 +591,8 @@ export const InputBar = memo(function InputBar({
   const sendingDraftKeyRef = useRef<string | null>(null)
   useEffect(() => {
     if (draftKeyRef.current === draftKeyValue) return
+    historyRef.current = null
+    historyCaretRef.current = null
     const prevKey = draftKeyRef.current
     draftKeyRef.current = draftKeyValue
     // 新建会话刚落库拿到 id（切 plan/orchestrate 模式等会触发）：草稿跟着搬过去，
@@ -624,7 +651,7 @@ export const InputBar = memo(function InputBar({
   // 集：导航态选中的集（项目优先；两者在侧栏互斥）。
   const effectiveSet: { id: string; name: string } | null =
     effectiveProject ? null : (selectedSet ? { id: selectedSet.id, name: selectedSet.name } : null)
-  // 专家入口:欢迎页与对话中都显示,未选时为「选择专家」图标,已选时高亮 + 清除按钮。
+  // 专家入口:欢迎页与对话中都显示,未选时为「选择专家」图标,已选时高亮。
   const showAssistantEntry = Boolean(onOpenAssistantCenter)
   const modeEntryEnabled = Boolean(onModeChange) && modeOptions.length > 0
   const presetEntryEnabled = Boolean(onPresetChange) && presetOptions.length > 0
@@ -1136,6 +1163,16 @@ export const InputBar = memo(function InputBar({
     setSlashPanelOpen(false)
 
     switch (command.id) {
+      case 'goal':
+        setInput('/goal ')
+        requestAnimationFrame(() => {
+          const textarea = textareaRef.current
+          if (!textarea) return
+          textarea.focus({ preventScroll: true })
+          textarea.selectionStart = 6
+          textarea.selectionEnd = 6
+        })
+        return
       case 'plan':
         await setAgentPlanMode('plan')
         return
@@ -1191,6 +1228,7 @@ export const InputBar = memo(function InputBar({
     setComposerDraft(sentDraftKey, { input: '', quotes: [], attachments: [] })
     // 等待发送时用户可能已经切到另一条有自己草稿的会话。只清本次提交实际归属的输入框。
     if (draftKeyRef.current !== sentDraftKey) return
+    historyRef.current = null
     setInput('')
     setQuotes([])
     setAttachments([])
@@ -1368,6 +1406,40 @@ export const InputBar = memo(function InputBar({
       }
     }
 
+    if (
+      (e.key === 'ArrowUp' || e.key === 'ArrowDown') &&
+      !e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey &&
+      !sendPending && !optimizeBusy
+    ) {
+      const el = e.currentTarget
+      const up = e.key === 'ArrowUp'
+      // 多行文本只在首尾切换历史，保留正文中的光标移动与选区操作。
+      const atBoundary = !input.includes('\n') ||
+        (up ? el.selectionStart === 0 : el.selectionEnd === input.length)
+      if (el.selectionStart === el.selectionEnd && atBoundary) {
+        if (!historyRef.current && up) {
+          const entries = inputHistory.filter((text) => text.trim())
+          if (entries.length) historyRef.current = { entries, index: entries.length, draft: input }
+        }
+        const history = historyRef.current
+        if (history) {
+          e.preventDefault()
+          history.index = Math.max(0, Math.min(history.entries.length, history.index + (up ? -1 : 1)))
+          const next = history.entries[history.index] ?? history.draft
+          const caret = next.length
+          historyCaretRef.current = caret
+          setInput(next)
+          if (next === input) {
+            el.setSelectionRange(caret, caret)
+            historyCaretRef.current = null
+          }
+          setSlashPanelOpen(false)
+          if (history.index === history.entries.length) historyRef.current = null
+          return
+        }
+      }
+    }
+
     // 生成中按 Esc = 点停止。只绑在输入框上（发完焦点就在这），
     // 不接全局监听——图片查看器/右键菜单/侧边栏那一堆 Esc 关闭会跟着一块触发。
     if (e.key === 'Escape' && onCancel && cancelVisible && !cancelling) {
@@ -1382,6 +1454,7 @@ export const InputBar = memo(function InputBar({
   }
 
   const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    historyRef.current = null
     const nextValue = e.target.value
     setInput(nextValue)
     // 高度/滚动条由 input 的 layout effect 统一跟，这里不再内联量一遍。
@@ -1709,7 +1782,7 @@ export const InputBar = memo(function InputBar({
   const wrapperClass =
     layout === 'inline'
       ? 'w-full'
-      : 'chat-composer-footer shrink-0 px-6 pb-8 pt-2'
+      : 'chat-composer-footer shrink-0 px-6 pb-4 pt-2'
 
   const innerClass = layout === 'inline' ? 'w-full' : 'mx-auto w-full max-w-4xl'
   const slashPanelPlacementClass = layout === 'inline'
@@ -1940,7 +2013,7 @@ export const InputBar = memo(function InputBar({
           </div>
         )}
         {/* ① 状态条：「你在哪 + 在做什么 + 改了多少」—— 项目/集、当前 todo、diff 徽标。 */}
-        {(statusBarVisible || todoBarVisible || gitStatusEnabled) && (
+        {(statusBarVisible || todoBarVisible || goalSlot || gitStatusEnabled) && (
           <div className="chat-composer-status" data-tauri-drag-region="false">
             {statusBarVisible && effectiveProject && (
               <div className="relative min-w-0">
@@ -1989,7 +2062,8 @@ export const InputBar = memo(function InputBar({
                 <span className="min-w-0 truncate">{effectiveSet.name}</span>
               </button>
             )}
-            {todoBarVisible && (
+            {goalSlot}
+            {!goalSlot && todoBarVisible && (
               <AgentTodoIndicator todoState={agentTodoState} placement="status" />
             )}
             {gitStatusEnabled && gitWorkdir && gitLang && onOpenGitPanel && (
@@ -2180,20 +2254,29 @@ export const InputBar = memo(function InputBar({
                 closeModeMenu()
                 closePresetMenu()
               }}
+              sourcesPanel={
+                onChangeKnowledgeBaseIds && onSetWebSearchMode ? (
+                  <SourcesButton
+                    knowledgeBaseIds={knowledgeBaseIds}
+                    onChangeKnowledgeBaseIds={onChangeKnowledgeBaseIds}
+                    forceKnowledgeSearch={forceKnowledgeSearch}
+                    onToggleForceKnowledgeSearch={onToggleForceKnowledgeSearch}
+                    mcpServers={mcpServers}
+                    onToggleMcpServer={onToggleMcpServer ?? (() => {})}
+                    webSearchMode={webSearchMode}
+                    onSetWebSearchMode={onSetWebSearchMode}
+                    builtinWebSearchSupported={builtinWebSearchSupported}
+                    onOpenSettings={onOpenSettings}
+                  />
+                ) : undefined
+              }
+              sourcesActive={knowledgeBaseIds.length > 0 || webSearchMode !== 'off'}
             />
-
-            {onChangeKnowledgeBaseIds && onSetWebSearchMode && (
-              <SourcesButton
-                knowledgeBaseIds={knowledgeBaseIds}
-                onChangeKnowledgeBaseIds={onChangeKnowledgeBaseIds}
-                forceKnowledgeSearch={forceKnowledgeSearch}
-                onToggleForceKnowledgeSearch={onToggleForceKnowledgeSearch}
-                mcpServers={mcpServers}
-                onToggleMcpServer={onToggleMcpServer ?? (() => {})}
-                webSearchMode={webSearchMode}
-                onSetWebSearchMode={onSetWebSearchMode}
-                builtinWebSearchSupported={builtinWebSearchSupported}
-                onOpenSettings={onOpenSettings}
+            {showAssistantEntry && onOpenAssistantCenter && (
+              <AssistantPicker
+                currentAssistant={currentAssistant}
+                onSelect={onSelectAssistant ?? (() => {})}
+                onOpenCenter={onOpenAssistantCenter}
                 disabled={disabled}
                 layout={layout}
               />
@@ -2236,16 +2319,6 @@ export const InputBar = memo(function InputBar({
                 )}
               </div>
             )}
-            {showAssistantEntry && onOpenAssistantCenter && (
-              <AssistantPicker
-                currentAssistant={currentAssistant}
-                onSelect={onSelectAssistant ?? (() => {})}
-                onOpenCenter={onOpenAssistantCenter}
-                disabled={disabled}
-                layout={layout}
-              />
-            )}
-
             {!usesExternalRuntime && onChangeReplyModels && (
               <div className="min-w-0 shrink" data-tauri-drag-region="false">
                 <MultiModelSelector
