@@ -1061,6 +1061,8 @@ async fn run_turn(app: &AppHandle, conv_id: &str, content: &str, timeout_sec: u6
         Vec::new(),
         None,
         None,
+        // plan_message_id：上游 2.9.9 新增的第 8 参，无头发送无计划消息。
+        None,
     );
     let mut send = Box::pin(send);
 
