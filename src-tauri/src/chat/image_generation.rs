@@ -76,9 +76,7 @@ pub async fn tool_generate_image(
         crate::chat::storage::load_conversation(app, conversation_id).ok()
     });
     let drafts = conversation_id
-        .map(|conversation_id| {
-            crate::chat::draft_journal::latest_drafts_for(app, conversation_id)
-        })
+        .map(|conversation_id| crate::chat::draft_journal::latest_drafts_for(app, conversation_id))
         .unwrap_or_default();
     let session_ref = conversation
         .as_ref()
@@ -94,8 +92,7 @@ pub async fn tool_generate_image(
         .cloned()
         .ok_or_else(|| "Mixer image generation provider is missing".to_string())?;
     let retry_attempts = crate::api::effective_retry_attempts(&settings);
-    let input_images =
-        collect_mixer_input_images(app, conversation.as_ref(), &drafts, arguments)?;
+    let input_images = collect_mixer_input_images(app, conversation.as_ref(), &drafts, arguments)?;
     generate_image_with_provider(
         state,
         &provider,
@@ -2129,26 +2126,21 @@ mod tests {
     #[test]
     fn mixer_finds_same_turn_artifact_on_draft_not_main_json() {
         let conversation = conversation_from_messages(vec![]);
-        let drafts: Vec<crate::chat::ChatMessage> = vec![serde_json::from_value(
-            assistant_with_tool_artifact("art_new", "aGVsbG8="),
-        )
-        .expect("draft")];
-        let found = resolve_mixer_artifacts(
-            Some(&conversation),
-            &drafts,
-            &["art_new".to_string()],
-        )
-        .expect("draft artifact");
+        let drafts: Vec<crate::chat::ChatMessage> =
+            vec![
+                serde_json::from_value(assistant_with_tool_artifact("art_new", "aGVsbG8="))
+                    .expect("draft"),
+            ];
+        let found = resolve_mixer_artifacts(Some(&conversation), &drafts, &["art_new".to_string()])
+            .expect("draft artifact");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].id.as_deref(), Some("art_new"));
     }
 
     #[test]
     fn mixer_unknown_artifact_errors_even_if_another_image_is_known() {
-        let conversation = conversation_from_messages(vec![assistant_with_tool_artifact(
-            "art_old",
-            "aGVsbG8=",
-        )]);
+        let conversation =
+            conversation_from_messages(vec![assistant_with_tool_artifact("art_old", "aGVsbG8=")]);
         let err = resolve_mixer_artifacts(
             Some(&conversation),
             &[],

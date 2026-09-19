@@ -2,7 +2,6 @@
 import { invoke } from '@tauri-apps/api/core'
 import { isPlaceholderTitle, optimisticConversationTitle } from './conversationTitle'
 import { estimateTokens } from '../utils/tokens'
-import { isExecutableAgentPlanText } from './agentPlan'
 import { isTauriRuntime } from './utils'
 import type { ConversationPin } from './conversationPins'
 import type {
@@ -724,7 +723,9 @@ const mockChatApi = {
     content: string,
     attachments: PendingAttachment[] = [],
     activeSkillId?: string | null,
+    planMessageId?: string,
   ): Promise<Conversation> {
+    if (planMessageId !== undefined) throw new Error('请在桌面应用中执行计划文档')
     const conversations = loadMockConversations()
     const index = conversations.findIndex((item) => item.id === conversationId)
     if (index < 0) throw new Error('Conversation not found')
@@ -754,25 +755,6 @@ const mockChatApi = {
         timestamp: now,
       },
     ]
-    const currentPlanMode = conversation.agent_plan_state?.mode ?? conversation.agentPlanState?.mode ?? 'act'
-    if (currentPlanMode === 'plan') {
-      const assistantIndex = conversation.messages.length - 1
-      const reply = conversation.messages[assistantIndex]?.content ?? ''
-      if (isExecutableAgentPlanText(reply)) {
-        conversation.agent_plan_state = {
-          mode: 'plan',
-          status: 'draft',
-          plan: reply,
-          updated_at: now,
-        }
-        conversation.agentPlanState = conversation.agent_plan_state
-        conversation.messages[assistantIndex] = {
-          ...conversation.messages[assistantIndex],
-          agent_plan: conversation.agent_plan_state,
-          agentPlan: conversation.agent_plan_state,
-        }
-      }
-    }
     if (isPlaceholderTitle(conversation.title)) {
       const nextTitle = optimisticConversationTitle(
         content,
@@ -842,49 +824,9 @@ const mockChatApi = {
   async cancelGoal(conversationId: string): Promise<Conversation> { return mockGoalStatus(conversationId, 'cancelled') },
 
   async executeAgentPlan(conversationId: string, messageId?: string): Promise<Conversation> {
-    const conversations = loadMockConversations()
-    const index = conversations.findIndex((item) => item.id === conversationId)
-    if (index < 0) throw new Error('Conversation not found')
-    const now = nowSeconds()
-    const messageIndex = messageId
-      ? conversations[index].messages.findIndex((message) => message.id === messageId && message.role === 'assistant')
-      : -1
-    if (messageId && messageIndex < 0) throw new Error('计划消息不存在')
-    const messagePlan = messageIndex >= 0
-      ? conversations[index].messages[messageIndex].agent_plan ?? conversations[index].messages[messageIndex].agentPlan ?? null
-      : null
-    if (messageId && !isExecutableAgentPlanText(messagePlan?.plan)) throw new Error('该消息不是可执行计划')
-    const current = messagePlan ?? conversations[index].agent_plan_state ?? conversations[index].agentPlanState ?? {
-      mode: 'act',
-      status: 'empty',
-      plan: null,
-      updated_at: 0,
-    }
-    const hasPlan = isExecutableAgentPlanText(current.plan)
-    const conversation = {
-      ...conversations[index],
-      agent_plan_state: {
-        ...current,
-        mode: 'act' as AgentPlanMode,
-        status: hasPlan ? 'approved' as const : 'empty' as const,
-        updated_at: now,
-      },
-      updated_at: now,
-    }
-    conversation.agentPlanState = conversation.agent_plan_state
-    if (messageIndex >= 0) {
-      conversation.messages = conversation.messages.map((message, i) =>
-        i === messageIndex
-          ? { ...message, agent_plan: conversation.agent_plan_state, agentPlan: conversation.agent_plan_state }
-          : message,
-      )
-    }
-    const contextState = estimateMockContext(conversation)
-    conversation.context_state = contextState
-    conversation.contextState = contextState
-    conversations[index] = conversation
-    saveMockConversations(conversations)
-    return conversation
+    void conversationId
+    void messageId
+    throw new Error('请在桌面应用中执行计划文档')
   },
 
   async deleteConversation(conversationId: string): Promise<void> {
@@ -1703,9 +1645,10 @@ export const chatApi = {
     content: string,
     attachments: PendingAttachment[] = [],
     activeSkillId?: string | null,
+    planMessageId?: string,
   ): Promise<Conversation> {
     if (!isTauriRuntime()) {
-      return mockChatApi.sendMessage(conversationId, content, attachments, activeSkillId)
+      return mockChatApi.sendMessage(conversationId, content, attachments, activeSkillId, planMessageId)
     }
     // 磁盘附件传路径；内存文本附件（粘贴长文本虚拟 txt）直接传内容，由后端注入 prompt，不落盘。
     const diskPaths = attachments.filter((a) => a.content === undefined).map((a) => a.path)
@@ -1720,6 +1663,7 @@ export const chatApi = {
         attachments: diskPaths,
         textAttachments,
         activeSkillId,
+        planMessageId,
       }
     )
     if (!result.success || !result.conversation) {

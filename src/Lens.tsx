@@ -29,6 +29,9 @@ import { estimateTokens, formatTokens } from './utils/tokens'
 import { ThinkingBlock } from './lens/ThinkingBlock'
 import { WebSearchBlock } from './lens/WebSearchBlock'
 import { useWindowInteractionFocus } from './utils/windowFocus'
+import { useFreezeFramePreview } from './lens/useFreezeFramePreview'
+import { useImageObjectUrl } from './lens/useImageObjectUrl'
+import { readDevicePixelRatio, useDevicePixelRatio } from './lens/useDevicePixelRatio'
 
 /** 解析 webview hash query：'#lens?mode=translate' → 'translate' */
 function readModeFromHash(): Mode {
@@ -104,8 +107,8 @@ const LENS_HIDE_IDLE_TIMEOUT_MS = 120
 // 第二次 take 必然拿到 null（已被第一次消费）。若此时 enterSelect({}) 会把第一次已
 // 加载的 freezeFrameImageId/冻结帧清掉（且第一次的异步加载已被 cleanup 的
 // cancelPendingMotion 作废）→ 冻结帧永远出不来。缓存最近一次 take 到的载荷，
-// mount 时 take 到 null 就用缓存重放。resetBeforeHide 时清空，避免跨会话串台。
-let lastResetPayloadCache: LensResetPayload | null = null
+// mount 时 take 到 null 就用组件 ref 缓存重放。StrictMode effect 重放保留 ref，
+// 真正卸载则释放；resetBeforeHide 时也清空，避免跨会话串台。
 
 const waitForVisibleIdle = (timeout = LENS_HIDE_IDLE_TIMEOUT_MS) => new Promise<void>((resolve) => {
   const idleWindow = window as Window & {
@@ -134,7 +137,10 @@ export default function Lens() {
   const [dragStart, setDragStart] = useState<Point | null>(null)
   const [dragCurrent, setDragCurrent] = useState<Point | null>(null)
   const [dragging, setDragging] = useState(false)
-  const [imagePreview, setImagePreview] = useState('')
+  const [previewSource, setPreviewSource] = useState<{ imageId: string; url: string }>({ imageId: '', url: '' })
+  const capturedPreview = useImageObjectUrl(previewSource.imageId, api.lensReadImage)
+  const imagePreview = previewSource.url || capturedPreview
+  const setImagePreview = useCallback((url: string) => setPreviewSource({ imageId: '', url }), [])
   const [appLabel, setAppLabel] = useState('')
   const [input, setInput] = useState('')
   // Lens 启动前 Rust 端抓到的选中文本：作为本次会话的上下文前缀
@@ -166,10 +172,14 @@ export default function Lens() {
   const [translateNow, setTranslateNow] = useState(() => Date.now())
   const translateStartRef = useRef<number | null>(null)
   const [freezeFrameImageId, setFreezeFrameImageId] = useState('')
-  const [freezeFramePreview, setFreezeFramePreview] = useState('')
+  // Cropping consumes the backend frame ID, but the rendered background must
+  // stay alive through annotation/translation until the entire session closes.
+  const [freezeFramePreviewId, setFreezeFramePreviewId] = useState('')
+  const freezeFramePreview = useFreezeFramePreview(freezeFramePreviewId)
   // 冻结帧用 canvas 渲染：backing store 取图片原生分辨率，保证全屏帧在屏上按设备像素 1:1
   // 栅格化（绕过透明 overlay 下 WebView2 把全屏 <img> 以低光栅倍率放大导致的发虚）。
   const freezeCanvasRef = useRef<HTMLCanvasElement>(null)
+  const devicePixelRatio = useDevicePixelRatio()
   // viewport 大小：监听 resize（拔显示器/系统缩放变化都会触发），所有相对尺寸由此重算
   const [viewport, setViewport] = useState(() => ({
     w: typeof window !== 'undefined' ? window.innerWidth : 1280,
@@ -220,7 +230,7 @@ export default function Lens() {
       setAnnotateSaving(false)
     }
   }, [stage])
-  // 冻结帧绘制：把 data URL 画进 canvas，backing store = 图片原生像素，CSS 铺满 viewport，
+  // 冻结帧绘制：把 Blob URL 画进 canvas，backing store = 图片原生像素，CSS 铺满 viewport，
   // 使全屏冻结帧按设备像素 1:1 显示，与实时桌面同等清晰（避免 <img> 被重采样发虚）。
   // 全屏态（select 及 keepFullscreen 的 ready/answering）整段会话都保留作背景，直到关闭 Lens。
   useEffect(() => {
@@ -234,6 +244,12 @@ export default function Lens() {
       if (cancelled) return
       if (canvas.width !== img.naturalWidth) canvas.width = img.naturalWidth
       if (canvas.height !== img.naturalHeight) canvas.height = img.naturalHeight
+      // WebView2 rounds the viewport up at fractional DPI (e.g. a 2560px
+      // screen becomes 2561px at 150%). width:100% would resample every pixel.
+      // Size the CSS surface from the source pixels instead of that viewport.
+      const scale = devicePixelRatio
+      canvas.style.width = `${img.naturalWidth / scale}px`
+      canvas.style.height = `${img.naturalHeight / scale}px`
       const ctx = canvas.getContext('2d')
       if (!ctx) return
       ctx.clearRect(0, 0, canvas.width, canvas.height)
@@ -243,7 +259,7 @@ export default function Lens() {
     return () => {
       cancelled = true
     }
-  }, [stage, keepFullscreen, freezeFramePreview])
+  }, [stage, keepFullscreen, freezeFramePreview, devicePixelRatio, viewport.w, viewport.h])
   // 内存历史：单次 app 生命周期保留，esc/hide 不清空
   const [history, setHistory] = useState<HistoryItem[]>(loadHistoryFromStorage)
   const [historyOpen, setHistoryOpen] = useState(false)
@@ -270,6 +286,14 @@ export default function Lens() {
   // closeAfterReset 用它判断"等待隐藏期间是否有新会话开启"，避免被关闭自身的
   // setStage('select') 副作用（会再次 bump motionSeqRef）误判而跳过 lensClose。
   const lensOpenSeqRef = useRef(0)
+  const initializationSeqRef = useRef(0)
+  const invalidateInitialization = useCallback(() => { initializationSeqRef.current++ }, [])
+  const lastResetPayloadCacheRef = useRef<LensResetPayload | null>(null)
+  const captureReadyRef = useRef(false)
+  const [captureReady, setCaptureReady] = useState(false)
+  const [pendingCapture, setPendingCapture] = useState<{ x: number; y: number; width: number; height: number } | null>(null)
+  const lastSelectPointerRef = useRef<Point | null>(null)
+  const recoverInitialDragRef = useRef(true)
   const selectRevealTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const selectRevealedRef = useRef(false)
   const captureHintEnabledRef = useRef(true)
@@ -398,14 +422,24 @@ export default function Lens() {
   }, [])
 
   // select 态进入：刷新所有 state、重算对话栏位置、播放 intro 动画
-  const enterSelect = useCallback(async (resetPayload: LensResetPayload = {}) => {
+  const enterSelect = useCallback(async (resetPayload: LensResetPayload = {}, initializationSeq = ++initializationSeqRef.current) => {
+    captureReadyRef.current = false
+    setCaptureReady(false)
     const curMode = readModeFromHash()
     await loadLensSettings(curMode)
+    if (initializationSeq !== initializationSeqRef.current) return
     const resetFrame = resetPayload.frame
     const resetFreezeFrameImageId = resetPayload.freezeFrameImageId ?? ''
     cancelPendingMotion()
     // 标记一次真正的会话开启/重入：pending 的 closeAfterReset 看到它变化即放弃隐藏。
+    const firstEntry = lensOpenSeqRef.current === 0
     lensOpenSeqRef.current++
+    if (!firstEntry) {
+      setPendingCapture(null)
+      capturingRef.current = false
+      lastSelectPointerRef.current = null
+      recoverInitialDragRef.current = true
+    }
     const motionSeq = motionSeqRef.current
     fullscreenMetricsRef.current = null
     // 防御：reset 流程会 setMessages([]) + setStreaming(false)，理论上 messages.length===0 effect 不会进
@@ -422,9 +456,13 @@ export default function Lens() {
       setKeepFullscreen(keepFullscreenForMode(curMode, screenshotKeepFullscreenRef.current))
       setFloatingRebased(false)
       setHovered(null)
-      setDragStart(null)
-      setDragCurrent(null)
-      setDragging(false)
+      // The native window can receive mouse input before its cold-start payload
+      // arrives. Preserve that first drag; subsequent sessions still reset it.
+      if (!firstEntry) {
+        setDragStart(null)
+        setDragCurrent(null)
+        setDragging(false)
+      }
       setTranslateCardDragging(false)
       setImagePreview('')
       setAppLabel('')
@@ -442,7 +480,7 @@ export default function Lens() {
       setReplaceError('')
       setReplaceWarning('')
       setFreezeFrameImageId(resetFreezeFrameImageId)
-      setFreezeFramePreview('')
+      setFreezeFramePreviewId(resetFreezeFrameImageId)
       const w = resetFrame?.width ?? window.innerWidth
       const h = resetFrame?.height ?? window.innerHeight
       setViewport({ w, h })
@@ -465,18 +503,6 @@ export default function Lens() {
     setCardSessionHeight(0)
     setTranslateCardResizing(false)
     focusLensSurface([0, 40, 120])
-    if (resetFreezeFrameImageId) {
-      void (async () => {
-        try {
-          const img = await api.explainReadImage(resetFreezeFrameImageId)
-          if (motionSeq === motionSeqRef.current && img.success) {
-            setFreezeFramePreview(img.data ?? '')
-          }
-        } catch (err) {
-          console.error('Failed to load freeze frame', err)
-        }
-      })()
-    }
     // 重新加载设置：用户在设置面板修改后关闭再打开 Lens，需要读到最新值。
     // 必须放在 reset DOM 之后，避免 await 期间 Rust 已 show 导致旧 ready/answering surface 露出首帧。
     void (async () => {
@@ -600,6 +626,9 @@ export default function Lens() {
         }
       } catch (err) { console.error('Failed to read window origin', err) }
     }
+    if (initializationSeq !== initializationSeqRef.current) return
+    captureReadyRef.current = true
+    setCaptureReady(true)
     try {
       const list = await api.lensListWindows()
       if (motionSeq === motionSeqRef.current) setWindows(list)
@@ -608,7 +637,7 @@ export default function Lens() {
       if (motionSeq === motionSeqRef.current) setWindows([])
     }
     focusLensSurface()
-  }, [cancelPendingMotion, focusLensSurface, loadLensSettings])
+  }, [cancelPendingMotion, focusLensSurface, loadLensSettings, setImagePreview])
 
   useEffect(() => {
     // 冷挂载 与 复用收到 lens:reset 走同一路径：主动 take 后端暂存的复位载荷（frame +
@@ -625,7 +654,7 @@ export default function Lens() {
         const raw = await api.lensTakeResetPayload()
         if (raw) {
           const payload = readLensResetPayload(JSON.parse(raw))
-          lastResetPayloadCache = payload
+          lastResetPayloadCacheRef.current = payload
           return payload
         }
       } catch (err) {
@@ -634,20 +663,25 @@ export default function Lens() {
       return null
     }
     const consumeAndEnter = async (fromMount: boolean) => {
+      const initializationSeq = ++initializationSeqRef.current
+      captureReadyRef.current = false
+      setCaptureReady(false)
+      if (!fromMount) setPendingCapture(null)
       let payload = await takeOnce()
       if (!payload && fromMount) {
-        for (let i = 0; i < 12 && !payload && !disposed; i++) {
+        for (let i = 0; i < 12 && !payload && !disposed && initializationSeq === initializationSeqRef.current; i++) {
           // StrictMode 第二次挂载：本会话已缓存（resetBeforeHide 会清空缓存），直接重放
-          if (lastResetPayloadCache) {
-            payload = lastResetPayloadCache
+          if (lastResetPayloadCacheRef.current) {
+            payload = lastResetPayloadCacheRef.current
             break
           }
           await new Promise(r => setTimeout(r, 150))
+          if (disposed || initializationSeq !== initializationSeqRef.current) return
           payload = await takeOnce()
         }
       }
-      if (disposed) return
-      void enterSelect(payload ?? {})
+      if (disposed || initializationSeq !== initializationSeqRef.current) return
+      void enterSelect(payload ?? {}, initializationSeq)
     }
     void consumeAndEnter(true)
     const handleReset = () => {
@@ -656,10 +690,11 @@ export default function Lens() {
     window.addEventListener('lens:reset', handleReset)
     return () => {
       disposed = true
+      invalidateInitialization()
       window.removeEventListener('lens:reset', handleReset)
       cancelPendingMotion()
     }
-  }, [enterSelect, cancelPendingMotion])
+  }, [enterSelect, cancelPendingMotion, invalidateInitialization])
 
   useEffect(() => {
     let cancelled = false
@@ -874,10 +909,15 @@ export default function Lens() {
   }, [])
 
   const resetBeforeHide = useCallback(() => {
+    initializationSeqRef.current++
+    captureReadyRef.current = false
+    capturingRef.current = false
+    setCaptureReady(false)
+    setPendingCapture(null)
     cancelPendingMotion()
     releaseFreezeCanvas()
     // 会话结束：清掉 take-once 载荷缓存，避免下次 StrictMode 重放到旧会话的冻结帧
-    lastResetPayloadCache = null
+    lastResetPayloadCacheRef.current = null
     fullscreenMetricsRef.current = null
     translateStartRef.current = null
     // 防御：和 enterSelect 同理 —— reset 路径不该走持久化
@@ -895,7 +935,7 @@ export default function Lens() {
       setTranslateCardDragging(false)
       setImagePreview('')
       setFreezeFrameImageId('')
-      setFreezeFramePreview('')
+      setFreezeFramePreviewId('')
       setAppLabel('')
       setInput('')
       setSelectionText('')
@@ -934,7 +974,7 @@ export default function Lens() {
     // 让任何还没落地的 takeLensSelection 老 promise 作废，避免关闭后 setSelectionText 拖回来
     selectionReqIdRef.current++
     focusReqIdRef.current++
-  }, [cancelPendingMotion, releaseFreezeCanvas, viewport, metrics])
+  }, [cancelPendingMotion, releaseFreezeCanvas, viewport, metrics, setImagePreview])
 
   const closeAfterReset = useCallback(async () => {
     // 记下关闭开始时的"会话代次"。resetBeforeHide 会 setStage('select') 进而触发动画
@@ -1094,7 +1134,10 @@ export default function Lens() {
   }, [dragging, hovered, t])
 
   const handleMouseDown = (e: React.MouseEvent) => {
-    if (stage !== 'select') return
+    if (stage !== 'select' || pendingCapture || capturingRef.current) return
+    // Once a down event arrives, normal hit testing owns this gesture (including
+    // presses in the input bar); never recover those as screenshot drags.
+    recoverInitialDragRef.current = false
     // 点击在对话栏内部时不开始拖动，让输入框/按钮等正常交互
     if (barRef.current?.contains(e.target as Node)) return
     // 历史面板展开时点击外层只关闭面板，不开始拖动/截图
@@ -1109,8 +1152,10 @@ export default function Lens() {
   }
 
   const handleMouseMove = (e: React.MouseEvent) => {
-    if (stage !== 'select') return
+    if (stage !== 'select' || pendingCapture || capturingRef.current) return
     const p: Point = { x: e.clientX, y: e.clientY }
+    const previousPoint = lastSelectPointerRef.current
+    lastSelectPointerRef.current = p
     if (dragStart) {
       setDragCurrent(p)
       const dx = Math.abs(p.x - dragStart.x)
@@ -1123,6 +1168,18 @@ export default function Lens() {
     }
     // 鼠标在对话栏（含历史面板）上方时清除 hover，避免高亮/误截图背后窗口
     if (barRef.current?.contains(e.target as Node)) {
+      setHovered(null)
+      return
+    }
+    // A newly shown WebView2 can miss the initial down while already delivering
+    // moves with the left button held. Recover only that first gesture, using
+    // the last observed cursor position instead of making the user press again.
+    if (recoverInitialDragRef.current && (e.buttons & 1) !== 0 && !historyOpenRef.current) {
+      recoverInitialDragRef.current = false
+      const start = previousPoint ?? p
+      setDragStart(start)
+      setDragCurrent(p)
+      setDragging(Math.abs(p.x - start.x) > DRAG_THRESHOLD || Math.abs(p.y - start.y) > DRAG_THRESHOLD)
       setHovered(null)
       return
     }
@@ -1471,13 +1528,16 @@ export default function Lens() {
   }, [stage])
 
   const handleCaptureWindow = async (info: LensWindowInfo) => {
+    if (!captureReadyRef.current || capturingRef.current) return
     // 见 handleCaptureRegion：用 lensOpenSeqRef 而非 motionSeqRef，否则 flyBarToAnchor 后守卫必然失败。
     const captureOpenSeq = lensOpenSeqRef.current
+    const captureInitializationSeq = initializationSeqRef.current
+    const isCurrentCapture = () => captureOpenSeq === lensOpenSeqRef.current && captureInitializationSeq === initializationSeqRef.current
     // capturingRef 全程 true，避免 macOS screencapture 短暂让 lens webview 失焦时触发 blur handler 误关
     capturingRef.current = true
     try {
       const result = await api.lensCaptureWindow(info.id)
-      if (captureOpenSeq !== lensOpenSeqRef.current) return
+      if (!isCurrentCapture()) return
       if (!result.success || !result.imageId) {
         console.error('lensCaptureWindow failed:', result.error)
         void enterSelect()
@@ -1494,12 +1554,7 @@ export default function Lens() {
         height: info.height,
         label: info.owner,
       })
-      void (async () => {
-        try {
-          const img = await api.explainReadImage(newId)
-          if (img.success) setImagePreview(img.data ?? '')
-        } catch (err) { console.error(err) }
-      })()
+      setPreviewSource({ imageId: newId, url: '' })
       if (mode === 'screenshot') {
         // 截图标注：无对话栏可飞，直接进 ready（工具栏对着 capturedFrame 渲染）
         flushSync(() => { setStage('ready') })
@@ -1510,19 +1565,31 @@ export default function Lens() {
         Math.round(info.x), Math.round(info.y), Math.round(info.width), Math.round(info.height),
         info.owner,
       )
-      if (captureOpenSeq !== lensOpenSeqRef.current) return
+      if (!isCurrentCapture()) return
       if (mode === 'translate') void runTranslate(newId)
       else if (mode === 'replace') void runReplaceTranslate(newId)
     } finally {
-      capturingRef.current = false
+      if (isCurrentCapture()) capturingRef.current = false
     }
   }
 
   const handleCaptureRegion = async (rect: { x: number; y: number; width: number; height: number }) => {
+    if (capturingRef.current) return
+    if (!captureReadyRef.current) {
+      // Keep the completed rectangle visible until its monitor origin and frozen
+      // frame arrive. Never fall back to a live capture with default coordinates.
+      setPendingCapture(rect)
+      return
+    }
+    setDragStart(null)
+    setDragCurrent(null)
+    setDragging(false)
     // 用 lensOpenSeqRef 做"截图期间是否开了新会话"的守卫：flyBarToAnchor 内部会 cancelPendingMotion
     // 把 motionSeqRef++，若用 motionSeq 守卫则 flyBar 后必然不等、runTranslate 永不触发（截图翻译卡住）。
     // lensOpenSeqRef 只有 enterSelect（真正新会话）才 bump，flyBar 不动它。
     const captureOpenSeq = lensOpenSeqRef.current
+    const captureInitializationSeq = initializationSeqRef.current
+    const isCurrentCapture = () => captureOpenSeq === lensOpenSeqRef.current && captureInitializationSeq === initializationSeqRef.current
     const gp = clientToGlobal({ x: rect.x, y: rect.y })
     const params = {
       absoluteX: Math.round(gp.x),
@@ -1531,14 +1598,14 @@ export default function Lens() {
       y: Math.round(rect.y),
       width: Math.round(rect.width),
       height: Math.round(rect.height),
-      scaleFactor: window.devicePixelRatio || 1,
+      scaleFactor: readDevicePixelRatio(),
       freezeFrameImageId: freezeFrameImageId || undefined,
     }
     // capturingRef 全程 true 直到 flyBarToAnchor 完成（同 handleCaptureWindow 注释）
     capturingRef.current = true
     try {
       const result = await api.lensCaptureRegion(params)
-      if (captureOpenSeq !== lensOpenSeqRef.current) return
+      if (!isCurrentCapture()) return
       if (!result.success || !result.imageId) {
         console.error('lensCaptureRegion failed:', result.error)
         void enterSelect()
@@ -1557,28 +1624,23 @@ export default function Lens() {
         height: params.height,
         label: '',
       })
-      void (async () => {
-        try {
-          const img = await api.explainReadImage(newId)
-          if (img.success) setImagePreview(img.data ?? '')
-        } catch (err) { console.error(err) }
-      })()
+      setPreviewSource({ imageId: newId, url: '' })
       if (mode === 'screenshot') {
         flushSync(() => { setStage('ready') })
         focusLensSurface([0, 80, 200])
         return
       }
       await flyBarToAnchor(params.absoluteX, params.absoluteY, params.width, params.height, '')
-      if (captureOpenSeq !== lensOpenSeqRef.current) return
+      if (!isCurrentCapture()) return
       if (mode === 'translate') void runTranslate(newId)
       else if (mode === 'replace') void runReplaceTranslate(newId)
     } finally {
-      capturingRef.current = false
+      if (isCurrentCapture()) capturingRef.current = false
     }
   }
 
   const handleMouseUp = async (e: React.MouseEvent) => {
-    if (stage !== 'select') return
+    if (stage !== 'select' || pendingCapture || capturingRef.current) return
     const releasedAt: Point = { x: e.clientX, y: e.clientY }
 
     if (dragging && dragStart) {
@@ -1586,10 +1648,12 @@ export default function Lens() {
       const y = Math.min(dragStart.y, releasedAt.y)
       const w = Math.abs(releasedAt.x - dragStart.x)
       const h = Math.abs(releasedAt.y - dragStart.y)
-      setDragStart(null)
-      setDragCurrent(null)
-      setDragging(false)
-      if (w < 10 || h < 10) return
+      if (w < 10 || h < 10) {
+        setDragStart(null)
+        setDragCurrent(null)
+        setDragging(false)
+        return
+      }
       await handleCaptureRegion({ x, y, width: w, height: h })
       return
     }
@@ -1609,6 +1673,16 @@ export default function Lens() {
       await handleCaptureWindow(hovered)
     }
   }
+
+  // Replay a queued release with the latest committed origin/frame/mode, not
+  // the handler closure from the pre-initialization mouse event.
+  const captureRegionHandlerRef = useRef(handleCaptureRegion)
+  useLayoutEffect(() => { captureRegionHandlerRef.current = handleCaptureRegion })
+  useEffect(() => {
+    if (!captureReady || !pendingCapture) return
+    setPendingCapture(null)
+    void captureRegionHandlerRef.current(pendingCapture)
+  }, [captureReady, pendingCapture])
 
   const doSend = async (question: string) => {
     if (streaming) return
@@ -2231,7 +2305,7 @@ export default function Lens() {
         <canvas
           ref={freezeCanvasRef}
           aria-hidden
-          className="absolute inset-0 w-full h-full pointer-events-none"
+          className="absolute left-0 top-0 pointer-events-none"
         />
       )}
 
@@ -2256,13 +2330,13 @@ export default function Lens() {
               top: capturedFrame.y,
               width: capturedFrame.width,
               height: capturedFrame.height,
-              boxShadow: '0 0 16px 2px rgba(217,119,87,0.45)',
+              boxShadow: '0 0 16px 2px rgba(47,111,240,0.45)',
             }}
           />
         </>
       )}
 
-      {/* 不依赖 imagePreview：它来自独立的 explainReadImage 预览加载，失败/迟到不应阻塞
+      {/* 不依赖 imagePreview：它来自独立的二进制预览加载，失败/迟到不应阻塞
           覆盖层挂载——覆盖层渲染只需要后端事件给的 cleanedImage/groups/slots。 */}
       {showReplaceOverlay && capturedFrame && (
         <ReplaceTranslateOverlay
@@ -2448,7 +2522,7 @@ export default function Lens() {
                   top: hoverRect.y,
                   width: hoverRect.width,
                   height: hoverRect.height,
-                  boxShadow: '0 0 16px 2px rgba(217,119,87,0.45)',
+                  boxShadow: '0 0 16px 2px rgba(47,111,240,0.45)',
                 }}
               />
             </>
@@ -2461,7 +2535,7 @@ export default function Lens() {
                 top: dragRect.y,
                 width: dragRect.width,
                 height: dragRect.height,
-                boxShadow: '0 0 16px 2px rgba(217,119,87,0.45)',
+                boxShadow: '0 0 16px 2px rgba(47,111,240,0.45)',
               }}
             />
           )}

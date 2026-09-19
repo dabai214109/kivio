@@ -314,22 +314,29 @@ pub async fn execute_tool_call(
     let started = Instant::now();
     let timeout_ms = effective_tool_timeout_ms(settings, tool, &call.arguments);
     let call_fut = executor.call(ctx, tool, call.arguments.clone(), skill_cache);
-    let result = tokio::select! {
-        result = async {
-            if timeout_ms == NO_OUTER_TOOL_TIMEOUT {
-                Ok(call_fut.await)
-            } else {
-                timeout(Duration::from_millis(timeout_ms), call_fut).await
+    let result = if host.requires_tool_completion() {
+        // Cancellation stops further steps, but the worker remains "stopping"
+        // until this operation returns. Its own native/provider deadlines still
+        // apply; an unconfirmed operation never frees the worker's capacity.
+        Ok(call_fut.await)
+    } else {
+        tokio::select! {
+            result = async {
+                if timeout_ms == NO_OUTER_TOOL_TIMEOUT {
+                    Ok(call_fut.await)
+                } else {
+                    timeout(Duration::from_millis(timeout_ms), call_fut).await
+                }
+            } => result,
+            _ = host.wait_for_generation_inactive(ctx.conversation_id, ctx.generation) => {
+                record.status = ToolCallStatus::Cancelled;
+                record.duration_ms = Some(started.elapsed().as_millis() as u64);
+                record.completed_at = Some(chrono::Local::now().timestamp());
+                record.error = Some("Tool call cancelled".to_string());
+                host.emit_tool_record(ctx.conversation_id, ctx.run_id, ctx.message_id, &record);
+                let content = record.error.clone().unwrap_or_default();
+                return (record, content, Vec::new());
             }
-        } => result,
-        _ = host.wait_for_generation_inactive(ctx.conversation_id, ctx.generation) => {
-            record.status = ToolCallStatus::Cancelled;
-            record.duration_ms = Some(started.elapsed().as_millis() as u64);
-            record.completed_at = Some(chrono::Local::now().timestamp());
-            record.error = Some("Tool call cancelled".to_string());
-            host.emit_tool_record(ctx.conversation_id, ctx.run_id, ctx.message_id, &record);
-            let content = record.error.clone().unwrap_or_default();
-            return (record, content, Vec::new());
         }
     };
     record.duration_ms = Some(started.elapsed().as_millis() as u64);
@@ -854,13 +861,11 @@ fn artifact_presentation_hint(artifacts: &[ChatToolArtifact]) -> Option<String> 
     if artifacts.is_empty() {
         return None;
     }
-    let mut ids = Vec::new();
     let mut items = Vec::new();
     for artifact in artifacts {
         let Some(id) = artifact.id.as_deref() else {
             continue;
         };
-        ids.push(id);
         items.push(format!(
             "- {id}: {} ({})",
             artifact.name, artifact.mime_type
@@ -869,11 +874,9 @@ fn artifact_presentation_hint(artifacts: &[ChatToolArtifact]) -> Option<String> 
     if items.is_empty() {
         return None;
     }
-    let example = serde_json::json!({ "artifact_ids": ids });
     Some(format!(
-        "Available artifacts (not shown automatically):\n{}\nTo show selected files in chat, copy those art_ ids into present_artifacts. Example: {}. Do not pass file contents, base64, or data URLs. Existing local files can be shown with paths.",
+        "Available artifacts (not shown automatically):\n{}\nIn your final answer, reference only necessary deliverables at the relevant paragraph: [label](artifact:art_ID) for files, ![description](artifact:art_ID) for images. Replace art_ID with an exact ID listed above. Internal QA screenshots, extracted frames, drafts, and failed attempts normally stay in the work log. Do not pass file contents, base64, or data URLs. Use present_artifacts with paths to prepare selected existing local files; use mode preview only for an explicit user preview or choice.",
         items.join("\n"),
-        example,
     ))
 }
 
@@ -908,6 +911,18 @@ fn tool_content_with_structured_output(output: &McpToolCallResult, source: &str)
             }
             content.push_str(&hint);
         }
+    } else if let Some(structured) = output.structured_content.as_ref() {
+        // Old records have no mode. New calls need the IDs assigned to local
+        // files after execution, including when native content omits raw JSON.
+        if structured.get("mode").is_some() {
+            if let Some(ids) = structured.get("artifactIds").and_then(Value::as_array) {
+                let ids: Vec<&str> = ids.iter().filter_map(Value::as_str).collect();
+                content.push_str(&format!(
+                    "\n\nRegistered artifact IDs: {}. Use only needed IDs in your final answer: [label](artifact:art_ID) for files or ![description](artifact:art_ID) for images. Do not repeat a separate attachment gallery.",
+                    ids.join(", ")
+                ));
+            }
+        }
     }
     content
 }
@@ -921,6 +936,9 @@ fn effective_tool_timeout_ms(
     arguments: &Value,
 ) -> u64 {
     let default_timeout_ms = settings.chat_tools.tool_timeout_ms;
+    if tool.source == "mixer" && tool.name == "mixer_video_analysis" {
+        return default_timeout_ms.max(300_000);
+    }
     if tool.source == "mixer" && tool.name == "mixer_generate_image" {
         return default_timeout_ms.max(crate::chat::image_generation::IMAGE_GENERATION_TIMEOUT_MS);
     }
@@ -936,15 +954,6 @@ fn effective_tool_timeout_ms(
             .unwrap_or(crate::native_tools::DEFAULT_BASH_OUTPUT_WAIT_MS)
             .min(CHAT_TOOL_MAX_TIMEOUT_MS);
         return default_timeout_ms.max(wait_ms);
-    }
-    // The `agent` spawn tool runs a whole sub-agent loop whose own budget
-    // (SUB_AGENT_MAX_ATTEMPTS × the inner run) is far longer than the default
-    // generic tool timeout (120s). Without a longer outer timeout, the generic
-    // 120s would fire first and mis-kill a still-running sub-agent. Give the
-    // outer call a large backstop and let the sub-agent's inner lifecycle +
-    // cascade cancel govern it.
-    if tool.source == "native" && tool.name == crate::chat::sub_agent::AGENT_TOOL_NAME {
-        return crate::chat::sub_agent::SUB_AGENT_TOOL_TIMEOUT_MS.max(default_timeout_ms);
     }
     if tool.source == "native" && tool.name == "automation_run" {
         return crate::automation::tools::run_timeout_ms(arguments).max(default_timeout_ms);
@@ -1349,6 +1358,10 @@ mod tests {
             tool_content_with_structured_output(&output, "native"),
             "display"
         );
+        output.structured_content.as_mut().unwrap()["mode"] = serde_json::json!("prepare");
+        let prepared_content = tool_content_with_structured_output(&output, "native");
+        assert!(prepared_content.contains("Registered artifact IDs: art_existing, art_local"));
+        assert!(prepared_content.contains("[label](artifact:art_ID)"));
     }
 
     #[test]
@@ -1367,9 +1380,10 @@ mod tests {
         assert!(hint.contains("art_report: report.txt (text/plain)"));
         assert!(hint.contains("not shown automatically"));
         assert!(hint.contains("present_artifacts"));
-        assert!(hint.contains(r#"{"artifact_ids":["art_report"]}"#));
+        assert!(hint.contains("[label](artifact:art_ID)"));
+        assert!(hint.contains("Internal QA screenshots"));
         assert!(hint.contains("Do not pass file contents, base64, or data URLs"));
-        assert!(hint.contains("Existing local files can be shown with paths"));
+        assert!(hint.contains("prepare selected existing local files"));
     }
 
     #[test]
@@ -1837,35 +1851,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_spawn_uses_sub_agent_backstop_timeout() {
-        // The `agent` spawn tool must outlast the sub-agent's own run budget so the
-        // outer 120s default does not mis-kill a long sub-agent run.
+    fn asynchronous_agent_admission_uses_normal_tool_timeout() {
         let mut settings = Settings::default();
         settings.chat_tools.tool_timeout_ms = 120_000;
         let tool = crate::chat::sub_agent::agent_tool(&[]);
-        let arguments = serde_json::json!({ "prompt": "do a focused sub-task" });
-
         assert_eq!(
-            effective_tool_timeout_ms(&settings, &tool, &arguments),
-            crate::chat::sub_agent::SUB_AGENT_TOOL_TIMEOUT_MS
-        );
-        assert!(
-            crate::chat::sub_agent::SUB_AGENT_TOOL_TIMEOUT_MS > 120_000,
-            "agent timeout must exceed the default generic tool timeout"
-        );
-    }
-
-    #[test]
-    fn agent_spawn_respects_larger_user_default_timeout() {
-        // If the user configured an even larger generic timeout, honor it.
-        let mut settings = Settings::default();
-        settings.chat_tools.tool_timeout_ms = crate::chat::sub_agent::SUB_AGENT_TOOL_TIMEOUT_MS + 1;
-        let tool = crate::chat::sub_agent::agent_tool(&[]);
-        let arguments = serde_json::json!({ "prompt": "do a focused sub-task" });
-
-        assert_eq!(
-            effective_tool_timeout_ms(&settings, &tool, &arguments),
-            crate::chat::sub_agent::SUB_AGENT_TOOL_TIMEOUT_MS + 1
+            effective_tool_timeout_ms(&settings, &tool, &serde_json::json!({"prompt":"inspect"})),
+            120_000
         );
     }
 

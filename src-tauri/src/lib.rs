@@ -7,6 +7,7 @@ pub mod automation;
 pub mod capture_geometry;
 pub mod chat;
 pub mod commands;
+mod computer_control;
 pub mod connectors;
 pub mod dock;
 pub mod external_agents;
@@ -50,14 +51,13 @@ pub mod windows_ocr;
 
 use std::time::Duration;
 
-use futures::StreamExt;
 use tauri::{Emitter, Manager, State};
 #[cfg(target_os = "macos")]
 use tauri_plugin_autostart::MacosLauncher;
 use tauri_plugin_single_instance::init as init_single_instance;
 
 use api::build_http_client;
-use commands::apply_launch_at_startup;
+use commands::initialize_launch_at_startup;
 use native_tools::cleanup_stale_sandbox_exports;
 use screenshot::cleanup_orphan_temp_files;
 use settings::load_settings;
@@ -74,8 +74,6 @@ use windows::{ensure_overlay_panel, restore_previous_frontmost_app};
 
 /// 自启动参数，用于区分用户手动启动和系统自动启动
 const AUTOSTART_ARG: &str = "--from-autostart";
-/// Bound startup process/memory spikes when many MCP servers are enabled.
-const MCP_STARTUP_WARMUP_CONCURRENCY: usize = 2;
 
 #[cfg(target_os = "macos")]
 const USER_WINDOW_LABELS: &[&str] = &["chat", "main"];
@@ -344,8 +342,8 @@ pub fn run() {
                     Err(err) => eprintln!("Failed to merge built-in assistants v3: {err}"),
                 }
             }
-            if let Err(err) = apply_launch_at_startup(&app.handle(), settings.launch_at_startup) {
-                eprintln!("Failed to apply launch-at-startup setting: {err}");
+            if let Err(err) = initialize_launch_at_startup(&app.handle(), &mut settings) {
+                eprintln!("Failed to initialize launch-at-startup setting: {err}");
             }
             // 开机自启带 `--from-autostart` 时不弹窗；用户显式打开「启动后最小化到托盘」时
             // 任何启动路径都不弹（含参数丢失的自启、开始菜单快捷方式）。
@@ -496,48 +494,8 @@ pub fn run() {
                 });
             }
 
-            // 启动期并行预热：对每个已启用的 MCP server 建立持久连接（非阻塞）。
-            // 失败仅置 Error 态（mcp_get_or_connect 内部已发事件），不影响启动。
-            {
-                let app_handle = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    // 启动竞态加固：若 AppState 尚未 manage，跳过预热（首次使用时会 lazy 连接）。
-                    let Some(state) = app_handle.try_state::<AppState>() else {
-                        return;
-                    };
-                    let settings = state.settings_read().clone();
-                    if !settings.chat_tools.enabled {
-                        return;
-                    }
-                    let servers: Vec<_> = settings
-                        .chat_tools
-                        .servers
-                        .iter()
-                        .filter(|server| crate::mcp::registry::mcp_server_is_runtime_eligible(server))
-                        .cloned()
-                        .collect();
-                    if !servers.is_empty() {
-                        eprintln!(
-                            "[mcp] warming {} server(s) with concurrency {}",
-                            servers.len(),
-                            MCP_STARTUP_WARMUP_CONCURRENCY
-                        );
-                    }
-                    futures::stream::iter(servers)
-                        .for_each_concurrent(MCP_STARTUP_WARMUP_CONCURRENCY, |server| {
-                            let app_handle = app_handle.clone();
-                            async move {
-                                // 启动竞态加固：若 AppState 尚未 manage，跳过该 server
-                                // 预热（lazy 连接兜底）。
-                                let Some(state) = app_handle.try_state::<AppState>() else {
-                                    return;
-                                };
-                                let _ = state.mcp_get_or_connect(Some(&app_handle), &server).await;
-                            }
-                        })
-                        .await;
-                });
-            }
+            // MCP connects when generation discovers tools or the user explicitly
+            // enables/tests a server. Tray startup must not launch tool processes.
 
             // 手动启动默认打开聊天窗口；自启 / 「启动后最小化到托盘」则只留托盘常驻。
             if !skip_chat_on_launch {
@@ -582,6 +540,8 @@ pub fn run() {
             commands::open_data_url_file,
             commands::open_html_preview,
             lens_commands::explain_read_image,
+            lens_commands::lens_read_freeze_frame,
+            lens_commands::lens_read_image,
             commands::fetch_models,
             commands::test_provider_connection,
             commands::test_web_search,
@@ -678,6 +638,7 @@ pub fn run() {
             remote_bridge::remote_bridge_pairing_status,
             remote_bridge::remote_bridge_cancel_pairing,
             remote_bridge::remote_bridge_status,
+            chat::sub_agent::control::chat_subagent_control,
             chat::commands::interaction::chat_confirm_tool_call,
             chat::commands::interaction::chat_respond_session_consent,
             chat::commands::interaction::chat_submit_user_choice,
@@ -685,11 +646,14 @@ pub fn run() {
             chat::commands::interaction::chat_follow_up_message,
             chat::commands::attachments::chat_read_attachment,
             chat::commands::attachments::chat_open_attachment,
+            chat::commands::attachments::chat_reveal_attachment,
             chat::commands::attachments::chat_open_generated_artifact,
             chat::commands::attachments::chat_reveal_generated_artifact,
             chat::commands::attachments::chat_save_pasted_image,
             chat::commands::attachments::chat_save_pasted_attachment,
             chat::commands::attachments::chat_read_clipboard_files,
+            chat::commands::attachments::chat_read_clipboard,
+            chat::commands::attachments::chat_write_clipboard_text,
             chat::commands::mutations::chat_delete_conversation,
             chat::commands::mutations::chat_update_conversation,
             chat::commands::title::chat_regenerate_title,
@@ -748,6 +712,10 @@ pub fn run() {
             chat::memory::chat_memory_open_folder,
             mcp::registry::chat_mcp_list_tools,
             mcp::registry::chat_mcp_test_server,
+            computer_control::computer_control_check,
+            computer_control::computer_control_status,
+            computer_control::computer_control_install,
+            computer_control::computer_control_update,
             mcp::registry::chat_mcp_import_json,
             mcp::registry::chat_cli_import_scan,
             mcp::registry::chat_mcp_server_status,
@@ -823,6 +791,7 @@ pub fn run() {
             dock::fs::dock_fs_delete,
             dock::fs::dock_fs_open_path,
             dock::git::dock_git_status,
+            dock::git::dock_git_snapshot,
             dock::git::dock_git_diff,
             dock::git::dock_git_log,
             dock::git::dock_git_commit_diff,
@@ -857,6 +826,16 @@ pub fn run() {
                     crate::im_gateway::request_shutdown();
                     crate::remote_bridge::request_shutdown();
                     let state: State<AppState> = app_handle.state();
+                    if let Ok(runtime) = chat::sub_agent::control::runtime(app_handle) {
+                        let stopped = tauri::async_runtime::block_on(async {
+                            tokio::time::timeout(std::time::Duration::from_secs(5), runtime.shutdown()).await
+                        });
+                        if !matches!(stopped, Ok(Ok(()))) {
+                            eprintln!("Child cleanup has not completed; keeping the application alive.");
+                            api.prevent_exit();
+                            return;
+                        }
+                    }
                     // 自动化先于 MCP：运行中的图可能正跑 agent loop（依赖 MCP/供应商）或
                     // 命令节点（Child 靠 kill_on_drop 收尸）。先标记取消、限时等收尾，
                     // 此时运行时还活着，select! 的取消分支才来得及 drop 掉 Child。

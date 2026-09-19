@@ -37,15 +37,15 @@ export interface PermissionModes {
   current: string
 }
 
-/** Kivio Agent 三档 —— 仅内置 Agent 运行时显示；Kivio Chat 不显示此胶囊。 */
+/** Kivio Agent 模式 —— 仅内置 Agent 运行时显示；Kivio Chat 不显示此胶囊。 */
 export const AGENT_MODE_OPTIONS: ModeOption[] = [
   { value: 'act', label: 'Act', description: '普通模式 · Normal', icon: Zap, tone: 'neutral' },
   { value: 'goal', label: 'Goal', description: '持续执行一个目标 · Persistent execution', icon: Target, tone: 'violet' },
-  { value: 'plan', label: 'Plan', description: '计划模式 · Enter plan mode', icon: ListChecks, tone: 'emerald' },
+  { value: 'plan', label: 'Plan', description: '生成计划文档 · Plan document', icon: ListChecks, tone: 'emerald' },
   {
     value: 'orchestrate',
     label: 'Orchestrate',
-    description: '主动派 Subagent · Proactive subagents',
+    description: '主代理统筹并行协作 · Parallel collaboration',
     icon: Network,
     tone: 'violet',
   },

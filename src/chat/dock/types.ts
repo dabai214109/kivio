@@ -66,6 +66,7 @@ export type GitDiffResult = {
   stat: string
   truncated: boolean
   binaryFiles: string[]
+  fileStats?: GitDiffStatFile[]
 }
 
 export type GitCommitItem = {
@@ -75,6 +76,7 @@ export type GitCommitItem = {
   authorName: string
   authorDate: string
   refs: string[]
+  parents?: string[]
 }
 
 export type GitLogResult = {
@@ -106,6 +108,11 @@ export type GitDiffStat = {
   additions: number
   deletions: number
   files: GitDiffStatFile[]
+}
+
+export type GitSnapshot = {
+  state: GitRepoState
+  diffStat: GitDiffStat | null
 }
 
 /** 变更类命令统一返回：state 为操作后的全新 GitRepoState。 */
@@ -223,6 +230,7 @@ export function normalizeGitDiffResult(raw: unknown): GitDiffResult {
     stat: pickString(record, 'stat', 'stat'),
     truncated: pickBoolean(record, 'truncated', 'truncated'),
     binaryFiles: pickStringArray(record, 'binaryFiles', 'binary_files'),
+    fileStats: normalizeGitDiffStat({ files: record.fileStats ?? record.file_stats }).files,
   }
 }
 
@@ -235,6 +243,7 @@ export function normalizeGitCommitItem(raw: unknown): GitCommitItem {
     authorName: pickString(record, 'authorName', 'author_name'),
     authorDate: pickString(record, 'authorDate', 'author_date'),
     refs: pickStringArray(record, 'refs', 'refs'),
+    parents: pickStringArray(record, 'parents', 'parents'),
   }
 }
 

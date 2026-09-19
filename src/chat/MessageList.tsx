@@ -26,7 +26,7 @@ import { CompactionSummaryPanel } from './CompactionSummaryPanel'
 import { ContextClearDivider } from './ContextClearDivider'
 import { resolveCompactionBoundaries, resolvePendingCompactionAfterIndex, type CompactionBoundaryView } from './compactionBoundary'
 import { resolveClearBoundaries, type ContextClearBoundaryView } from './contextClearBoundary'
-import { isExecutableAgentPlanText } from './agentPlan'
+import { hasAgentPlanText } from './agentPlan'
 import { foldMessageGroups, isLastAssistantTurn, occupiedReplyModels } from './messageGroups'
 import {
   activeMessageNavigatorNodeId,
@@ -139,8 +139,9 @@ const NAVIGATOR_UNLOCK_FRAMES = 10
 const NAVIGATOR_PENDING_SELECTOR = '[data-chat-heavy-hydrated="false"], [data-chat-async-pending="true"]'
 const NAVIGATOR_ALIGN_EPSILON_PX = 1
 const HEADING_NAVIGATOR_TOP_INSET_PX = 16
-// 会话切换遮罩：重内容一直晃也不能无限等，超时强制揭开。
+// 未响应的异步块不能无限挡住会话；超时后仍须等实际布局稳定。
 const OPEN_SETTLE_MAX_MS = 2_000
+const OPEN_SETTLE_QUIET_MS = 80
 
 
 
@@ -212,7 +213,7 @@ type GroupModelLabel = { providerId: string | null; model: string | null }
 
 function MessageListBase({
   conversationId,
-  messages,
+  messages: storedMessages,
   renderRequestId = 0,
   onInitialRender,
   agentPlanState = null,
@@ -238,6 +239,12 @@ function MessageListBase({
   focusMessageId = null,
   onFocusMessageHandled,
 }: MessageListProps) {
+  // Durable worker receipts belong to the model context and the task dock,
+  // not the parent timeline. Use the backend's reserved receipt identity so
+  // existing conversations are covered without hiding quoted report text.
+  const messages = useMemo(() => storedMessages.filter(message => !(
+    message.role === 'assistant' && message.id.startsWith('subagent-result-')
+  )), [storedMessages])
   useChatPerfRenderProbe('MessageList', {
     conversationId,
     messages: messages.length,
@@ -337,51 +344,70 @@ function MessageListBase({
   useLayoutEffect(() => {
     if (
       !contentEl
+      || !viewportEl
       || !conversationId
       || renderRequestId <= 0
       || committedRenderRequestRef.current === renderRequestId
     ) return
     let cancelled = false
     let readyRaf: number | null = null
-    let previousHeight = -1
+    let previousLayout = ''
     let stableFrames = 0
+    let stableSince = performance.now()
     const startedAt = performance.now()
 
     const completeNow = () => {
+      if (cancelled || committedRenderRequestRef.current === renderRequestId) return
       committedRenderRequestRef.current = renderRequestId
+      observer.disconnect()
       onInitialRender?.(conversationId, renderRequestId)
     }
 
-    const completeIfReady = (): boolean | null => {
-      // 超时硬揭开：病理高度抖动 / 异常 pending 不能让遮罩永远盖住。
-      if (performance.now() - startedAt >= OPEN_SETTLE_MAX_MS) {
+    const completeIfReady = (): boolean => {
+      const now = performance.now()
+      const pendingMedia = [...contentEl.querySelectorAll('img')].some(image => !image.complete)
+        || document.fonts?.status === 'loading'
+      const pendingBlock = Boolean(contentEl.querySelector(NAVIGATOR_PENDING_SELECTOR))
+      // Images update their aspect ratio on load; a stable placeholder is not
+      // their final geometry. Failed images are complete and do not block.
+      if (pendingMedia || (pendingBlock && now - startedAt < OPEN_SETTLE_MAX_MS)) {
+        previousLayout = ''
+        stableFrames = 0
+        stableSince = now
+        return false
+      }
+      // Active output is expected to keep changing. Once its mounted content
+      // is ready, don't make opening the conversation wait for the run to end.
+      if (streaming && !pendingBlock && now - startedAt >= OPEN_SETTLE_MAX_MS) {
         completeNow()
         return true
       }
 
-      // 仍有未就绪的 ChatHeavyIsland：高度会在稍后猛涨。
-      if (contentEl.querySelector(NAVIGATOR_PENDING_SELECTOR)) {
-        previousHeight = -1
-        stableFrames = 0
-        // null：停 rAF 轮询，等 MutationObserver 看到标记变化后再测。
-        return null
-      }
-
-      // 重内容到位后，虚拟列表还可能在下一帧用真实 DOM 高度修正 itemSizeCache /
-      // totalSize。至少连续两帧高度不变，才把覆盖层交还给正文。
-      const height = contentEl.scrollHeight
-      if (height === previousHeight) stableFrames += 1
+      // 虚拟列表总高是估算值；相邻行一增一减、宽度重排、滚动补偿都可能
+      // 不改变 scrollHeight。检查已挂载行的实际尺寸/位置以及视口，直到
+      // ResizeObserver → virtualizer → React 的纠正连续多帧安静下来。
+      const bounds = viewportEl.getBoundingClientRect()
+      const layout = JSON.stringify([
+        viewportEl.scrollTop, viewportEl.scrollHeight, bounds.top, bounds.width, bounds.height,
+        contentEl.scrollHeight, contentEl.clientWidth,
+        ...[...contentEl.querySelectorAll<HTMLElement>('[data-chat-reading-row]')].map(row => {
+          const rect = row.getBoundingClientRect()
+          return [row.dataset.messageId ?? row.dataset.chatRowIndex, rect.top - bounds.top, rect.width, rect.height]
+        }),
+      ])
+      if (layout === previousLayout) stableFrames += 1
       else {
-        previousHeight = height
+        previousLayout = layout
         stableFrames = 0
+        stableSince = now
       }
-      if (stableFrames < 2) return false
+      if (stableFrames < 2 || now - stableSince < OPEN_SETTLE_QUIET_MS) return false
 
       completeNow()
       return true
     }
     const scheduleReadyCheck = () => {
-      if (cancelled || readyRaf !== null) return
+      if (cancelled || readyRaf !== null || committedRenderRequestRef.current === renderRequestId) return
       readyRaf = requestAnimationFrame(() => {
         readyRaf = null
         if (completeIfReady() === false) scheduleReadyCheck()
@@ -389,6 +415,9 @@ function MessageListBase({
     }
 
     const observer = new MutationObserver(() => {
+      // 内容在两个采样之间换过，即使占位高度相同也重新等待布局交接。
+      stableFrames = 0
+      stableSince = performance.now()
       scheduleReadyCheck()
     })
     observer.observe(contentEl, {
@@ -397,19 +426,13 @@ function MessageListBase({
       childList: true,
       subtree: true,
     })
-    // 超时兜底：即使 observer/rAF 路径卡住也要揭开。
-    const timeoutId = window.setTimeout(() => {
-      if (cancelled || committedRenderRequestRef.current === renderRequestId) return
-      completeNow()
-    }, OPEN_SETTLE_MAX_MS)
     scheduleReadyCheck()
     return () => {
       cancelled = true
       observer.disconnect()
       if (readyRaf !== null) cancelAnimationFrame(readyRaf)
-      window.clearTimeout(timeoutId)
     }
-  }, [contentEl, conversationId, onInitialRender, renderRequestId])
+  }, [contentEl, viewportEl, conversationId, onInitialRender, renderRequestId, streaming])
 
 
   useLayoutEffect(() => {
@@ -502,9 +525,9 @@ function MessageListBase({
 
   const legacyPlanMessageId = useMemo(() => {
     const legacyPlan = agentPlanState?.plan?.trim()
-    if (!isExecutableAgentPlanText(legacyPlan)) return null
+    if (!hasAgentPlanText(legacyPlan)) return null
     const hasMessagePlan = historyMessages.some((message) => Boolean(
-      isExecutableAgentPlanText((message.agent_plan ?? message.agentPlan)?.plan),
+      hasAgentPlanText((message.agent_plan ?? message.agentPlan)?.plan),
     ))
     if (hasMessagePlan) return null
     return [...historyMessages]

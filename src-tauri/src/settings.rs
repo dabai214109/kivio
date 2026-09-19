@@ -257,6 +257,8 @@ impl CacheRetention {
 #[serde(rename_all = "camelCase", default)]
 pub struct ModelInfo {
     pub display_name: Option<String>,
+    /// Latest upstream capability; never takes precedence over an explicit override.
+    pub advertised_video_input: Option<bool>,
     pub context_window: Option<u64>,
     pub max_output: Option<u64>,
     /// 模型级采样温度；None 表示请求默认不发送 temperature。
@@ -281,6 +283,7 @@ pub struct ModelInfo {
 #[serde(rename_all = "camelCase", default)]
 pub struct ModelCapabilities {
     pub vision: Option<bool>,
+    pub video_input: Option<bool>,
     pub function_calling: Option<bool>,
     pub reasoning: Option<bool>,
     pub streaming: Option<bool>,
@@ -753,6 +756,9 @@ impl Default for LensConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ChatConfig {
+    /// Expose video analysis to the main agent. Never starts on attachment alone.
+    #[serde(default = "default_true")]
+    pub video_analysis_enabled: bool,
     #[serde(default = "default_true")]
     pub stream_enabled: bool,
     #[serde(default = "default_true")]
@@ -820,6 +826,7 @@ impl Default for ChatModeConfig {
 impl Default for ChatConfig {
     fn default() -> Self {
         Self {
+            video_analysis_enabled: true,
             stream_enabled: true,
             thinking_enabled: true,
             max_output_tokens: default_chat_max_output_tokens(),
@@ -954,7 +961,7 @@ impl Default for DefaultModelSelection {
 }
 
 impl DefaultModelSelection {
-    fn is_configured(&self) -> bool {
+    pub(crate) fn is_configured(&self) -> bool {
         !self.provider_id.trim().is_empty()
     }
 }
@@ -1005,6 +1012,9 @@ pub struct DefaultModelsConfig {
     pub chat: DefaultModelSelection,
     #[serde(default)]
     pub vision: DefaultModelSelection,
+    /// Video-capable auxiliary model; empty selects an enabled capable model automatically.
+    #[serde(default)]
+    pub video_analysis: DefaultModelSelection,
     #[serde(default)]
     pub title_summary: DefaultModelSelection,
     #[serde(default)]
@@ -1022,6 +1032,7 @@ impl Default for DefaultModelsConfig {
         Self {
             chat: DefaultModelSelection::default(),
             vision: DefaultModelSelection::default(),
+            video_analysis: DefaultModelSelection::default(),
             title_summary: DefaultModelSelection::default(),
             compression: DefaultModelSelection::default(),
             image_generation: DefaultModelSelection::default(),
@@ -1363,9 +1374,6 @@ pub const CHAT_TOOL_MIN_OUTPUT_CHARS: usize = 2_000;
 pub const CHAT_TOOL_MAX_OUTPUT_CHARS: usize = 200_000;
 /// 默认单条工具结果字符上限 ≈ 6K token（头 1/2 + 尾 1/4 保留约 3/4）。
 pub const DEFAULT_MAX_TOOL_OUTPUT_CHARS: usize = 24_000;
-/// Orchestrate 模式下的最低工具轮次预算：编排者主动 fan-out 子 agent + 先规划再分派，
-/// 单条用户消息内可能需要更多轮次，因此抬到 max(用户配置, 此值)，但不放开为无限。
-pub const ORCHESTRATE_MIN_TOOL_ROUNDS: u32 = 40;
 /// MCP 持久连接空闲超时下限：太小会让长连接频繁回收失去意义。
 pub const MCP_IDLE_TIMEOUT_MIN_MS: u64 = 60_000;
 /// MCP 持久连接空闲超时上限：避免死连接长期占用子进程。
@@ -2098,7 +2106,7 @@ pub fn skill_global_unavailable_error(
     if !crate::plugins::plugin_skill_available(skill_id) {
         if let Some(plugin_id) = crate::plugins::skill_owned_by_plugin(skill_id) {
             return Some(format!(
-                "Skill is managed by plugin «{plugin_id}» — enable it in 扩展 → 插件: {skill_name}"
+                "Skill belongs to operation tool «{plugin_id}» — enable it in 设置 → 电脑操控: {skill_name}"
             ));
         }
         return Some(format!("Skill is unavailable: {skill_name}"));
@@ -2350,6 +2358,7 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
         for selection in [
             &mut settings.default_models.chat,
             &mut settings.default_models.vision,
+            &mut settings.default_models.video_analysis,
             &mut settings.default_models.title_summary,
             &mut settings.default_models.compression,
             &mut settings.default_models.image_generation,
@@ -2439,6 +2448,7 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
 
         sanitize_default_model_selection(&mut settings.default_models.chat, &settings.providers);
         sanitize_default_model_selection(&mut settings.default_models.vision, &settings.providers);
+        sanitize_default_model_selection(&mut settings.default_models.video_analysis, &settings.providers);
         sanitize_default_model_selection(
             &mut settings.default_models.title_summary,
             &settings.providers,
@@ -2862,8 +2872,26 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
     }
     // Persist only the new single-directory setting after legacy migration.
     settings.chat_tools.native_tools.workspace_roots.clear();
+    let mut migrated_legacy_cua = false;
     for server in &mut settings.chat_tools.servers {
         server.id = server.id.trim().to_string();
+        let is_legacy_cua = server.id == crate::computer_control::LEGACY_CUA_MCP_SERVER_ID
+            || server.connector_id.as_deref().is_some_and(|id| {
+                id.trim() == crate::computer_control::LEGACY_CUA_MCP_CONNECTOR_ID
+            });
+        if is_legacy_cua {
+            migrated_legacy_cua = true;
+            server.id = crate::computer_control::CUA_MCP_SERVER_ID.to_string();
+            server.name = "Cua Driver".to_string();
+            server.connector_id = None;
+            server.transport = "stdio".to_string();
+            if server.command.trim().is_empty() {
+                server.command = "cua-driver".to_string();
+            }
+            if server.args.is_empty() {
+                server.args = vec!["mcp".to_string()];
+            }
+        }
         if server.id.is_empty() {
             server.id = format!("mcp-{}", uuid::Uuid::new_v4());
         }
@@ -2933,6 +2961,29 @@ pub fn sanitize_settings(mut settings: Settings) -> Settings {
                 Some(trimmed)
             }
         });
+    }
+    let mut seen_server_ids = std::collections::HashSet::new();
+    settings
+        .chat_tools
+        .servers
+        .retain(|server| seen_server_ids.insert(server.id.clone()));
+    if migrated_legacy_cua {
+        let enabled = settings
+            .chat_tools
+            .servers
+            .iter()
+            .find(|server| server.id == crate::computer_control::CUA_MCP_SERVER_ID)
+            .is_some_and(|server| server.enabled);
+        settings
+            .chat_tools
+            .disabled_skill_ids
+            .retain(|id| id != "cua-driver");
+        if !enabled {
+            settings
+                .chat_tools
+                .disabled_skill_ids
+                .push("cua-driver".to_string());
+        }
     }
 
     // 清理归档目录路径（去除首尾空白）
@@ -4793,6 +4844,60 @@ mod tests {
         let server = &s.chat_tools.servers[0];
         assert_eq!(server.transport, "stdio");
         assert_eq!(server.command, "npx");
+    }
+
+    #[test]
+    fn sanitize_settings_moves_cua_mcp_out_of_plugins() {
+        let mut s = Settings::default();
+        s.chat_tools.servers.push(ChatMcpServer {
+            id: "plugin-cua-driver".to_string(),
+            name: "Cua Driver (插件)".to_string(),
+            enabled: true,
+            transport: "stdio".to_string(),
+            command: "cua-driver".to_string(),
+            args: vec!["mcp".to_string()],
+            connector_id: Some("plugin:cua-driver".to_string()),
+            ..Default::default()
+        });
+
+        let s = sanitize_settings(s);
+        let server = &s.chat_tools.servers[0];
+        assert_eq!(server.id, "computer-control-cua-driver");
+        assert_eq!(server.name, "Cua Driver");
+        assert_eq!(server.connector_id, None);
+        assert_eq!(server.args, vec!["mcp".to_string()]);
+        assert!(server.enabled);
+        assert!(!s
+            .chat_tools
+            .disabled_skill_ids
+            .contains(&"cua-driver".to_string()));
+    }
+
+    #[test]
+    fn sanitize_settings_keeps_disabled_legacy_cua_disabled() {
+        let mut s = Settings::default();
+        s.chat_tools.servers.push(ChatMcpServer {
+            id: "plugin-cua-driver".to_string(),
+            name: "Cua Driver (插件)".to_string(),
+            enabled: false,
+            transport: "stdio".to_string(),
+            command: "cua-driver".to_string(),
+            args: vec!["mcp".to_string()],
+            connector_id: Some("plugin:cua-driver".to_string()),
+            ..Default::default()
+        });
+
+        let s = sanitize_settings(s);
+
+        assert_eq!(
+            s.chat_tools.servers[0].id,
+            crate::computer_control::CUA_MCP_SERVER_ID
+        );
+        assert!(!s.chat_tools.servers[0].enabled);
+        assert!(s
+            .chat_tools
+            .disabled_skill_ids
+            .contains(&"cua-driver".to_string()));
     }
 
     #[test]

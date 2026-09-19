@@ -241,13 +241,18 @@ fn model_database_entry(model: &str) -> Option<&'static Value> {
 /// Resolve Kimi Code aliases only for its own provider, without widening global matching.
 fn provider_model_database_id<'a>(provider: Option<&ModelProvider>, model: &'a str) -> &'a str {
     let kimi = provider.is_some_and(|p| {
-        p.request.oauth.as_ref().is_some_and(|a| a.provider == "kimi")
+        p.request
+            .oauth
+            .as_ref()
+            .is_some_and(|a| a.provider == "kimi")
             || reqwest::Url::parse(&p.base_url).ok().is_some_and(|url| {
                 url.host_str() == Some("api.kimi.com")
                     && (url.path() == "/coding" || url.path().starts_with("/coding/"))
             })
     });
-    if !kimi { return model; }
+    if !kimi {
+        return model;
+    }
     match model.trim().to_ascii_lowercase().as_str() {
         "k3" => "kimi-code/k3",
         "k3-256k" => "kimi-code/k3-256k",
@@ -618,6 +623,21 @@ pub(crate) fn model_supports_vision(provider: Option<&ModelProvider>, model: &st
         .or_else(|| model_database_vision(provider_model_database_id(Some(provider), model)))
 }
 
+pub(crate) fn model_supports_video(provider: &ModelProvider, model: &str) -> Option<bool> {
+    provider
+        .model_overrides
+        .get(model)
+        .and_then(|info| info.capabilities.as_ref())
+        .and_then(|caps| caps.video_input)
+        .or_else(|| provider.model_overrides.get(model)?.advertised_video_input)
+        .or_else(|| {
+            model_database_entry(provider_model_database_id(Some(provider), model))?
+                .get("capabilities")?
+                .get("videoInput")?
+                .as_bool()
+        })
+}
+
 /// 归一化模型名：小写 + 去 `models/` 前缀 + trim。出图路由 / override 生图能力判定 /
 /// `is_image_output_model` / 名字启发式统一走这里，消除「换大小写/加 `models/` 前缀就路由错、
 /// override 精确匹配静默失效」三类脆弱。
@@ -777,7 +797,8 @@ pub(crate) fn context_window_for_model(
     ) {
         return (tokens, false);
     }
-    if let Some(tokens) = model_database_context_window(provider_model_database_id(provider, model)) {
+    if let Some(tokens) = model_database_context_window(provider_model_database_id(provider, model))
+    {
         return (tokens, false);
     }
 
@@ -867,7 +888,8 @@ pub(crate) fn pricing_for_model(
     ) {
         return Some((pricing, "user_override".to_string()));
     }
-    model_database_pricing(provider_model_database_id(provider, model)).map(|pricing| (pricing, "model_pricing".to_string()))
+    model_database_pricing(provider_model_database_id(provider, model))
+        .map(|pricing| (pricing, "model_pricing".to_string()))
 }
 
 #[cfg(test)]
@@ -877,6 +899,38 @@ mod tests {
     use crate::settings::{ModelInfo, ModelProvider};
 
     use super::*;
+
+    #[test]
+    fn imported_video_models_use_database_defaults() {
+        let provider = test_provider_with_overrides(HashMap::new());
+        for model in [
+            "kimi-k2.7-code",
+            "kimi-k2.7-code-highspeed",
+            "moonshotai/kimi-k2.7-code",
+            "gemini-3-pro-preview",
+            "models/gemini-3-pro-preview",
+            "gemini-3.1-pro-preview",
+            "gemini-3.8-flash",
+        ] {
+            assert_eq!(
+                model_supports_video(&provider, model),
+                Some(true),
+                "{model}"
+            );
+        }
+        for model in [
+            "gemini-3-pro-image-preview",
+            "gemini-embedding-001",
+            "kimi-k2",
+            "kimi-k2.7",
+        ] {
+            assert_ne!(
+                model_supports_video(&provider, model),
+                Some(true),
+                "{model}"
+            );
+        }
+    }
 
     fn db_display_name(model: &str) -> Option<String> {
         model_database_entry(model)
@@ -1021,7 +1075,7 @@ mod tests {
         );
         assert_eq!(
             db_display_name("deepseek-v4-flash-vision-exp").as_deref(),
-            Some("DeepSeek V4 Flash Vision Exp")
+            Some("DeepSeek V4.1 Flash (Legacy Vision Alias)")
         );
         assert_eq!(
             db_display_name("qwen3.5-plus").as_deref(),
@@ -1422,8 +1476,14 @@ mod tests {
     fn kimi_code_aliases_are_provider_scoped() {
         let mut provider = test_provider_with_overrides(HashMap::new());
         provider.base_url = "https://api.kimi.com/coding/v1".into();
-        assert_eq!(context_window_for_model(Some(&provider), "k3-256k"), (262144, false));
-        assert_eq!(reasoning_efforts_for_model(Some(&provider), "k3"), vec!["low", "high", "max"]);
+        assert_eq!(
+            context_window_for_model(Some(&provider), "k3-256k"),
+            (262144, false)
+        );
+        assert_eq!(
+            reasoning_efforts_for_model(Some(&provider), "k3"),
+            vec!["low", "high", "max"]
+        );
         assert!(pricing_for_model(Some(&provider), "k3").is_none());
         assert_eq!(model_supports_vision(Some(&provider), "k3"), Some(true));
         provider.base_url = "https://example.com/v1".into();
@@ -1437,14 +1497,29 @@ mod tests {
         let mut provider = test_provider_with_overrides(HashMap::new());
         provider.api_format = "gemini".into();
         assert!(builtin_web_search_supported(&provider));
-        assert_eq!(WebSearchMode::Builtin.for_provider(&provider), WebSearchMode::Builtin);
-        provider.request.oauth = Some(serde_json::from_value(serde_json::json!({
-            "provider": "antigravity"
-        })).unwrap());
+        assert_eq!(
+            WebSearchMode::Builtin.for_provider(&provider),
+            WebSearchMode::Builtin
+        );
+        provider.request.oauth = Some(
+            serde_json::from_value(serde_json::json!({
+                "provider": "antigravity"
+            }))
+            .unwrap(),
+        );
         assert!(!builtin_web_search_supported(&provider));
-        assert_eq!(WebSearchMode::Builtin.for_provider(&provider), WebSearchMode::ThirdParty);
-        assert_eq!(WebSearchMode::Off.for_provider(&provider), WebSearchMode::Off);
-        assert_eq!(WebSearchMode::ThirdParty.for_provider(&provider), WebSearchMode::ThirdParty);
+        assert_eq!(
+            WebSearchMode::Builtin.for_provider(&provider),
+            WebSearchMode::ThirdParty
+        );
+        assert_eq!(
+            WebSearchMode::Off.for_provider(&provider),
+            WebSearchMode::Off
+        );
+        assert_eq!(
+            WebSearchMode::ThirdParty.for_provider(&provider),
+            WebSearchMode::ThirdParty
+        );
     }
 
     #[test]
@@ -1454,16 +1529,27 @@ mod tests {
         provider.api_format = "gemini".into();
         let model = "gemini-3.8-flash-low";
         assert!(!reasoning_efforts_for_model(Some(&provider), model).is_empty());
-        provider.request.oauth = Some(serde_json::from_value(serde_json::json!({
-            "provider": "antigravity"
-        })).unwrap());
-        for model in ["gemini-3.8-flash-low", "gemini-3.8-flash-high", "gpt-oss-120b-medium"] {
+        provider.request.oauth = Some(
+            serde_json::from_value(serde_json::json!({
+                "provider": "antigravity"
+            }))
+            .unwrap(),
+        );
+        for model in [
+            "gemini-3.8-flash-low",
+            "gemini-3.8-flash-high",
+            "gpt-oss-120b-medium",
+        ] {
             assert!(reasoning_efforts_for_model(Some(&provider), model).is_empty());
-            let request = antigravity::wrap_request(&provider, model, serde_json::json!({
-                "generationConfig": {"thinkingConfig": {
-                    "includeThoughts": true, "thinkingLevel": "HIGH", "thinkingBudget": 8192
-                }}
-            }));
+            let request = antigravity::wrap_request(
+                &provider,
+                model,
+                serde_json::json!({
+                    "generationConfig": {"thinkingConfig": {
+                        "includeThoughts": true, "thinkingLevel": "HIGH", "thinkingBudget": 8192
+                    }}
+                }),
+            );
             let thinking = &request["request"]["generationConfig"]["thinkingConfig"];
             assert!(thinking.get("thinkingLevel").is_none());
             assert!(thinking.get("thinkingBudget").is_none());

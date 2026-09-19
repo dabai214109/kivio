@@ -47,6 +47,7 @@ export function MixerTab({
             className="shrink-0"
             onClick={() => {
               onUpdateDefaultModel('vision', '', '')
+              onUpdateDefaultModel('videoAnalysis', '', '')
               onUpdateDefaultModel('titleSummary', '', '')
               onUpdateDefaultModel('compression', '', '')
               onUpdateDefaultModel('imageGeneration', '', '')
@@ -70,6 +71,26 @@ export function MixerTab({
             }
             onChange={(providerId, model) => {
               onUpdateDefaultModel('vision', providerId, model)
+            }}
+          />
+        </SettingRow>
+        <SettingRow label={t.videoAnalysisModel} description={t.videoAnalysisModelHint}>
+          <ModelPairSelect
+            providerId={settings.defaultModels.videoAnalysis?.providerId || ''}
+            model={settings.defaultModels.videoAnalysis?.model || ''}
+            providers={settings.providers}
+            inheritLabel={t.mixerAutoVisionModel}
+            offOption={{
+              label: lang === 'zh' ? '关闭' : 'Off',
+              selected: settings.chat?.videoAnalysisEnabled === false,
+              onSelect: () => onUpdateChat({ videoAnalysisEnabled: false }),
+            }}
+            filterModel={(provider, model) =>
+              resolveModelInfo(model, provider.modelOverrides, provider).capabilities?.videoInput === true
+            }
+            onChange={(providerId, model) => {
+              onUpdateDefaultModel('videoAnalysis', providerId, model)
+              onUpdateChat({ videoAnalysisEnabled: true })
             }}
           />
         </SettingRow>

@@ -168,7 +168,7 @@ describe('MessageList ← streamingStore 集成', () => {
     expect(onExecute).toHaveBeenCalledWith('msg-plan')
   })
 
-  it('does not attach a legacy agent plan row to non-plan text', async () => {
+  it('preserves explicit legacy plan metadata without grading its prose', async () => {
     render(
       <MessageList
         conversationId="c-plan-fragment"
@@ -184,8 +184,8 @@ describe('MessageList ← streamingStore 集成', () => {
     )
     await flush()
 
-    expect(screen.queryByText('计划草案')).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: '执行这条计划' })).not.toBeInTheDocument()
+    expect(screen.getByText('计划草案')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '执行这条计划' })).toBeInTheDocument()
   })
 
   it('applyStreamSnapshotToState 等价：内容快照 + coarse streaming → 渲染流式预览文本', async () => {

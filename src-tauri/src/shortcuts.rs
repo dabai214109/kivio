@@ -4,7 +4,7 @@ use arboard::Clipboard;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
-use crate::commands::apply_launch_at_startup;
+use crate::commands::{apply_launch_at_startup, should_apply_launch_at_startup};
 use crate::lens_commands::{
     lens_close, lens_request, lens_request_replace, lens_request_screenshot,
     lens_request_translate, lens_request_translate_text, request_lens_close,
@@ -966,8 +966,11 @@ pub(crate) fn restore_runtime_settings(
     state: &State<AppState>,
     previous: &Settings,
 ) {
-    if let Err(err) = apply_launch_at_startup(app, previous.launch_at_startup) {
-        eprintln!("Failed to rollback launch-at-startup setting: {err}");
+    let current_startup = state.settings_read().launch_at_startup;
+    if should_apply_launch_at_startup(Some(current_startup), previous.launch_at_startup) {
+        if let Err(err) = apply_launch_at_startup(app, previous.launch_at_startup) {
+            eprintln!("Failed to rollback launch-at-startup setting: {err}");
+        }
     }
 
     {
@@ -1356,6 +1359,9 @@ pub(crate) fn setup_tray(app: &AppHandle) -> Result<(), String> {
         return Ok(());
     }
 
+    #[cfg(target_os = "windows")]
+    let icon_bytes = include_bytes!("../icons/windows-tray.png");
+    #[cfg(not(target_os = "windows"))]
     let icon_bytes = include_bytes!("../icons/tray-icon.png");
     let icon_image = image::load_from_memory(icon_bytes)
         .map_err(|e| e.to_string())?
@@ -1367,9 +1373,9 @@ pub(crate) fn setup_tray(app: &AppHandle) -> Result<(), String> {
             width,
             height,
         ))
-        // macOS template image：纯黑透明 PNG,系统按 light/dark 主题自动反色为白
-        // (Windows/Linux 上 ignore 此 flag,直接显示原图)
-        .icon_as_template(true)
+        // macOS uses a monochrome template; Windows uses the colored app icon
+        // with its white plate so it remains visible on light and dark taskbars.
+        .icon_as_template(cfg!(target_os = "macos"))
         .menu(&menu)
         .show_menu_on_left_click(false)
         .on_menu_event(|app, event| match event.id().as_ref() {

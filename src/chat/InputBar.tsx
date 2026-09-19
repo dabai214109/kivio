@@ -31,6 +31,7 @@ import {
 import { ChatAttachments } from './ChatAttachments'
 import { PastedTextEditorModal } from './PastedTextEditorModal'
 import { ComposerAddMenu } from './ComposerAddMenu'
+import { useComposerContextMenu, type ComposerPasteTarget } from './useComposerContextMenu'
 import { SourcesButton } from './SourcesButton'
 import { onComposerInsert, onComposerTextInsert } from './composerInsert'
 import { draftKey, getComposerDraft, migrateNewChatDraft, setComposerDraft } from './composerDraft'
@@ -57,6 +58,7 @@ import {
 import { mapExternalCliSlashCommands, externalCliAgentLabel } from './externalCliSlashCommands'
 import type { ModeOption, ModeTone } from './permissionModes'
 import { isTauriRuntime } from './utils'
+import { isVideoFile } from './attachmentType'
 
 const IMAGE_EXTENSIONS = ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'tiff', 'tif', 'heic', 'heif']
 /** 与 `index.css` 问题优化出场 / 入场时长对齐：`--kv-dur-slow`、`slow + fast`。 */
@@ -203,7 +205,7 @@ const LOCAL_SLASH_COMMANDS: LocalSlashCommand[] = [
     id: 'orchestrate',
     slash: '/orchestrate',
     title: '/orchestrate',
-    description: 'Enter orchestrate mode (proactive subagents)',
+    description: 'Enter orchestrate mode (lead parallel collaboration)',
     category: 'Local',
     kind: 'action',
     keywords: ['orchestrate', 'agent', 'subagent', 'fanout', 'mode', '编排', 'subagents', '子代理', '模式', '切换'],
@@ -401,6 +403,7 @@ export interface InputBarProps {
   agentPlanState?: AgentPlanState | null
   agentTodoState?: AgentTodoState | null
   goalSlot?: ReactNode
+  subAgentSlot?: ReactNode
   onAgentPlanModeChange?: (mode: AgentPlanMode) => void | Promise<void>
   enabledSkills?: SlashSkill[]
   onOpenSkillSettings?: () => void
@@ -491,6 +494,7 @@ export const InputBar = memo(function InputBar({
   agentPlanState = null,
   agentTodoState = null,
   goalSlot,
+  subAgentSlot,
   onAgentPlanModeChange,
   enabledSkills = [],
   onOpenSkillSettings,
@@ -684,7 +688,7 @@ export const InputBar = memo(function InputBar({
         const normalized = path.replace(/\\/g, '/')
         const name = normalized.split('/').filter(Boolean).pop() || t.chatAttachmentFallbackName
         const ext = name.split('.').pop()?.toLowerCase() ?? ''
-        const type: PendingAttachment['type'] = IMAGE_EXTENSIONS.includes(ext) ? 'image' : 'file'
+        const type: PendingAttachment['type'] = IMAGE_EXTENSIONS.includes(ext) ? 'image' : isVideoFile(name) ? 'video' : 'file'
         return {
           id: `pending-att-${crypto.randomUUID()}`,
           type,
@@ -830,7 +834,10 @@ export const InputBar = memo(function InputBar({
     })
   }, [])
 
-  useEffect(() => onComposerTextInsert(insertTextAtEnd), [insertTextAtEnd])
+  useEffect(
+    () => onComposerTextInsert(insertTextAtEnd, draftKeyValue),
+    [draftKeyValue, insertTextAtEnd],
+  )
 
   const syncSlashToken = useCallback((value: string, cursor: number) => {
     const token = findActiveSlashToken(value, cursor)
@@ -1466,8 +1473,12 @@ export const InputBar = memo(function InputBar({
     syncSlashToken(el.value, el.selectionStart)
   }
 
-  const handlePaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    if (composerLocked || !isTauriRuntime()) return
+  const handlePaste = async (
+    e: { clipboardData: Pick<DataTransfer, 'files' | 'getData'>; preventDefault: () => void },
+    menuTarget?: ComposerPasteTarget,
+    knownNativePaths?: string[],
+  ) => {
+    if (composerLocked || optimizeBusy || (!isTauriRuntime() && !menuTarget)) return
 
     const attachableClipboardFiles = Array.from(e.clipboardData.files).filter(isAttachableClipboardFile)
     const textarea = textareaRef.current
@@ -1484,16 +1495,19 @@ export const InputBar = memo(function InputBar({
       e.preventDefault()
     }
 
-    const nativePaths: string[] = []
+    const nativePaths: string[] = knownNativePaths ?? []
     try {
-      const native = await api.chatReadClipboardFiles()
-      if (native.success && native.files?.length) {
-        nativePaths.push(...native.files.map((file) => file.path))
+      if (!knownNativePaths && isTauriRuntime()) {
+        const native = await api.chatReadClipboardFiles()
+        if (native.success && native.files?.length) {
+          nativePaths.push(...native.files.map((file) => file.path))
+        }
       }
     } catch (err) {
       console.error('Failed to read clipboard files:', err)
     }
 
+    if (menuTarget && !menuTarget.isCurrent()) return
     const hasNativeFiles = nativePaths.length > 0
     const hasClipboardFiles = attachableClipboardFiles.length > 0
 
@@ -1510,11 +1524,11 @@ export const InputBar = memo(function InputBar({
             content: clipText,
           },
         ])
-      }
+      } else if (clipText) menuTarget?.insertText(clipText)
       return
     }
 
-    if (hasNativeFiles && textarea) {
+    if (hasNativeFiles && textarea && !menuTarget) {
       // 等浏览器默认粘贴与 React onChange 完成后，只在内容完全等于“插入了文件名”时撤销。
       window.setTimeout(() => {
         undoAccidentalFilenamePaste(
@@ -1571,7 +1585,7 @@ export const InputBar = memo(function InputBar({
         }
         pastedAttachments.push({
           id: `pending-att-${crypto.randomUUID()}`,
-          type: 'file',
+          type: isVideoFile(result.name) ? 'video' : 'file',
           name: result.name,
           path: result.path,
         })
@@ -1582,7 +1596,7 @@ export const InputBar = memo(function InputBar({
         return
       }
 
-      addAttachments(pastedAttachments)
+      if (!menuTarget || menuTarget.isCurrent()) addAttachments(pastedAttachments)
     } catch (err) {
       console.error('Failed to paste chat attachment:', err)
       setAttachmentError(
@@ -1590,6 +1604,49 @@ export const InputBar = memo(function InputBar({
       )
     }
   }
+
+  const composerContextMenu = useComposerContextMenu({
+    textareaRef, scopeKey: draftKeyValue, readOnly: composerLocked || optimizeBusy,
+    onError: setAttachmentError,
+    onPaste: async (target) => {
+      // 桌面端全部走系统剪贴板；WebView 的 read/readText 会弹出网站权限请求。
+      let nativePaths: string[] = []
+      const clipboard = new DataTransfer()
+      if (isTauriRuntime()) {
+        const content = await api.chatReadClipboard()
+        if (!target.isCurrent()) return
+        if (content.kind === 'files') nativePaths = content.paths
+        if (content.kind === 'text') clipboard.setData('text/plain', content.text)
+        if (content.kind === 'image') {
+          const bytes = Uint8Array.from(atob(content.dataBase64), char => char.charCodeAt(0))
+          clipboard.items.add(new File([bytes], 'pasted-image.png', { type: 'image/png' }))
+        }
+        await handlePaste({ clipboardData: clipboard, preventDefault: () => {} }, target, nativePaths)
+        return
+      }
+      if (!target.isCurrent()) return
+      if (!nativePaths.length) {
+        if (navigator.clipboard?.read) {
+          const items = await navigator.clipboard.read()
+          for (const item of items) {
+            const imageType = item.types.find(type => type.startsWith('image/'))
+            if (imageType) {
+              const blob = await item.getType(imageType)
+              clipboard.items.add(new File([blob], `pasted-image.${imageExtensionForMime(imageType)}`, { type: imageType }))
+            } else if (item.types.includes('text/plain')) {
+              clipboard.setData('text/plain', await (await item.getType('text/plain')).text())
+            }
+          }
+        } else if (navigator.clipboard?.readText) {
+          clipboard.setData('text/plain', await navigator.clipboard.readText())
+        } else {
+          throw new Error('Clipboard is unavailable')
+        }
+      }
+      if (!target.isCurrent()) return
+      await handlePaste({ clipboardData: clipboard, preventDefault: () => {} }, target, nativePaths)
+    },
+  })
 
   const removeAttachment = (id: string) => {
     setAttachments((prev) => prev.filter((attachment) => attachment.id !== id))
@@ -2013,7 +2070,7 @@ export const InputBar = memo(function InputBar({
           </div>
         )}
         {/* ① 状态条：「你在哪 + 在做什么 + 改了多少」—— 项目/集、当前 todo、diff 徽标。 */}
-        {(statusBarVisible || todoBarVisible || goalSlot || gitStatusEnabled) && (
+        {(statusBarVisible || todoBarVisible || goalSlot || subAgentSlot || gitStatusEnabled) && (
           <div className="chat-composer-status" data-tauri-drag-region="false">
             {statusBarVisible && effectiveProject && (
               <div className="relative min-w-0">
@@ -2073,6 +2130,7 @@ export const InputBar = memo(function InputBar({
                 onOpenGitPanel={onOpenGitPanel}
               />
             )}
+            {subAgentSlot}
           </div>
         )}
 
@@ -2165,6 +2223,7 @@ export const InputBar = memo(function InputBar({
                 aria-busy={sendPending || optimizeBusy}
                 onChange={handleInput}
                 onPaste={(e) => void handlePaste(e)}
+                onContextMenu={composerContextMenu.onContextMenu}
                 onKeyDown={handleKeyDown}
                 onSelect={handleSelect}
                 onScroll={syncSlashHighlightScroll}
@@ -2195,6 +2254,7 @@ export const InputBar = memo(function InputBar({
                     : 'text-neutral-900 dark:text-neutral-100'
                 } ${optimizing ? 'is-optimizing' : ''} ${optimizeMotion === 'out' ? 'is-optimize-out' : ''} ${optimizeMotion === 'in' ? 'is-optimize-reveal' : ''}`}
               />
+              {composerContextMenu.menu}
             </div>
 
             {/* 发送 / 停止：绝对定位在输入行右侧。两按钮共存于同一槽位，做 opacity+scale

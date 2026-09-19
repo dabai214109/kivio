@@ -42,13 +42,22 @@ pub fn enqueue(
     enqueue_mode(app, id, origin, until_node_id, input, None)
 }
 
-pub fn test_node(app: AppHandle, id: String, node_id: String, input: NodeOutput) -> Result<AutomationRunStarted, String> {
+pub fn test_node(
+    app: AppHandle,
+    id: String,
+    node_id: String,
+    input: NodeOutput,
+) -> Result<AutomationRunStarted, String> {
     enqueue_mode(app, id, RunOrigin::Manual, None, Some(input), Some(node_id))
 }
 
 fn enqueue_mode(
-    app: AppHandle, id: String, origin: RunOrigin, until_node_id: Option<String>,
-    input: Option<NodeOutput>, single_node_id: Option<String>,
+    app: AppHandle,
+    id: String,
+    origin: RunOrigin,
+    until_node_id: Option<String>,
+    input: Option<NodeOutput>,
+    single_node_id: Option<String>,
 ) -> Result<AutomationRunStarted, String> {
     let automation = storage::get(&app, &id)?;
     execution_start(&automation, origin, single_node_id.as_deref())?;
@@ -79,7 +88,11 @@ fn enqueue_mode(
     let mut record = AutomationRun {
         id: run_id.clone(),
         automation_id: id.clone(),
-        origin: if single_node_id.is_some() { "test".into() } else { origin.as_str().into() },
+        origin: if single_node_id.is_some() {
+            "test".into()
+        } else {
+            origin.as_str().into()
+        },
         status: "running".into(),
         started_at: now_iso(),
         finished_at: None,
@@ -218,13 +231,23 @@ fn snapshot(output: &NodeOutput) -> Option<NodeOutput> {
     (serde_json::to_vec(output).ok()?.len() <= 512 * 1024).then(|| output.clone())
 }
 
-fn execution_start<'a>(automation: &'a Automation, origin: RunOrigin, single: Option<&str>) -> Result<&'a FlowNode, String> {
+fn execution_start<'a>(
+    automation: &'a Automation,
+    origin: RunOrigin,
+    single: Option<&str>,
+) -> Result<&'a FlowNode, String> {
     if let Some(id) = single {
-        let node = automation.nodes.iter().find(|node| node.id == id).ok_or("node does not exist")?;
+        let node = automation
+            .nodes
+            .iter()
+            .find(|node| node.id == id)
+            .ok_or("node does not exist")?;
         if !node.node_type.starts_with("action.") && !node.node_type.starts_with("logic.") {
             return Err("only action and logic nodes can be tested".into());
         }
-        if node_disabled(&node.data) { return Err("enable the node before testing it".into()); }
+        if node_disabled(&node.data) {
+            return Err("enable the node before testing it".into());
+        }
         Ok(node)
     } else {
         start_trigger(automation, origin).ok_or_else(|| "no enabled trigger for this run".into())
@@ -248,8 +271,11 @@ async fn execute_graph(
         Err(error) => return finish_run(app, record, "error", Some(error)),
     };
 
-    let mut incoming = if single_node_id.is_some() { input.unwrap_or_else(|| NodeOutput::from_text("")) }
-        else { seed_incoming(origin, &record.started_at, input) };
+    let mut incoming = if single_node_id.is_some() {
+        input.unwrap_or_else(|| NodeOutput::from_text(""))
+    } else {
+        seed_incoming(origin, &record.started_at, input)
+    };
     let mut queue = VecDeque::from([(trigger.id.clone(), incoming.clone())]);
     let mut visited = HashSet::new();
     let mut hit_until = until_node_id.is_none();
@@ -281,7 +307,10 @@ async fn execute_graph(
         let handle_hint = match result {
             Ok((mut output, next_handle)) => {
                 output.sources = prev.sources.clone();
-                output.sources.insert(node.id.clone(), json!({ "text": output.text, "json": output.json }));
+                output.sources.insert(
+                    node.id.clone(),
+                    json!({ "text": output.text, "json": output.json }),
+                );
                 let preview = clip(&output.text, 2000);
                 let status = if node_disabled(&node.data) {
                     "skipped"
@@ -407,7 +436,9 @@ async fn execute_node(
         };
         return Ok((prev.clone(), handle));
     }
-    if node.node_type != "action.agent" { check_references(&node.data, prev)?; }
+    if node.node_type != "action.agent" {
+        check_references(&node.data, prev)?;
+    }
     match node.node_type.as_str() {
         t if t.starts_with("trigger.") => Ok((trigger_output(origin, t, prev), None)),
         t if t.starts_with("agent.") => Ok((prev.clone(), None)),
@@ -1498,7 +1529,12 @@ mod tests {
     #[test]
     fn isolated_test_starts_at_requested_action_even_without_a_trigger() {
         let mut automation = graph(vec![node("step", "action.set")]);
-        assert_eq!(execution_start(&automation, RunOrigin::Manual, Some("step")).unwrap().id, "step");
+        assert_eq!(
+            execution_start(&automation, RunOrigin::Manual, Some("step"))
+                .unwrap()
+                .id,
+            "step"
+        );
         assert!(execution_start(&automation, RunOrigin::Manual, None).is_err());
         assert!(execution_start(&automation, RunOrigin::Manual, Some("missing")).is_err());
         automation.nodes[0].data = json!({"disabled": true});

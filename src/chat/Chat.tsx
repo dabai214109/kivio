@@ -1,7 +1,11 @@
+import { refreshSubAgents } from './useSubAgents'
+import { SubAgentIndicator } from './SubAgentPanel'
+import { freezeCancelledStream, isLocallyCancelledPayload } from './streamCancellation'
 import { lazy, memo, Profiler, startTransition, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ProfilerOnRenderCallback, type ReactNode, type Ref } from 'react'
 import { PanelRight, SquareArrowOutUpRight } from 'lucide-react'
 import { type ConversationSelectionScope, type ExtensionsNavItem } from './Sidebar'
 import { ChatSidebarPane } from './ChatSidebarPane'
+import { completeSettingsExit, type PendingSettingsAction } from './settingsExit'
 import { useChatRouting } from './hooks/useChatRouting'
 import { useExternalSendQueue } from './hooks/useExternalSendQueue'
 import { useMessageQueue } from './hooks/useMessageQueue'
@@ -33,6 +37,7 @@ import { AskUserBlock } from './AskUserBlock'
 import { AsyncQuestionsContext } from './asyncQuestionsContext'
 import { ChatTitlebar } from './ChatTitlebar'
 import { withExternalModel } from './externalModelEffort'
+import { findUnavailableRecommendedTools } from './toolAvailability'
 import { ChatTitlebarActions } from './ChatTitlebarActions'
 import {
   beginConversationTransition,
@@ -53,7 +58,6 @@ import { PermissionPicker } from './PermissionPicker'
 import { deriveDshPresetModes, derivePermissionModes, useDetectedExternalAgents, useDshCustomPresets } from './permissionModes'
 import { BackgroundJobsIndicator } from './BackgroundJobsIndicator'
 import { ContextIndicator } from './ContextIndicator'
-import { isExecutableAgentPlanText } from './agentPlan'
 import {
   agentRuntimesEqual,
   BUILTIN_AGENT_RUNTIME,
@@ -126,7 +130,7 @@ import {
 import { RightDock, type DockPreviewRequest, type DockRevealRequest, type DockTab } from './dock/RightDock'
 import { dockApi } from './dock/api'
 import { insertTextIntoComposer } from './composerInsert'
-import { onDockDiffPreviewRequest, onDockMarkdownPreviewRequest, onDockPreviewRequest, requestDockMarkdownPreview } from './dock/dockPreview'
+import { onDockSubAgentRequest, onDockDiffPreviewRequest, onDockMarkdownPreviewRequest, onDockPreviewRequest, requestDockMarkdownPreview } from './dock/dockPreview'
 import { IconButton } from '../components/Button'
 import { isTauriRuntime } from './utils'
 import { hasEnabledNativeBuiltinTool, hasEnabledSkillRuntime } from '../utils/chatTools'
@@ -288,7 +292,6 @@ const ChatSettingsPane = memo(function ChatSettingsPane({
   onClose,
   onSettingsChange,
   onReady,
-  onRequestPluginAiInstall,
   sessionLibrary,
   onRender,
 }: {
@@ -300,7 +303,6 @@ const ChatSettingsPane = memo(function ChatSettingsPane({
   onClose: () => void
   onSettingsChange: () => void
   onReady: () => void
-  onRequestPluginAiInstall: (pluginId: string) => void | Promise<void>
   sessionLibrary: NonNullable<SettingsShellProps['sessionLibrary']>
   onRender: ProfilerOnRenderCallback
 }) {
@@ -320,7 +322,6 @@ const ChatSettingsPane = memo(function ChatSettingsPane({
             onClose={onClose}
             onSettingsChange={onSettingsChange}
             onReady={onReady}
-            onRequestPluginAiInstall={onRequestPluginAiInstall}
             sessionLibrary={sessionLibrary}
           />
         </Profiler>
@@ -451,16 +452,6 @@ function skillRecommendedTools(skill?: SkillMeta | null): string[] {
   return skill?.recommended_tools ?? skill?.recommendedTools ?? []
 }
 
-function toolMatchesRecommendation(tool: ChatToolDefinition, recommended: string): boolean {
-  const name = recommended.trim()
-  if (!name) return false
-  return (
-    tool.name === name ||
-    tool.id === name ||
-    `${tool.serverId ?? ''}:${tool.name}` === name
-  )
-}
-
 function additionalDirectoriesOf(conversation: Conversation | null | undefined): AdditionalDirectory[] {
   return conversation?.additional_directories ?? conversation?.additionalDirectories ?? []
 }
@@ -515,15 +506,6 @@ function inferSingleAttachmentSkillId(
   ))
   if (skillNames.length !== 1) return null
   return findEnabledSkillId(skills, skillNames[0])
-}
-
-function isLocallyCancelledPayload(
-  payload: { conversationId: string; runId?: string },
-  cancelledConversationId: string | null,
-  cancelledRunId: string | null,
-): boolean {
-  if (cancelledConversationId !== payload.conversationId) return false
-  return !cancelledRunId || !payload.runId || payload.runId === cancelledRunId
 }
 
 function isPlainBlankConversation(conversation: Conversation | null): boolean {
@@ -616,6 +598,7 @@ function settleOptimisticConversationListItem(
 }
 
 type SendMessageOptions = {
+  planMessageId?: string
   forceNewConversation?: boolean
   conversationOverride?: Conversation | null
   /** 前置校验完成、消息正式进入本地发送流程；输入框可立即清空。 */
@@ -746,6 +729,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const [providerOAuthTypes, setProviderOAuthTypes] = useState<Record<string, string>>({})
   const [providerBaseUrls, setProviderBaseUrls] = useState<Record<string, string>>({})
   const [enabledToolCount, setEnabledToolCount] = useState<number | null>(null)
+  const [toolDiscoveryPending, setToolDiscoveryPending] = useState(true)
   const [toolsDisabledReason, setToolsDisabledReason] = useState('')
   const [toolsRequested, setToolsRequested] = useState(false)
   const [approvalPolicy, setApprovalPolicy] = useState('readonly_auto_sensitive_confirm')
@@ -842,7 +826,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const streamingContentRef = useRef('')
   const streamingReasoningRef = useRef('')
   const settingsRef = useRef<SettingsShellHandle>(null)
-  const pendingAfterSettingsCloseRef = useRef<(() => void) | null>(null)
+  const pendingAfterSettingsCloseRef = useRef<PendingSettingsAction | null>(null)
   // A 合帧（render coalescing）：高频 stream/tool/subagent/userprompt 事件不再每条都同步
   // setState 重渲，而是把"待显示的快照"记到 ref，用 requestAnimationFrame 每帧最多 flush 一次。
 
@@ -1158,9 +1142,11 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     // 立即停掉"生成中"视觉（撤掉取消按钮 + 停 shimmer），但保留已生成文本：
     // 切到 frozen 态冻结展示，等 send invoke 返回持久化消息时由
     // finishStreamingRunWithConversation 无缝替换（clearStreamingPreview 会清除 frozen）。
-    // 后续迟到的流事件已被 isLocallyCancelledPayload 过滤，预览不会再变动。
-    setStreamCoarse({ streaming: false, streamFrozen: true })
-    patchStreamSnapshot({ reasoningStreaming: false })
+    // 过滤迟到的内容事件，但仍接收终局事件，供没有 send invoke 的恢复运行收尾。
+    freezeCancelledStream(
+      streamSnapshotsRef.current[currentConversationIdRef.current ?? ''],
+      cancelPendingFrame,
+    )
     const conversationId = currentConversationIdRef.current
     if (conversationId) {
       delete pendingToolConfirmsRef.current[conversationId]
@@ -1170,7 +1156,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     setPendingToolConfirm(null)
     setPendingSessionConsent(null)
     setPendingUserPrompt(null)
-  }, [])
+  }, [cancelPendingFrame])
 
   const resetLocalCancellation = useCallback(() => {
     locallyCancelledConversationIdRef.current = null
@@ -1294,7 +1280,11 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     ?? null
 
   const refreshToolIndicator = useCallback(async () => {
+    setToolDiscoveryPending(true)
+    setEnabledToolCount(null)
+    setToolsDisabledReason('')
     if (!isTauriRuntime()) {
+      setToolDiscoveryPending(false)
       setEnabledTools([])
       setEnabledToolCount(null)
       setToolsDisabledReason('')
@@ -1326,6 +1316,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
           : nextDisabledSkillIds,
       )
       if (!chatTools) {
+        setToolDiscoveryPending(false)
         setEnabledTools([])
         setEnabledToolCount(null)
         setToolsDisabledReason('')
@@ -1339,17 +1330,20 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       const requested = anyMcpEnabled || anyNativeEnabled || skillRuntimeEnabled
       setToolsRequested(requested)
       if (!requested) {
+        setToolDiscoveryPending(false)
         setEnabledTools([])
         setEnabledToolCount(null)
         setToolsDisabledReason('')
         return
       }
-      const result = await api.chatMcpListTools()
+      const result = await api.chatMcpListTools(true)
       const tools = result.success ? result.tools : []
       setEnabledTools(tools)
-      setEnabledToolCount(tools.length)
+      setToolDiscoveryPending(Boolean(result.discoveryPending))
+      setEnabledToolCount(result.discoveryPending ? null : tools.length)
       setToolsDisabledReason(result.success ? '' : result.error || '工具不可用')
     } catch (err) {
+      setToolDiscoveryPending(false)
       setEnabledTools([])
       setToolsRequested(false)
       setEnabledToolCount(null)
@@ -1378,6 +1372,10 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       void refreshToolIndicator()
     }
   }, [onSettingsChange, refreshToolIndicator])
+
+  useTauriEvent(api.onMcpServerState, (event) => {
+    if (event.state.kind !== 'connecting') void refreshToolIndicator()
+  }, [refreshToolIndicator])
 
   const handleToggleMcpServer = useCallback(async (serverId: string) => {
     try {
@@ -1408,11 +1406,8 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   }, [onSettingsChange, refreshToolIndicator])
 
   const unavailableRecommendedTools = useMemo(
-    () =>
-      effectiveSkillRecommendedTools.filter(
-        (recommended) => !enabledTools.some((tool) => toolMatchesRecommendation(tool, recommended)),
-      ),
-    [effectiveSkillRecommendedTools, enabledTools],
+    () => findUnavailableRecommendedTools(effectiveSkillRecommendedTools, enabledTools, toolDiscoveryPending),
+    [effectiveSkillRecommendedTools, enabledTools, toolDiscoveryPending],
   )
 
   const toolStatusHint = useMemo(() => {
@@ -1574,13 +1569,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     })
   }, [])
 
-  // 开窗预热：后台把所有启用的 MCP server 连接并抓一次工具清单（fire-and-forget，
-  // 连接池单飞保证幂等），首轮对话的工具收集不再现场握手。
-  useEffect(() => {
-    void api.chatMcpWarmup()
-  }, [])
-
-  // 空闲预取各中心页 chunk，避免首次切到设置/专家/技能/插件时才触发 lazy import 而转圈；
+  // 空闲预取各中心页 chunk，避免首次切到设置/专家/技能/MCP 时才触发 lazy import 而转圈；
   // 预取后切换时 Suspense 不再挂起，chat-motion-view-in 动画得以播在真实内容上（而非 spinner）。
   useEffect(() => {
     return scheduleIdleTask(() => {
@@ -1680,16 +1669,19 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     window.setTimeout(() => {
       setSettingsExiting(false)
       setChatView('conversation')
-      syncConversationRoute(currentConversationIdRef.current)
-      void loadSkills()
-      void refreshToolIndicator()
       const pending = pendingAfterSettingsCloseRef.current
       pendingAfterSettingsCloseRef.current = null
-      pending?.()
+      completeSettingsExit(
+        currentConversationIdRef.current,
+        pending,
+        syncConversationRoute,
+      )
+      void loadSkills()
+      void refreshToolIndicator()
     }, 220)
   }, [loadSkills, refreshToolIndicator, syncConversationRoute])
 
-  // 中心页（技能/MCP/插件/专家）没有自己的返回按钮，离开靠侧栏选会话/新建等任意路径。
+  // 中心页（技能/MCP/专家）没有自己的返回按钮，离开靠侧栏选会话/新建等任意路径。
   // 统一在「回到会话视图」这个转变点刷新技能列表与工具指示器，
   // 保证中心页里的启停/增删在回到聊天后立即生效（替代原各页 onClose 的刷新职责）。
   const prevChatViewRef = useRef(chatView)
@@ -1703,19 +1695,31 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     }
   }, [chatView, loadSkills, refreshToolIndicator])
 
-  const runAfterLeavingSettings = useCallback((action: () => void) => {
+  const runAfterLeavingSettings = useCallback((
+    action: () => void,
+    options?: { restoreCurrentRoute?: boolean },
+  ) => {
     if (chatView !== 'settings') {
       action()
       return
     }
     if (!settingsRef.current) {
       setChatView('conversation')
-      syncConversationRoute(currentConversationIdRef.current)
-      action()
+      completeSettingsExit(
+        currentConversationIdRef.current,
+        {
+          action,
+          restoreCurrentRoute: options?.restoreCurrentRoute ?? true,
+        },
+        syncConversationRoute,
+      )
       return
     }
-    pendingAfterSettingsCloseRef.current = action
-    settingsRef.current?.requestClose()
+    pendingAfterSettingsCloseRef.current = {
+      action,
+      restoreCurrentRoute: options?.restoreCurrentRoute ?? true,
+    }
+    settingsRef.current?.requestClose({ waitForSave: false })
   }, [chatView, syncConversationRoute])
 
   const handleSettingsChange = useCallback(() => {
@@ -1941,7 +1945,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
           streamErrorsRef.current[conversationId] || '回复生成失败，请稍后重试。',
         )
       }
-      if (conversationId && payload.reason !== 'cancelled') {
+      if (conversationId) {
         if (currentConversationIdRef.current === conversationId) {
           await reloadConversation(conversationId, { force: true })
         }
@@ -2354,6 +2358,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   }, [])
 
   useTauriEvent(api.onChatTool, (payload) => {
+      if (['agent', 'agent_control', 'native__agent', 'native__agent_control'].includes(payload.name) && payload.status === 'success') refreshSubAgents(payload.conversationId)
       if (popoutConversationIdsRef.current.has(payload.conversationId)) return
       if (isLocallyCancelledPayload(
         payload,
@@ -3344,6 +3349,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
         trimmed,
         attachments,
         attachmentSkillId,
+        options.planMessageId,
       )
       persistedConversation = updatedConv
       sendAccepted = true
@@ -3449,69 +3455,6 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   // 避免其依赖抖动导致订阅 effect 反复 cleanup/重订阅（重订阅缝隙会丢掉外部发送事件）。
   const handleSendMessageRef = useRef(handleSendMessage)
   handleSendMessageRef.current = handleSendMessage
-
-  /** 设置 → 插件「让 AI 代装」：取规范 brief → 回聊天 → 新开对话并自动发送安装任务 */
-  const handleRequestPluginAiInstall = useCallback(async (pluginId: string) => {
-    const startingConversationId = currentConversationIdRef.current
-    const brief = await api.pluginsInstallBrief(pluginId)
-    if (currentConversationIdRef.current !== startingConversationId) return
-    setExtensionsNavItem(null)
-    setSettingsExiting(false)
-    setChatView('conversation')
-    setAssistantStreamStatsByMessageId({})
-    let targetConversationId: string | null = null
-    try {
-      let conv = await chatApi.createConversation(
-        activeProviderId || undefined,
-        activeModel || undefined,
-        selectedProject?.name,
-        selectedProject?.id ?? null,
-        undefined,
-        selectedSet?.id ?? null,
-      )
-      try {
-        conv = await chatApi.updateConversation(conv.id, {
-          title: brief.conversationTitle,
-        })
-      } catch {
-        // 标题失败不阻断
-      }
-      targetConversationId = conv.id
-      refreshSidebar()
-      if (currentConversationIdRef.current === startingConversationId) {
-        currentConversationIdRef.current = conv.id
-        applyConversation(conv)
-        restoreStreamingPreview(conv.id)
-        syncConversationRoute(conv.id)
-      }
-      const accepted = await handleSendMessageRef.current(brief.userMessage, [], {
-        forceNewConversation: false,
-        conversationOverride: conv,
-      })
-      if (!accepted) {
-        throw new Error('发送安装任务失败（可能当前模型未配置或正在生成）')
-      }
-    } catch (err) {
-      console.error('Failed to start plugin install chat:', err)
-      if (
-        currentConversationIdRef.current === startingConversationId
-        || currentConversationIdRef.current === targetConversationId
-      ) {
-        setStreamError(typeof err === 'string' ? err : (err as Error).message || '无法开始插件安装对话')
-      }
-      throw err
-    }
-  }, [
-    activeModel,
-    activeProviderId,
-    applyConversation,
-    refreshSidebar,
-    restoreStreamingPreview,
-    selectedProject?.id,
-    selectedProject?.name,
-    selectedSet?.id,
-    syncConversationRoute,
-  ])
 
   // 历史预置（Lens「在 AI 客户端继续」交接）：用最新 reactive 值（provider/model/project）创建带历史的新会话。
   // 同 handleSendMessageRef 思路用 ref 持有，保持 drainExternalSends 稳定身份。
@@ -3659,36 +3602,16 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const handleExecuteAgentPlan = useCallback(async (messageId: string) => {
     const conversation = currentConversation
     if (!conversation) return
-    const planMessage = conversation.messages.find((message) => message.id === messageId)
-    const messagePlan = planMessage?.agent_plan ?? planMessage?.agentPlan ?? null
-    const messagePlanText = messagePlan?.plan?.trim() ?? ''
-    const legacyPlan = conversation.agent_plan_state ?? conversation.agentPlanState ?? null
-    const legacyPlanText = legacyPlan?.plan?.trim() ?? ''
-    const isLegacyPlanMessage = Boolean(
-      planMessage
-      && !isExecutableAgentPlanText(messagePlanText)
-      && isExecutableAgentPlanText(legacyPlanText)
-      && planMessage.role === 'assistant'
-      && planMessage.content.trim() === legacyPlanText,
-    )
-    const planText = isExecutableAgentPlanText(messagePlanText)
-      ? messagePlanText
-      : (isLegacyPlanMessage ? legacyPlanText : '')
-    if (!isExecutableAgentPlanText(planText)) return
     if (isConversationInFlight(inFlightConversationsRef.current, conversation.id)) {
       setStreamErrorForConversation(conversation.id, '该对话正在生成中，请稍后再试')
       return
     }
 
     try {
-      const updated = await chatApi.executeAgentPlan(
-        conversation.id,
-        isExecutableAgentPlanText(messagePlanText) ? messageId : undefined,
-      )
-      applyConversationIfCurrent(conversation.id, updated)
-      refreshSidebar()
-      void refreshContextStats(updated.id)
-      void handleSendMessage('按这条计划开始执行。', [], { conversationOverride: updated })
+      await handleSendMessage('按这条计划开始执行。', [], {
+        conversationOverride: conversation,
+        planMessageId: messageId,
+      })
     } catch (err) {
       console.error('Failed to execute agent plan:', err)
       setStreamErrorForConversation(
@@ -3697,11 +3620,8 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
       )
     }
   }, [
-    applyConversationIfCurrent,
     currentConversation,
     handleSendMessage,
-    refreshContextStats,
-    refreshSidebar,
     setStreamErrorForConversation,
   ])
 
@@ -4521,6 +4441,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
   const [dockWorkdir, setDockWorkdir] = useState('')
   const [treeExpanded, setTreeExpanded] = useState<string[]>([])
   const [dockReveal, setDockReveal] = useState<DockRevealRequest>(null)
+  const [subAgentRequest, setSubAgentRequest] = useState<{ conversationId: string; agentId: string; nonce: number } | null>(null)
   const [dockPreview, setDockPreview] = useState<DockPreviewRequest>(null)
   // 工作目录跟随当前会话 / 选中项目 / agent runtime 变化，由后端 dock_resolve_cwd 解析
   // （外部 agent 与内置 runtime 的实际写入目录不同，runtime 切换必须重解析）。
@@ -4583,6 +4504,12 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     setDockOpen(true)
     rememberDockOpen(true)
   }, [])
+
+  useEffect(() => onDockSubAgentRequest(target => {
+    if (target.conversationId !== currentConversationIdRef.current) return
+    handleOpenDockTasks()
+    setSubAgentRequest(previous => ({ ...target, nonce: (previous?.nonce ?? 0) + 1 }))
+  }), [handleOpenDockTasks])
 
   const handleDockWidthChange = useCallback((nextWidth: number) => {
     setDockWidth(nextWidth)
@@ -4757,7 +4684,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
         messageCount: conversation?.message_count,
         focusMessageId: focusMessageId || undefined,
       })
-    })
+    }, { restoreCurrentRoute: false })
   }, [handleSelectConversation, occupyConversationInMain, runAfterLeavingSettings])
 
   const handleSidebarNewConversation = useCallback(() => {
@@ -4845,7 +4772,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
     setSearchOpen(false)
   }, [runAfterLeavingSettings])
 
-  // 中心页（专家/技能/MCP/插件）去掉了整行「返回聊天」顶栏后，窗口顶部不再可拖拽；
+  // 中心页（专家/技能/MCP）去掉了整行「返回聊天」顶栏后，窗口顶部不再可拖拽；
   // 且侧栏收起时页面上没有任何展开侧栏/离开中心页的入口（会被困住）。
   // 用一条浮在内容 padding 区上的细拖拽带兜底：始终可拖动窗口，
   // 侧栏收起时在带内浮出「展开侧栏 + 新建聊天」，与会话页收起态的顶栏行为一致。
@@ -5428,7 +5355,6 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
             onClose={handleSettingsClose}
             onSettingsChange={handleSettingsChange}
             onReady={emitContentReady}
-            onRequestPluginAiInstall={handleRequestPluginAiInstall}
             sessionLibrary={{
               currentConversationId: currentConversation?.id,
               generatingConversationIds,
@@ -5527,6 +5453,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
             onSelectConversation={handleSelectConversation}
             importedHistoryStale={importedHistoryStale}
             pendingSlot={pendingSlot}
+            subAgentSlot={currentConversation?.id && <SubAgentIndicator key={currentConversation.id} conversationId={currentConversation.id} lang={uiLang} onOpen={handleOpenDockTasks} />}
             goalSlot={visibleGoal ? (
               <GoalCard
                 goal={visibleGoal}
@@ -5550,6 +5477,7 @@ export default function Chat({ onSettingsChange, onContentReady }: ChatProps) {
         </ChatRouteKeepAlive>
         {chatView === 'conversation' && !usesChatRuntime && !conversationOccupied && (
           <RightDock
+            subAgentRequest={subAgentRequest}
             open={dockOpen}
             width={dockWidth}
             activeTab={dockTab}

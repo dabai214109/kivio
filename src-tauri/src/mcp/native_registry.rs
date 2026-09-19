@@ -87,7 +87,9 @@ pub enum NativeToolCall {
     /// resolution because it only needs the conversation id, matching the
     /// legacy `RegistryToolExecutor` special case which never resolved a
     /// workspace for todo tools.
-    Conversation(for<'a> fn(&'a AppHandle, &'a NativeToolContext, &'a str, Value) -> NativeToolFuture<'a>),
+    Conversation(
+        for<'a> fn(&'a AppHandle, &'a NativeToolContext, &'a str, Value) -> NativeToolFuture<'a>,
+    ),
     /// Host-mediated tool (ask_user): intercepted in
     /// `chat/agent/execute.rs::execute_ask_user_call` and must never reach
     /// the registry dispatcher.
@@ -414,6 +416,16 @@ pub static NATIVE_TOOLS: &[NativeToolEntry] = &[
     // Conversation-level tools below are appended in chat/commands.rs and
     // never exposed via list_native_builtin_tool_defs (enabled = false).
     NativeToolEntry {
+        name: "save_plan",
+        def: crate::chat::plan_document::tool,
+        enabled: |_, _, _| false,
+        parallel_safe: false,
+        bypasses_approval: true,
+        read_only: false,
+        requires_session_consent: false,
+        call: NativeToolCall::Conversation(crate::chat::plan_document::handle),
+    },
+    NativeToolEntry {
         name: crate::chat::todo::TODO_WRITE_TOOL_NAME,
         def: crate::chat::todo::todo_write_tool,
         enabled: |_, _, _| false,
@@ -423,12 +435,66 @@ pub static NATIVE_TOOLS: &[NativeToolEntry] = &[
         requires_session_consent: false,
         call: NativeToolCall::Conversation(crate::chat::todo::handle_conversation_tool_call),
     },
-    NativeToolEntry { name: crate::chat::goal::GET_GOAL_TOOL, def: || crate::chat::goal::tool_definitions().remove(0), enabled: |_,_,_| false, parallel_safe: false, bypasses_approval: true, read_only: true, requires_session_consent: false, call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call) },
-    NativeToolEntry { name: crate::chat::goal::INIT_GOAL_CRITERIA_TOOL, def: || crate::chat::goal::tool_definitions().remove(1), enabled: |_,_,_| false, parallel_safe: false, bypasses_approval: true, read_only: false, requires_session_consent: false, call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call) },
-    NativeToolEntry { name: crate::chat::goal::REPORT_GOAL_PROGRESS_TOOL, def: || crate::chat::goal::tool_definitions().remove(2), enabled: |_,_,_| false, parallel_safe: false, bypasses_approval: true, read_only: false, requires_session_consent: false, call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call) },
-    NativeToolEntry { name: crate::chat::goal::COMPLETE_GOAL_TOOL, def: || crate::chat::goal::tool_definitions().remove(3), enabled: |_,_,_| false, parallel_safe: false, bypasses_approval: true, read_only: false, requires_session_consent: false, call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call) },
-    NativeToolEntry { name: crate::chat::goal::BLOCK_GOAL_TOOL, def: || crate::chat::goal::tool_definitions().remove(4), enabled: |_,_,_| false, parallel_safe: false, bypasses_approval: true, read_only: false, requires_session_consent: false, call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call) },
-    NativeToolEntry { name: crate::chat::goal::WAIT_GOAL_TOOL, def: || crate::chat::goal::tool_definitions().remove(5), enabled: |_,_,_| false, parallel_safe: false, bypasses_approval: true, read_only: false, requires_session_consent: false, call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call) },
+    NativeToolEntry {
+        name: crate::chat::goal::GET_GOAL_TOOL,
+        def: || crate::chat::goal::tool_definitions().remove(0),
+        enabled: |_, _, _| false,
+        parallel_safe: false,
+        bypasses_approval: true,
+        read_only: true,
+        requires_session_consent: false,
+        call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call),
+    },
+    NativeToolEntry {
+        name: crate::chat::goal::INIT_GOAL_CRITERIA_TOOL,
+        def: || crate::chat::goal::tool_definitions().remove(1),
+        enabled: |_, _, _| false,
+        parallel_safe: false,
+        bypasses_approval: true,
+        read_only: false,
+        requires_session_consent: false,
+        call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call),
+    },
+    NativeToolEntry {
+        name: crate::chat::goal::REPORT_GOAL_PROGRESS_TOOL,
+        def: || crate::chat::goal::tool_definitions().remove(2),
+        enabled: |_, _, _| false,
+        parallel_safe: false,
+        bypasses_approval: true,
+        read_only: false,
+        requires_session_consent: false,
+        call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call),
+    },
+    NativeToolEntry {
+        name: crate::chat::goal::COMPLETE_GOAL_TOOL,
+        def: || crate::chat::goal::tool_definitions().remove(3),
+        enabled: |_, _, _| false,
+        parallel_safe: false,
+        bypasses_approval: true,
+        read_only: false,
+        requires_session_consent: false,
+        call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call),
+    },
+    NativeToolEntry {
+        name: crate::chat::goal::BLOCK_GOAL_TOOL,
+        def: || crate::chat::goal::tool_definitions().remove(4),
+        enabled: |_, _, _| false,
+        parallel_safe: false,
+        bypasses_approval: true,
+        read_only: false,
+        requires_session_consent: false,
+        call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call),
+    },
+    NativeToolEntry {
+        name: crate::chat::goal::WAIT_GOAL_TOOL,
+        def: || crate::chat::goal::tool_definitions().remove(5),
+        enabled: |_, _, _| false,
+        parallel_safe: false,
+        bypasses_approval: true,
+        read_only: false,
+        requires_session_consent: false,
+        call: NativeToolCall::Conversation(crate::chat::goal::handle_conversation_tool_call),
+    },
     NativeToolEntry {
         name: crate::chat::ask_user::ASK_USER_TOOL_NAME,
         def: crate::chat::ask_user::ask_user_tool,
@@ -450,19 +516,22 @@ pub static NATIVE_TOOLS: &[NativeToolEntry] = &[
         // name/shape here, so an empty role list is correct.
         def: || crate::chat::sub_agent::agent_tool(&[]),
         enabled: |_, _, _| false,
-        // parallel_safe = true: each `agent` spawn runs in isolation (its own
-        // synthetic conversation/generation/message history), bypasses approval,
-        // and is capped by the SubAgentManager semaphore (default 12, user-
-        // configurable). Concurrent fan-out is the core value of multi-agent: a
-        // single round may dispatch several `agent` calls in parallel (scheduler
-        // caps at MAX_PARALLEL_TOOL_CALLS_PER_ROUND = 12, semaphore at the
-        // setting). Each call blocks until its sub-agent finishes and returns the
-        // full result inline (Claude Code Task model).
+        // Independent durable admissions can be submitted concurrently.
         parallel_safe: true,
         bypasses_approval: true,
         read_only: false,
         requires_session_consent: false,
         call: NativeToolCall::SubAgent(crate::chat::sub_agent::dispatch_agent_spawn),
+    },
+    NativeToolEntry {
+        name: "agent_control",
+        def: crate::chat::sub_agent::control::definition,
+        enabled: |_, _, _| false,
+        parallel_safe: false,
+        bypasses_approval: true,
+        read_only: false,
+        requires_session_consent: false,
+        call: NativeToolCall::SubAgent(crate::chat::sub_agent::control::dispatch),
     },
 ];
 
@@ -1109,6 +1178,12 @@ fn call_present_artifacts(
     workspace: &NativeToolWorkspace,
     arguments: &Value,
 ) -> Result<McpToolCallResult, String> {
+    let mode = match arguments.get("mode") {
+        None => "prepare",
+        Some(Value::String(value)) if value == "prepare" => "prepare",
+        Some(Value::String(value)) if value == "preview" => "preview",
+        Some(_) => return Err("present_artifacts mode must be prepare or preview".to_string()),
+    };
     let encoded = serde_json::to_string(arguments).unwrap_or_default();
     if encoded.chars().count() > PRESENT_ARTIFACTS_ARGUMENTS_MAX_CHARS {
         return Err(
@@ -1147,6 +1222,7 @@ fn call_present_artifacts(
     let mut structured = serde_json::json!({
         "type": "artifact_presentation",
         "artifactIds": artifact_ids,
+        "mode": mode,
     });
     if let Some(caption) = caption {
         structured["caption"] = Value::String(caption);
@@ -1155,7 +1231,9 @@ fn call_present_artifacts(
     // 再追加一句 "Skipped ..."，模型收到的是自相矛盾的两句话（说要展示、又说跳过了），
     // 无法判断成没成，于是回空响应把整轮卡死（实测 out=4 tokens，稳定复现）。
     let shown = artifact_ids.len() + artifacts.len();
-    let mut content = if shown == 1 {
+    let mut content = if mode == "prepare" {
+        format!("Prepared {shown} file(s) for final-answer references. No expanded preview was displayed. Place only necessary file references beside their explanation in your final answer.")
+    } else if shown == 1 {
         "Displayed 1 file in the response.".to_string()
     } else {
         format!("Displayed {shown} files in the response.")
@@ -1259,6 +1337,7 @@ mod tests {
         "memory_read",
         "memory_modify",
         "memory_search",
+        "save_plan",
         "todo_write",
         "get_goal",
         "initialize_goal_criteria",
@@ -1268,6 +1347,7 @@ mod tests {
         "goal_wait",
         "ask_user",
         "agent",
+        "agent_control",
     ];
 
     #[test]
@@ -1348,7 +1428,7 @@ mod tests {
              bash_output joins it because it is a pure read-only registry/log read \
              (and lists jobs when given no job_id); `agent` joins it because each \
              spawn runs in isolation (own conversation/generation/message history), \
-             bypasses approval, and is capped by the SubAgentManager semaphore \
+             bypasses approval, and is capped by atomic runtime admission \
              (default 12), making concurrent fan-out the core multi-agent value"
         );
     }
@@ -1368,6 +1448,7 @@ mod tests {
                 "memory_read",
                 "memory_modify",
                 "memory_search",
+                "save_plan",
                 "todo_write",
                 "get_goal",
                 "initialize_goal_criteria",
@@ -1377,6 +1458,7 @@ mod tests {
                 "goal_wait",
                 "ask_user",
                 "agent",
+                "agent_control",
             ]
         );
     }
@@ -1592,6 +1674,7 @@ mod tests {
             Some(serde_json::json!({
                 "type": "artifact_presentation",
                 "artifactIds": ["art_a", "art_b"],
+                "mode": "prepare",
                 "caption": "Preview"
             }))
         );
@@ -1621,7 +1704,7 @@ mod tests {
         // 此前是无条件的 "Selected files will be displayed" + "Skipped ..."，两句矛盾，
         // 模型判断不出成没成而回空响应，整轮卡死（实测 out=4 tokens，稳定复现）。
         assert!(
-            result.content.contains("Displayed 1 file"),
+            result.content.contains("Prepared 1 file"),
             "must state how many were shown, got: {}",
             result.content
         );
@@ -1650,7 +1733,7 @@ mod tests {
         let workspace = NativeToolWorkspace::standalone();
         let result = call_present_artifacts(
             &workspace,
-            &serde_json::json!({ "artifact_ids": ["art_a", "art_b"] }),
+            &serde_json::json!({ "artifact_ids": ["art_a", "art_b"], "mode": "preview" }),
         )
         .expect("presentation result");
         assert!(
@@ -1691,7 +1774,8 @@ mod tests {
             result.structured_content,
             Some(serde_json::json!({
                 "type": "artifact_presentation",
-                "artifactIds": []
+                "artifactIds": [],
+                "mode": "prepare"
             }))
         );
     }
@@ -1708,5 +1792,20 @@ mod tests {
         )
         .expect_err("oversized payload");
         assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn present_artifacts_rejects_unknown_display_modes() {
+        let workspace = NativeToolWorkspace::standalone();
+        for mode in [serde_json::json!("unknown"), serde_json::json!(42)] {
+            assert!(call_present_artifacts(
+                &workspace,
+                &serde_json::json!({
+                    "artifact_ids": ["art_a"], "mode": mode
+                })
+            )
+            .unwrap_err()
+            .contains("mode"));
+        }
     }
 }

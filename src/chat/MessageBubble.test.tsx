@@ -4,6 +4,172 @@ import { describe, expect, it, vi } from 'vitest'
 import { MessageBubble } from './MessageBubble'
 import type { ChatMessage } from './types'
 
+describe('assistant body visibility', () => {
+  it.each(['cancelled', undefined])('folds cancelled progress with outcome %s and preserves the partial answer', outcome => {
+    render(<MessageBubble message={{
+      id: 'partial-answer', role: 'assistant', timestamp: 1, content: 'Useful partial answer', stream_outcome: outcome,
+      segments: [
+        { id: 'progress', kind: 'text', phase: 'tool_loop', order: 1, text: 'Reading files now' },
+        { id: 'call', kind: 'tool', phase: 'tool_loop', order: 2, tool_call_id: 'call' },
+        { id: 'partial', kind: 'text', phase: 'synthesis', order: 3, text: 'Useful partial answer' },
+        { id: 'seg_4_cancelled_synthesis', kind: 'text', phase: 'synthesis', order: 4, text: '已停止生成。' },
+      ],
+    }} />)
+    expect(screen.queryByText('Reading files now')).not.toBeInTheDocument()
+    expect(screen.getByText('Useful partial answer')).toBeVisible()
+    expect(screen.getByText('已停止生成。')).toBeVisible()
+  })
+
+  it.each(['cancelled', undefined])('keeps interrupted browser commentary inside Worked with outcome %s', outcome => {
+    const progress = ['Chrome 起来了，但扩展还是没连上。', '扩展自己重连了，再试一次。', '我找一下 Kivio 的日志。']
+    render(<MessageBubble message={{
+      id: 'browser-cancelled', role: 'assistant', timestamp: 1,
+      content: `${progress.join('\n\n')}\n\n正在检查日志。\n\n已停止生成。`, stream_outcome: outcome,
+      segments: [
+        ...progress.flatMap((text, index) => [
+          { id: `note-${index}`, kind: 'text' as const, phase: 'tool_loop' as const, order: index * 2, text },
+          { id: `call-${index}`, kind: 'tool' as const, phase: 'tool_loop' as const, order: index * 2 + 1, tool_call_id: `call-${index}` },
+        ]),
+        { id: 'trailing-note', kind: 'text', phase: 'tool_loop', order: 6, text: '正在检查日志。' },
+        { id: 'seg_7_cancelled_synthesis', kind: 'text', phase: 'synthesis', order: 7, text: '已停止生成。' },
+      ],
+    }} />)
+    const worked = screen.getByRole('button', { name: /^Worked/ })
+    expect(worked).toHaveAttribute('aria-expanded', 'false')
+    for (const text of progress) expect(screen.queryByText(text)).not.toBeInTheDocument()
+    expect(screen.queryByText('正在检查日志。')).not.toBeInTheDocument()
+    expect(screen.getByText('已停止生成。')).toBeVisible()
+    fireEvent.click(worked)
+    for (const text of progress) expect(screen.getByText(text)).toBeVisible()
+    expect(screen.getByText('正在检查日志。')).toBeVisible()
+  })
+
+  it('uses one stable Work for subagents, waiting, final answer and history', () => {
+    const message: ChatMessage = {
+      id: 'live-subagents', role: 'assistant', timestamp: 1, content: '',
+      segments: [
+        { id: 'r1', kind: 'reasoning', phase: 'tool_loop', order: 0, text: 'Launch plan' },
+        { id: 'intro', kind: 'text', phase: 'tool_loop', order: 1, text: '先启动子代理，我来读 README。' },
+        { id: 'a', kind: 'tool', phase: 'tool_loop', order: 2, tool_call_id: 'a' },
+        { id: 'b', kind: 'tool', phase: 'tool_loop', order: 3, tool_call_id: 'b' },
+        { id: 'r2', kind: 'reasoning', phase: 'tool_loop', order: 4, text: 'Read plan' },
+        { id: 'read-note', kind: 'text', phase: 'tool_loop', order: 5, text: 'README 只有 9 字节，再看文档。' },
+        { id: 'read', kind: 'tool', phase: 'tool_loop', order: 6, tool_call_id: 'read' },
+        { id: 'wait-note', kind: 'text', phase: 'tool_loop', order: 7, text: '项目用途已了解，等待子代理。' },
+        { id: 'wait', kind: 'tool', phase: 'tool_loop', order: 8, tool_call_id: 'wait' },
+      ],
+      tool_calls: [
+        { id: 'a', name: 'agent', source: 'native', status: 'completed' },
+        { id: 'b', name: 'agent', source: 'native', status: 'completed' },
+        { id: 'read', name: 'read_file', source: 'native', status: 'completed' },
+        { id: 'wait', name: 'agent', source: 'native', status: 'running', arguments: '{"operation":"wait"}' },
+      ],
+    }
+    const { rerender } = render(<MessageBubble message={message} messageStreaming />)
+    const work = screen.getByRole('button', { name: 'Working' })
+    expect(screen.getAllByLabelText('过程分组')).toHaveLength(1)
+    expect(screen.getByText('先启动子代理，我来读 README。')).toBeVisible()
+    rerender(<MessageBubble message={{ ...message, segments: [...message.segments!,
+      { id: 'final', kind: 'text', phase: 'plain', order: 9, text: '最终项目汇总' },
+    ] }} />)
+    expect(screen.getByText('最终项目汇总')).toBeVisible()
+    expect(screen.getAllByLabelText('过程分组')).toHaveLength(1)
+    expect(screen.getByRole('button', { name: /^Worked/ })).toBe(work)
+    expect(work).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByText('先启动子代理，我来读 README。')).not.toBeInTheDocument()
+    fireEvent.click(work)
+    expect(screen.getByText('README 只有 9 字节，再看文档。')).toBeVisible()
+    expect(screen.getByText('项目用途已了解，等待子代理。')).toBeVisible()
+  })
+
+  it.each(['cancelled', 'error', 'interrupted', 'recovered'])('folds progress after a %s outcome', outcome => {
+    const message: ChatMessage = {
+      id: 'stopped-run', role: 'assistant', timestamp: 1, content: 'Run stopped',
+      stream_outcome: outcome,
+      segments: [
+        { id: 'partial', kind: 'text', phase: 'tool_loop', order: 1, text: 'Partial findings' },
+        { id: 'tool', kind: 'tool', phase: 'tool_loop', order: 2, tool_call_id: 'call' },
+        { id: 'notice', kind: 'text', phase: 'synthesis', order: 3, text: 'Run stopped' },
+      ],
+    }
+    const { rerender } = render(<MessageBubble message={message} />)
+    expect(screen.queryByText('Partial findings')).not.toBeInTheDocument()
+    expect(screen.getByText('Run stopped')).toBeVisible()
+    rerender(<MessageBubble message={{ ...message, stream_outcome: undefined, streamOutcome: outcome }} />)
+    expect(screen.queryByText('Partial findings')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /^Worked/ }))
+    expect(screen.getByText('Partial findings')).toBeVisible()
+  })
+
+  it('folds intermediate search updates into one Worked group after completion', () => {
+    const message: ChatMessage = {
+      id: 'news-search', role: 'assistant', timestamp: 1, content: '最终新闻汇总',
+      stream_outcome: 'completed',
+      segments: [
+        { id: 'r1', kind: 'reasoning', phase: 'tool_loop', order: 0, text: 'search plan' },
+        { id: 'n1', kind: 'text', phase: 'tool_loop', order: 1, text: '先搜一圈最近几天的 AI 新闻，稍等。' },
+        { id: 't1', kind: 'tool', phase: 'tool_loop', order: 2, tool_call_id: 'search' },
+        { id: 'n2', kind: 'text', phase: 'tool_loop', order: 3, text: '再补两条其他方向的。' },
+        { id: 'r2', kind: 'reasoning', phase: 'tool_loop', order: 4, text: 'summarize' },
+        { id: 'final', kind: 'text', phase: 'plain', order: 5, text: '最终新闻汇总' },
+      ],
+      tool_calls: [{ id: 'search', name: 'web_search', source: 'native', status: 'completed' }],
+    }
+    const { rerender } = render(<MessageBubble message={message} messageStreaming />)
+    expect(screen.getByText('再补两条其他方向的。')).toBeVisible()
+    rerender(<MessageBubble message={message} />)
+    expect(screen.getByText('最终新闻汇总')).toBeVisible()
+    expect(screen.queryByText('再补两条其他方向的。')).not.toBeInTheDocument()
+    const worked = screen.getByRole('button', { name: /^Worked/ })
+    expect(worked).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.click(worked)
+    expect(screen.getByText('先搜一圈最近几天的 AI 新闻，稍等。')).toBeVisible()
+    expect(screen.getByText('再补两条其他方向的。')).toBeVisible()
+  })
+
+  it('copies the questions and final supplement without private reasoning or tool output', async () => {
+    const user = userEvent.setup()
+    const message: ChatMessage = {
+      id: 'copy-questions', role: 'assistant', timestamp: 1, content: '请回答上面的问题。',
+      segments: [
+        { id: 'questions', kind: 'text', phase: 'tool_loop', order: 1, text: '目标用户是谁？' },
+        { id: 'reasoning', kind: 'reasoning', phase: 'tool_loop', order: 2, text: 'private reasoning' },
+        { id: 'final', kind: 'text', phase: 'plain', order: 3, text: '请回答上面的问题。' },
+      ],
+    }
+    render(<MessageBubble message={message} />)
+    await user.click(screen.getByRole('button', { name: '复制' }))
+    expect(await navigator.clipboard.readText()).toBe('目标用户是谁？\n\n请回答上面的问题。')
+  })
+
+  it('keeps current text visible and moves it into Worked when execution advances', () => {
+    const questions = 'Q1 目标用户是谁？Q2 有何差异？Q3 首个交付是什么？Q4 有哪些约束？'
+    const message: ChatMessage = {
+      id: 'questions-before-tools', role: 'assistant', content: '', timestamp: 1,
+      segments: [{ id: 'questions', kind: 'text', phase: 'tool_loop', order: 1, text: questions }],
+    }
+    const { rerender } = render(<MessageBubble message={message} messageStreaming />)
+    expect(screen.getByText(questions)).toBeVisible()
+    const completed: ChatMessage = {
+      ...message,
+      content: '环境检查完成。请回答上面四个问题。',
+      segments: [
+        ...message.segments!,
+        { id: 'check', kind: 'tool', phase: 'tool_loop', order: 2, tool_call_id: 'check' },
+        { id: 'final', kind: 'text', phase: 'plain', order: 3, text: '环境检查完成。请回答上面四个问题。' },
+      ],
+      tool_calls: [{ id: 'check', name: 'bash', source: 'native', status: 'completed' }],
+    }
+    rerender(<MessageBubble message={completed} messageStreaming />)
+    expect(screen.getByText(questions)).toBeVisible()
+    rerender(<MessageBubble message={completed} />)
+    expect(screen.queryByText(questions)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /^Worked/ })).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.click(screen.getByRole('button', { name: /^Worked/ }))
+    expect(screen.getByText(questions)).toBeVisible()
+  })
+})
+
 describe('MessageBubble mount motion', () => {
   const assistantMessage: ChatMessage = {
     id: 'assistant-motion',
@@ -207,7 +373,7 @@ describe('MessageBubble agent plan action', () => {
     expect(screen.getByText('计划草案')).toBeInTheDocument()
   })
 
-  it('shows approved state without an execute button', () => {
+  it('keeps legacy plans usable without claiming implementation happened', () => {
     const message: ChatMessage = {
       id: 'msg-plan-approved',
       role: 'assistant',
@@ -223,48 +389,24 @@ describe('MessageBubble agent plan action', () => {
 
     render(<MessageBubble message={message} onExecuteAgentPlan={() => {}} />)
 
-    expect(screen.getByText('已按这条计划执行')).toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: '执行这条计划' })).not.toBeInTheDocument()
+    expect(screen.queryByText('已按这条计划执行')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '执行这条计划' })).toBeInTheDocument()
   })
 
-  it('does not render execute action for an incomplete non-plan fragment', () => {
-    const message: ChatMessage = {
-      id: 'msg-plan-fragment',
-      role: 'assistant',
-      content: '没问题！积萌,',
-      agent_plan: {
-        mode: 'plan',
-        status: 'draft',
-        plan: '没问题！积萌,',
-        updated_at: 1,
-      },
-      stream_outcome: 'interrupted',
-      timestamp: 1,
-    }
-
-    render(<MessageBubble message={message} onExecuteAgentPlan={() => {}} />)
-
-    expect(screen.queryByText('计划草案')).not.toBeInTheDocument()
-    expect(screen.queryByRole('button', { name: '执行这条计划' })).not.toBeInTheDocument()
+  it('uses document identity without requiring steps in the reply', () => {
+    const execute = vi.fn()
+    render(<MessageBubble message={{
+      id: 'document-plan', role: 'assistant', content: '方案已保存。', timestamp: 1,
+      agent_plan: { mode: 'plan', status: 'draft', document: { id: 'p1', title: '登录方案', path: 'E:/project/docs/plans/登录方案.md' } },
+    }} onExecuteAgentPlan={execute} />)
+    expect(screen.getByRole('button', { name: '登录方案.md' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '打开编辑' })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: '执行这条计划' }))
+    expect(execute).toHaveBeenCalledWith('document-plan')
   })
 
-  it('does not render execute action for a non-plan sentence even if persisted as draft', () => {
-    const message: ChatMessage = {
-      id: 'msg-plan-sentence',
-      role: 'assistant',
-      content: '计划：我会处理这个问题。',
-      agent_plan: {
-        mode: 'plan',
-        status: 'draft',
-        plan: '计划：我会处理这个问题。',
-        updated_at: 1,
-      },
-      timestamp: 1,
-    }
-
-    render(<MessageBubble message={message} onExecuteAgentPlan={() => {}} />)
-
-    expect(screen.queryByText('计划草案')).not.toBeInTheDocument()
+  it('does not turn an ordinary list into a plan', () => {
+    render(<MessageBubble message={{ id: 'list', role: 'assistant', content: '1. Finding A\n2. Finding B', timestamp: 1 }} onExecuteAgentPlan={() => {}} />)
     expect(screen.queryByRole('button', { name: '执行这条计划' })).not.toBeInTheDocument()
   })
 })
@@ -305,6 +447,8 @@ describe('MessageBubble timeline orphan tools', () => {
     }
 
     render(<MessageBubble message={message} />)
+    expect(screen.queryByText('Read')).not.toBeInTheDocument()
+    fireEvent.click(screen.getByRole('button', { name: /^Worked/ }))
     expect(screen.getByText('Read')).toBeInTheDocument()
   })
 })
@@ -369,7 +513,7 @@ describe('MessageBubble timeline grouping', () => {
     expect(screen.getByText('answer')).toBeInTheDocument()
   })
 
-  it('folds tool-loop commentary into the collapsed working shell', async () => {
+  it('folds tool-loop text with tool details after completion', async () => {
     const user = userEvent.setup()
     const message: ChatMessage = {
       id: 'msg-commentary',
@@ -498,7 +642,7 @@ describe('MessageBubble timeline grouping', () => {
     expect(screen.getAllByText('file-0.ts').length).toBeGreaterThan(0)
   })
 
-  it('renders tool → text → tool as one working shell', () => {
+  it('folds text between tools when a legacy content fallback supplies the final answer', () => {
     const message: ChatMessage = {
       id: 'msg-3',
       role: 'assistant',
@@ -518,6 +662,7 @@ describe('MessageBubble timeline grouping', () => {
     render(<MessageBubble message={message} />)
     expect(screen.getAllByLabelText('过程分组')).toHaveLength(1)
     expect(screen.queryByText('middle')).not.toBeInTheDocument()
+    expect(screen.getByText('final')).toBeVisible()
   })
 
   it('keeps the last group expanded while the message is streaming', () => {
@@ -579,7 +724,7 @@ describe('MessageBubble timeline grouping', () => {
     )
   })
 
-  it('collapses non-last groups even while streaming', () => {
+  it('shares one live Work control across process sections separated by presentations', () => {
     const message: ChatMessage = {
       id: 'msg-5',
       role: 'assistant',
@@ -606,11 +751,8 @@ describe('MessageBubble timeline grouping', () => {
     render(<MessageBubble message={message} messageStreaming />)
     const groups = screen.getAllByLabelText('过程分组')
     expect(groups).toHaveLength(2)
-    // standalone 产物卡打断分组：前组折叠，末组展开
-    expect(screen.getByRole('button', { name: /Worked/ })).toHaveAttribute(
-      'aria-expanded',
-      'false',
-    )
+    expect(screen.getAllByRole('button', { name: 'Working' })).toHaveLength(1)
+    expect(screen.queryByRole('button', { name: /^Worked/ })).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Working' })).toHaveAttribute(
       'aria-expanded',
       'true',
@@ -736,6 +878,161 @@ describe('MessageBubble 建分支', () => {
 
 
 describe('MessageBubble explicit artifact presentation', () => {
+  it.each(['completed', 'cancelled'])('keeps subsequent work below delivered artifacts through %s and re-expansion', outcome => {
+    const message: ChatMessage = {
+      id: 'delivery-during-work', role: 'assistant', timestamp: 1, content: '',
+      artifacts: [
+        { id: 'preview', name: 'preview.png', mime_type: 'image/png', data_url: 'data:image/png;base64,aA==' },
+        { id: 'report', name: 'report.txt', mime_type: 'text/plain', data_url: 'data:text/plain;base64,aA==' },
+      ],
+      tool_calls: [{ id: 'present', name: 'present_artifacts', source: 'native', status: 'completed',
+        structured_content: { type: 'artifact_presentation', artifactIds: ['preview'], caption: 'First delivery' } }],
+      segments: [
+        { id: 'before', kind: 'reasoning', phase: 'tool_loop', order: 0, text: 'Prepare preview' },
+        { id: 'present', kind: 'tool', phase: 'tool_loop', order: 1, tool_call_id: 'present' },
+      ],
+    }
+    const { container, rerender } = render(<MessageBubble message={message} messageStreaming />)
+    const preview = container.querySelector('img')!
+    const work = screen.getByRole('button', { name: 'Working' })
+    const continuing: ChatMessage = { ...message, segments: [...message.segments!,
+      { id: 'after', kind: 'text', phase: 'tool_loop', order: 2, text: 'Verify video after delivery' },
+      { id: 'verify', kind: 'tool', phase: 'tool_loop', order: 3, tool_call_id: 'verify' },
+      { id: 'second', kind: 'tool', phase: 'tool_loop', order: 4, tool_call_id: 'second' },
+      { id: 'cleanup', kind: 'text', phase: 'tool_loop', order: 5, text: 'Cleanup after second delivery' },
+      { id: 'finish', kind: 'reasoning', phase: 'tool_loop', order: 6, text: 'Ready to finish' },
+    ], tool_calls: [...message.tool_calls!,
+      { id: 'second', name: 'present_artifacts', source: 'native', status: 'completed',
+        structured_content: { type: 'artifact_presentation', artifactIds: ['report'], caption: 'Second delivery' } },
+    ] }
+    const assertOrder = () => {
+      const after = screen.getByText('Verify video after delivery')
+      const second = screen.getByText('Second delivery')
+      const cleanup = screen.getByText('Cleanup after second delivery')
+      expect(preview.compareDocumentPosition(after) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+      expect(after.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+      expect(second.compareDocumentPosition(cleanup) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+      expect(container.querySelector('img')).toBe(preview)
+    }
+    rerender(<MessageBubble message={continuing} messageStreaming />)
+    assertOrder()
+    expect(screen.getAllByRole('button', { name: 'Working' })).toEqual([work])
+    fireEvent.click(work)
+    expect(screen.queryByText('Verify video after delivery')).not.toBeInTheDocument()
+    expect(screen.queryByText('Cleanup after second delivery')).not.toBeInTheDocument()
+    expect(preview).toBeVisible()
+    expect(screen.getByText('Second delivery')).toBeVisible()
+    const finished: ChatMessage = { ...continuing, stream_outcome: outcome, segments: [...continuing.segments!,
+      { id: 'final', kind: 'text', phase: 'plain', order: 7, text: 'Final test results' },
+    ] }
+    rerender(<MessageBubble message={finished} />)
+    expect(screen.getByRole('button', { name: /^Worked/ })).toBe(work)
+    expect(screen.getByText('Final test results')).toBeVisible()
+    expect(container.querySelector('img')).toBe(preview)
+    fireEvent.click(work)
+    assertOrder()
+    expect(screen.getByText('Final test results').closest('[aria-label="过程分组"]')).toBeNull()
+  })
+
+  it('keeps streaming answer text below the presented image before completion', () => {
+    const message: ChatMessage = {
+      id: 'streaming-image-answer', role: 'assistant', timestamp: 1, content: '图片说明正在生成',
+      artifacts: [{ id: 'preview', name: 'preview.png', mime_type: 'image/png', data_url: 'data:image/png;base64,aA==' }],
+      tool_calls: [{ id: 'present', name: 'present_artifacts', source: 'native', status: 'completed',
+        structured_content: { type: 'artifact_presentation', artifactIds: ['preview'] } }],
+      segments: [
+        { id: 'present', kind: 'tool', phase: 'tool_loop', order: 0, tool_call_id: 'present' },
+        { id: 'answer', kind: 'text', phase: 'tool_loop', order: 1, text: '图片说明正在生成' },
+      ],
+    }
+    const { container, rerender } = render(<MessageBubble message={message} messageStreaming />)
+    const assertAnswerPosition = () => {
+      const answer = screen.getByText('图片说明正在生成')
+      expect(answer.closest('[aria-label="过程分组"]')).toBeNull()
+      expect(container.querySelector('img')!.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    }
+    assertAnswerPosition()
+    rerender(<MessageBubble message={message} />)
+    assertAnswerPosition()
+  })
+
+  it.each(['completed', 'cancelled', 'error', 'interrupted'])('keeps late deliveries visible with Work manually closed after %s', outcome => {
+    const message: ChatMessage = {
+      id: 'late-delivery', role: 'assistant', timestamp: 1, content: '动画已完成。',
+      segments: [
+        { id: 'read', kind: 'tool', phase: 'tool_loop', order: 0, tool_call_id: 'read' },
+        { id: 'answer', kind: 'text', phase: 'plain', order: 1, text: '动画已完成。' },
+        { id: 'present', kind: 'tool', phase: 'tool_loop', order: 2, tool_call_id: 'present' },
+      ],
+      toolCalls: [
+        { id: 'read', name: 'read_file', source: 'native', status: 'completed' },
+        { id: 'present', toolName: 'present_artifacts', source: 'native', status: 'running' },
+      ],
+    }
+    const { container, rerender } = render(<MessageBubble message={message} messageStreaming />)
+    const work = screen.getByRole('button', { name: 'Working' })
+    fireEvent.click(work)
+    const presented: ChatMessage = { ...message, toolCalls: [message.toolCalls![0], {
+      ...message.toolCalls![1], status: 'completed',
+      structuredContent: { type: 'artifact_presentation', artifact_ids: ['preview', 'html'], caption: '动画与预览' },
+    }] }
+    rerender(<MessageBubble message={presented} messageStreaming />)
+    expect(screen.getByLabelText('展示文件')).toHaveTextContent('2 个文件不可用')
+    const delivered: ChatMessage = { ...presented, artifacts: [
+      { id: 'preview', name: 'preview.png', mime_type: 'image/png', data_url: 'data:image/png;base64,aA==' },
+      { id: 'html', name: 'pelican-bike.html', mime_type: 'text/html', path: 'C:/workspace/pelican-bike.html' },
+    ] }
+    rerender(<MessageBubble message={delivered} messageStreaming />)
+    expect(work).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.getByLabelText('展示文件').closest('[aria-label="过程分组"]')).toBeNull()
+    expect(screen.getByRole('button', { name: /pelican-bike\.html/ })).toBeVisible()
+    expect(screen.getByText('动画已完成。')).toBeVisible()
+    expect(screen.queryByText(/个文件不可用/)).not.toBeInTheDocument()
+    rerender(<MessageBubble message={{ ...delivered, streamOutcome: outcome }} />)
+    expect(screen.getByRole('button', { name: /^Worked/ })).toBe(work)
+    expect(work).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.getByText('动画已完成。')).toBeVisible()
+    expect(screen.getByRole('button', { name: /pelican-bike\.html/ })).toBeVisible()
+    expect(container.querySelector('img')).toBeVisible()
+    fireEvent.click(work)
+    expect(screen.getAllByLabelText('展示文件')).toHaveLength(1)
+    expect(screen.getAllByRole('button', { name: /pelican-bike\.html/ })).toHaveLength(1)
+    expect(container.querySelectorAll('img')).toHaveLength(1)
+  })
+
+  it.each(['timeline', 'orphan', 'legacy'])('keeps delivered preview and HTML outside the single Work (%s)', shape => {
+    const message: ChatMessage = {
+      id: 'delivered-html', role: 'assistant', timestamp: 1, content: '动画已完成。',
+      artifacts: [
+        { id: 'preview', name: 'preview.png', mime_type: 'image/png', data_url: 'data:image/png;base64,aA==' },
+        { id: 'html', name: 'pelican-bike.html', mime_type: 'text/html', data_url: 'data:text/html;base64,aA==' },
+      ],
+      tool_calls: [
+        { id: 'read', name: 'read_file', source: 'native', status: 'completed' },
+        { id: 'present', name: 'present_artifacts', source: 'native', status: 'completed',
+          structured_content: { type: 'artifact_presentation', artifactIds: ['preview', 'html'], caption: '动画与预览' } },
+      ],
+      segments: shape === 'legacy' ? undefined : [
+        { id: 'read', kind: 'tool', phase: 'tool_loop', order: 0, tool_call_id: 'read' },
+        ...(shape === 'timeline' ? [{ id: 'present', kind: 'tool' as const, phase: 'tool_loop' as const, order: 1, tool_call_id: 'present' }] : []),
+        { id: 'final', kind: 'text', phase: 'plain', order: 2, text: '动画已完成。' },
+      ],
+    }
+    const { container, rerender } = render(<MessageBubble message={message} messageStreaming />)
+    const file = screen.getByRole('button', { name: /pelican-bike\.html/ })
+    expect(file.closest('[aria-label="过程分组"]')).toBeNull()
+    rerender(<MessageBubble message={message} />)
+    expect(screen.getByRole('button', { name: /pelican-bike\.html/ })).toBeVisible()
+    expect(container.querySelector('img')).toBeVisible()
+    expect(screen.getByText('动画与预览')).toBeVisible()
+    const worked = screen.getByRole('button', { name: /^Worked/ })
+    expect(worked).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.click(worked)
+    expect(screen.getAllByRole('button', { name: /pelican-bike\.html/ })).toHaveLength(1)
+    expect(container.querySelectorAll('img')).toHaveLength(1)
+    expect(screen.getAllByLabelText('过程分组')).toHaveLength(1)
+  })
+
   const artifact = {
     id: 'art_report',
     name: 'report.txt',
@@ -790,9 +1087,11 @@ describe('MessageBubble explicit artifact presentation', () => {
 
     render(<MessageBubble message={message} />)
 
-    const before = screen.getByText('before')
     const file = screen.getByRole('button', { name: /report\.txt/ })
     const after = screen.getByText('after')
+    expect(file).toBeVisible()
+    expect(after).toBeVisible()
+    const before = screen.getByText('before')
     expect(screen.getByText('Download report')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /hidden\.txt/ })).not.toBeInTheDocument()
     expect(before.compareDocumentPosition(file) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()

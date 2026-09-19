@@ -194,11 +194,7 @@ fn estimate_message_tokens(message: &Value) -> usize {
         .get("tool_calls")
         .map(|calls| estimate_tokens(&calls.to_string()))
         .unwrap_or(0);
-    let reasoning = message
-        .get("reasoning_content")
-        .and_then(Value::as_str)
-        .map(estimate_tokens)
-        .unwrap_or(0);
+    let reasoning = super::prepare::estimate_message_reasoning_tokens(message);
     let content = match message.get("content") {
         Some(Value::String(text)) => estimate_tokens(text),
         Some(other) => estimate_value_tokens(other),
@@ -303,6 +299,9 @@ fn render_multimodal_content(content: &Value) -> String {
 }
 
 fn render_content_part(part: &Value) -> String {
+    if part.get("type").and_then(Value::as_str) == Some("video_url") {
+        return "[video attachment omitted]".into();
+    }
     if let Some(kind) = part.get("type").and_then(Value::as_str) {
         if IMAGE_PART_TYPES.contains(&kind) {
             return IMAGE_PART_PLACEHOLDER.to_string();
@@ -842,12 +841,27 @@ fn estimate_model_messages_tokens(messages: &[ModelMessage]) -> usize {
     messages
         .iter()
         .map(|message| {
+            let native_reasoning: usize = message
+                .content
+                .iter()
+                .filter_map(|part| match part {
+                    MessagePart::ReasoningItem { item, .. } => {
+                        Some(super::prepare::estimate_reasoning_item_tokens(item))
+                    }
+                    _ => None,
+                })
+                .sum();
             let parts: usize = message
                 .content
                 .iter()
                 .map(|part| match part {
-                    MessagePart::Text { text } | MessagePart::Reasoning { text } => {
-                        estimate_tokens(text)
+                    MessagePart::Text { text } => estimate_tokens(text),
+                    MessagePart::Reasoning { text } => {
+                        if native_reasoning == 0 {
+                            estimate_tokens(text)
+                        } else {
+                            0
+                        }
                     }
                     MessagePart::ToolCall {
                         name,
@@ -859,11 +873,12 @@ fn estimate_model_messages_tokens(messages: &[ModelMessage]) -> usize {
                     // reasoning item 同理：encrypted_content 是密文 base64，按字符估算会
                     // 数倍虚高；其真实占用由 usage 锚点覆盖。
                     MessagePart::Image { .. }
+                    | MessagePart::Video { .. }
                     | MessagePart::ImageUrl { .. }
                     | MessagePart::ReasoningItem { .. } => 0,
                 })
                 .sum();
-            parts + 4
+            parts + native_reasoning + 4
         })
         .sum()
 }
@@ -1375,6 +1390,8 @@ pub(crate) async fn maybe_compact_send_view(env: &LoopEnv<'_>, state: &mut RunSt
     // 图片，任何情况下都是纯浪费，而 token 估算看不见它们（详见 `prune_image_parts`）。
     let saved_bytes = prune_image_parts(&mut state.runtime_messages, IMAGE_BYTES_BUDGET);
     if saved_bytes > 0 {
+        state.last_step_usage = None;
+        state.initial_anchor_valid = false;
         eprintln!("Chat context: pruned {saved_bytes} bytes of image data from the send view");
     }
     // 统一基准：裸窗口 × AUTO_COMPACT_RATIO（0.90），对齐 Codex。去掉 safe_window 折扣——
@@ -1385,7 +1402,7 @@ pub(crate) async fn maybe_compact_send_view(env: &LoopEnv<'_>, state: &mut RunSt
     }
     // 真实用量锚点口径（对齐 pi/opencode 的 ground-truth 优先）：有锚点时用 provider 实报的
     // 上次 prompt token 数 + 锚点响应起往后新增消息的字符估算；无锚点回落纯字符估算。
-    // 取 `max(纯估算)` 作保守下限，绝不因锚点偏小比现状更乐观。
+    // 纯估算仅用于没有有效实报的情况，不能覆盖已上报的用量。
     let budget = (window as f32 * AUTO_COMPACT_RATIO) as usize;
     // 纯字符估算 = 消息 + **工具 schema**（对齐 pi/footer 的兜底口径：pi 兜底含 system+每工具+消息；
     // Kivio footer 也含 `estimate_tool_segments`）。工具定义随每次请求发送、provider 会计入，漏算会
@@ -1433,7 +1450,7 @@ pub(crate) async fn maybe_compact_send_view(env: &LoopEnv<'_>, state: &mut RunSt
     } else {
         (None, 0)
     };
-    let (estimated, _anchored) =
+    let (estimated, anchored) =
         super::context_estimate::effective_context_tokens(anchor_prompt, trailing, estimate_full);
     // **内置路径的实时用量通道**：本函数每个 planning 轮都跑一次，且这两个数就是权威口径
     // （`compute_context_state` 用的是同一对函数 `anchor_total_tokens` +
@@ -1444,6 +1461,7 @@ pub(crate) async fn maybe_compact_send_view(env: &LoopEnv<'_>, state: &mut RunSt
     env.host.emit_context_usage_live(
         &config.conversation_id,
         estimated as u64,
+        super::context_estimate::token_count_source(anchored, trailing),
         Some(window as u64),
     );
     if estimated <= budget {

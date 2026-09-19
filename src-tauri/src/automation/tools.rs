@@ -17,7 +17,7 @@ use super::hotkeys::fingerprint as hotkey_fingerprint;
 use super::runner;
 use super::storage;
 use super::types::{
-    Automation, AutomationRun, NodeOutput, RunOrigin, SCHEMA_VERSION, ValidationIssue,
+    Automation, AutomationRun, NodeOutput, RunOrigin, ValidationIssue, SCHEMA_VERSION,
 };
 use super::validate;
 
@@ -134,13 +134,7 @@ pub(crate) async fn run(
     let automation = storage::get(app, &id)?;
     let input = parse_run_input(arguments.get("input"));
     let timeout = Duration::from_secs(parse_timeout_secs(arguments));
-    let started = runner::enqueue(
-        app.clone(),
-        id.clone(),
-        RunOrigin::Agent,
-        None,
-        input,
-    )?;
+    let started = runner::enqueue(app.clone(), id.clone(), RunOrigin::Agent, None, input)?;
     let run_id = started.run_id;
     let mut guard = CancelOnDrop {
         app: app.clone(),
@@ -224,8 +218,8 @@ fn parse_upsert_automation(arguments: &Value) -> Result<Automation, String> {
         .get("automation")
         .cloned()
         .ok_or_else(|| "automation object is required".to_string())?;
-    let mut automation: Automation = serde_json::from_value(value)
-        .map_err(|err| format!("invalid automation graph: {err}"))?;
+    let mut automation: Automation =
+        serde_json::from_value(value).map_err(|err| format!("invalid automation graph: {err}"))?;
     automation.schema_version = SCHEMA_VERSION;
     Ok(automation)
 }
@@ -309,10 +303,7 @@ fn clip_run(run: &AutomationRun) -> Value {
 }
 
 fn last_output(run: &AutomationRun) -> Option<String> {
-    run.nodes
-        .iter()
-        .rev()
-        .find_map(|node| node.output.clone())
+    run.nodes.iter().rev().find_map(|node| node.output.clone())
 }
 
 fn run_tool_result(name: &str, run: &AutomationRun) -> McpToolCallResult {
@@ -352,7 +343,10 @@ fn run_tool_result(name: &str, run: &AutomationRun) -> McpToolCallResult {
     }
 }
 
-fn validation_error(issues: &[ValidationIssue], automation: Option<&Automation>) -> McpToolCallResult {
+fn validation_error(
+    issues: &[ValidationIssue],
+    automation: Option<&Automation>,
+) -> McpToolCallResult {
     let schema_hint = super::types::upsert_schema_hint();
     let body = json!({
         "ok": false,
@@ -418,7 +412,7 @@ fn clip(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::automation::types::{Automation, FlowNode, SCHEMA_VERSION, Vec2, Viewport};
+    use crate::automation::types::{Automation, FlowNode, Vec2, Viewport, SCHEMA_VERSION};
     use crate::automation::validate::{has_errors, prepare_for_upsert, validate};
 
     #[test]
@@ -491,7 +485,11 @@ mod tests {
         let mut automation: Automation =
             serde_json::from_str(crate::automation::types::UPSERT_MINIMAL_EXAMPLE).unwrap();
         prepare_for_upsert(&mut automation);
-        assert!(!has_errors(&validate(&automation)), "{:?}", validate(&automation));
+        assert!(
+            !has_errors(&validate(&automation)),
+            "{:?}",
+            validate(&automation)
+        );
     }
 
     #[test]
@@ -514,11 +512,7 @@ mod tests {
         });
         let result = validation_error(&issues, None);
         assert!(result.is_error);
-        assert!(
-            result.content.contains("schemaHint"),
-            "{}",
-            result.content
-        );
+        assert!(result.content.contains("schemaHint"), "{}", result.content);
         assert!(
             result.content.contains("trigger.schedule"),
             "{}",

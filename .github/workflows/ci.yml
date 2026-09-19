@@ -34,6 +34,12 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      - name: Check application icons
+        run: npm run icons:check
+
+      - name: Check desktop packaging contracts
+        run: npm run package:check && npm run test:packaging
+
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 

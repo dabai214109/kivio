@@ -1,6 +1,7 @@
 // Right Dock API 调用封装。模式镜像 src/chat/api.ts：
 // Tauri 运行时走 invoke，纯浏览器（npm run dev:ui）返回空树 / not_repo mock，保证预览不炸。
 import { invoke } from '@tauri-apps/api/core'
+import { api } from '../../api/tauri'
 import { isTauriRuntime } from '../utils'
 import {
   normalizeDockFsListResult,
@@ -22,6 +23,7 @@ import {
   type GitLogResult,
   type GitMutationResult,
   type GitRepoState,
+  type GitSnapshot,
 } from './types'
 
 const MOCK_NOT_REPO: GitRepoState = {
@@ -160,6 +162,11 @@ export const dockApi = {
     return normalizeGitRepoState(raw)
   },
 
+  async gitSnapshot(workdir: string, includeDiffStat = false): Promise<GitSnapshot> {
+    if (!isTauriRuntime()) return { state: MOCK_NOT_REPO, diffStat: null }
+    return api.dockGitSnapshot(workdir, includeDiffStat)
+  },
+
   async gitDiff(
     workdir: string,
     mode: 'branch' | 'working_tree' = 'working_tree',
@@ -170,9 +177,9 @@ export const dockApi = {
     return normalizeGitDiffResult(raw)
   },
 
-  async gitLog(workdir: string, limit = 50, skip = 0): Promise<GitLogResult> {
+  async gitLog(workdir: string, limit = 50, skip = 0, allBranches = true): Promise<GitLogResult> {
     if (!isTauriRuntime()) return { commits: [], hasMore: false }
-    const raw = await invoke('dock_git_log', { workdir, limit, skip })
+    const raw = await invoke('dock_git_log', { workdir, limit, skip, allBranches })
     return normalizeGitLogResult(raw)
   },
 

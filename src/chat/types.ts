@@ -238,7 +238,7 @@ export interface MessageUsage {
 
 export interface Attachment {
   id: string
-  type: 'image' | 'file'
+  type: 'image' | 'file' | 'video'
   name: string
   path: string
   /**
@@ -250,7 +250,7 @@ export interface Attachment {
 
 export interface PendingAttachment {
   id: string
-  type: 'image' | 'file'
+  type: 'image' | 'file' | 'video'
   name: string
   path: string
   /**
@@ -456,6 +456,7 @@ export type AgentPlanMode = 'act' | 'plan' | 'orchestrate'
 export type AgentPlanStatus = 'empty' | 'draft' | 'approved'
 
 export interface AgentPlanState {
+  document?: { id: string; title: string; path: string } | null
   mode?: AgentPlanMode
   status?: AgentPlanStatus
   plan?: string | null

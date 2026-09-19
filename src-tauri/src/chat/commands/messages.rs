@@ -791,33 +791,6 @@ fn edited_assistant_model_messages(message: &ChatMessage) -> Vec<ModelMessage> {
     }
 }
 
-pub(super) fn capture_agent_plan_draft_if_needed(
-    conversation: &mut Conversation,
-    original_plan_mode: bool,
-    content: &str,
-    stream_outcome: &str,
-) -> Option<AgentPlanState> {
-    if stream_outcome != "completed"
-        || !original_plan_mode
-        || !crate::chat::plan::is_plan_mode(&conversation.agent_plan_state)
-    {
-        return None;
-    }
-    let next_state =
-        crate::chat::plan::capture_draft_from_reply(&conversation.agent_plan_state, content);
-    if next_state == conversation.agent_plan_state {
-        return if crate::chat::plan::executable_plan_text(&next_state)
-            .is_some_and(|plan| plan == content.trim())
-        {
-            Some(next_state)
-        } else {
-            None
-        };
-    }
-    conversation.agent_plan_state = next_state.clone();
-    Some(next_state)
-}
-
 pub(super) fn assistant_model_messages_for_storage(
     content: &str,
     reasoning: Option<&str>,

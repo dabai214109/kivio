@@ -441,6 +441,9 @@ async fn recover_remediate(
     let text = match result {
         Ok((message, usage)) => {
             state.merge_usage(usage);
+            // 独立精简请求的实报仅进费用总账，不能代表仍保留的完整上下文。
+            state.last_step_usage = None;
+            state.initial_anchor_valid = false;
             sanitize_assistant_text_response(
                 message
                     .get("content")

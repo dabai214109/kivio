@@ -545,7 +545,7 @@ pub fn native_present_artifacts_tool() -> ChatToolDefinition {
     ChatToolDefinition {
         id: "native__present_artifacts".to_string(),
         name: "present_artifacts".to_string(),
-        description: "Show files or images in the chat. Call this when the user should see a file; reading or describing it does not display it. Pass only a short JSON of identifiers: copy `art_…` ids from tool results into artifact_ids, or pass existing disk paths. Never both for the same file. Never invent a path for a generated file. Never put file contents, image bytes, base64, or data URLs in any field. Caption is optional plain text. Max 16 files. Unselected files stay hidden. Example: {\"artifact_ids\":[\"art_…\"]}".to_string(),
+        description: "Prepare selected deliverables for final-answer references (default mode: prepare). For an existing local file, pass its path to obtain an art_ ID. In the final answer, place [label](artifact:art_ID) for a file or ![description](artifact:art_ID) for an image at the relevant paragraph. Files that already have IDs can be referenced directly without calling this tool. Use mode preview only when the user explicitly requests an immediate preview or must inspect alternatives before you continue. Do not present internal QA screenshots, extracted frames, drafts, or failed attempts by default. Pass only a short JSON of identifiers: copy `art_…` ids from tool results into artifact_ids, or pass existing disk paths. Never both for the same file. Never invent a path for a generated file. Never put file contents, image bytes, base64, or data URLs in any field. Caption is optional plain text. Max 16 files. Unselected files stay hidden. Example: {\"artifact_ids\":[\"art_…\"]}".to_string(),
         source: "native".to_string(),
         server_id: None,
         server_name: Some("Kivio".to_string()),
@@ -565,6 +565,11 @@ pub fn native_present_artifacts_tool() -> ChatToolDefinition {
                     "items": { "type": "string", "minLength": 1 },
                     "minItems": 1,
                     "maxItems": 16
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["prepare", "preview"],
+                    "description": "Defaults to prepare: register only selected final deliverables for inline references, without expanding them during work. preview immediately displays files for an explicit user preview/choice."
                 },
                 "caption": {
                     "type": "string",

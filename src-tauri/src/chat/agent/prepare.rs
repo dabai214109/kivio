@@ -32,7 +32,10 @@ pub fn apply_assistant_mcp_restrictions(
             return true;
         }
         match tool.server_id.as_deref() {
-            Some(server_id) => assistant.mcp_server_ids.iter().any(|id| id == server_id),
+            Some(server_id) => assistant
+                .mcp_server_ids
+                .iter()
+                .any(|id| crate::computer_control::mcp_server_ids_equivalent(id, server_id)),
             None => false,
         }
     });
@@ -84,7 +87,7 @@ pub fn available_builtin_tool_names(tools: &[ChatToolDefinition]) -> Vec<String>
 pub fn disabled_builtin_tool_feedback(function_name: &str) -> Option<String> {
     // Builtin name set = static native registry (17 native + todo/ask_user)
     // plus the non-native builtin sources listed here.
-    const EXTRA_BUILTIN_NAMES: &[&str] = &["mixer_generate_image"];
+    const EXTRA_BUILTIN_NAMES: &[&str] = &["mixer_generate_image", "mixer_video_analysis"];
     // 模型按 wire 名（保留名别名）调用——反查回内部名再比对注册表。
     let function_name = crate::mcp::types::resolve_reserved_wire_alias(function_name);
     let is_builtin = crate::mcp::native_registry::find_entry(function_name).is_some()
@@ -110,6 +113,9 @@ pub fn is_kivio_builtin_tool(tool: &ChatToolDefinition) -> bool {
 }
 
 pub fn builtin_tool_bypasses_approval(tool: &ChatToolDefinition) -> bool {
+    if tool.source == "mixer" && tool.name == "mixer_video_analysis" {
+        return true;
+    }
     if tool.source == "skill" && is_native_skill_tool_name(&tool.name) {
         return true;
     }
@@ -224,7 +230,7 @@ fn work_style_prompt(available_builtin_tools: &[String]) -> String {
         .any(|tool| tool.as_str() == "read");
     let has_tools = !available_builtin_tools.is_empty();
     let file_clause = if can_edit_files {
-        " after editing files you don't need to restate what changed (the user can see it)."
+        " After editing files, briefly report the outcome, relevant verification, and any remaining user action."
     } else {
         ""
     };
@@ -234,11 +240,14 @@ fn work_style_prompt(available_builtin_tools: &[String]) -> String {
     // 阶段性播报；交付前必须用工具验证（生成图片逐张 read 质检），这是 skill 定义的
     // 「生成→检查→重做」循环能真正执行的前提。
     let mut prompt = format!(
-        "How you work: address only the current request — no filler preamble on simple answers, no wrap-up postamble;{file_clause} Match length to the task: answer simple questions in a sentence or two, and expand into structured output only for complex or report-style tasks — don't pad to look thorough. When the user only asks how to do something or whether it's possible, answer first; don't jump to making changes, and don't do work they didn't ask for."
+        "How you work: address only the current request — no filler preamble on simple answers or generic sign-off.{file_clause} Match length to the task: answer simple questions in a sentence or two, and expand into structured output only for complex or report-style tasks — don't pad to look thorough. When the user only asks how to do something or whether it's possible, answer first; don't jump to making changes, and don't do work they didn't ask for."
     );
     if has_tools {
         prompt.push_str(
             " During multi-step tool work, keep the user oriented: before starting a new phase or changing course, say what you're doing in one short sentence — visible progress, not play-by-play; don't restate tool output. After waiting on a long job, report substance from the new output — what finished, failed, or was rate-limited — not that it is still running.",
+        );
+        prompt.push_str(
+            " Your final answer must be self-contained: intermediate progress, clarification cards and their answers, tool output, and reasoning are collapsed in the UI. Include the result and all remaining steps the user must perform, with the exact paths, commands, links, and settings they need, even if you already gave them before an ask_user question. Incorporate the user's selected answer. Never replace required instructions with 'see above', 'as described earlier', or a pointer into the work log. Repeat only what is needed to use the result, not the whole work history. Keep reasoning in the dedicated reasoning channel; do not put thinking transcripts, Thinking headings, or <think> blocks in the user-facing answer.",
         );
         prompt.push_str(
             " Before declaring a deliverable done, verify it with your tools instead of assuming success: re-open what you produced and check it against the request",
@@ -269,6 +278,59 @@ fn project_context_prompt(project: &ProjectPromptContext) -> String {
             project.name
         ),
     }
+}
+
+fn computer_control_system_prompt(
+    registry: &skills::SkillRegistry,
+    chat_tools: &ChatToolsConfig,
+    tools_available: bool,
+    assistant_snapshot: Option<&ChatAssistantSnapshot>,
+) -> Option<String> {
+    if !tools_available
+        || !chat_tools.enabled
+        || !chat_tools.native_tools.skill_runtime
+        || !chat_tools.native_tools.run_command
+        || !chat_tools.native_tools.read_file
+    {
+        return None;
+    }
+
+    let skill_available = |skill_id: &str| {
+        registry.find(skill_id).is_some()
+            && skill_allowed_for_conversation(chat_tools, assistant_snapshot, skill_id, false)
+    };
+    let mut lines = Vec::new();
+
+    if skill_available("playwright-cli") {
+        lines.push(
+            "- Browser interaction: prefer Playwright CLI over generic web tools; activate the `playwright-cli` skill before using it.",
+        );
+    }
+
+    if skill_available("cua-driver") {
+        let cua_server = chat_tools.servers.iter().find(|server| {
+            server.enabled
+                && !server.command.trim().is_empty()
+                && (crate::computer_control::is_cua_mcp_server_id(&server.id)
+                    || server.connector_id.as_deref() == Some("computer-control:cua")
+                    || server.connector_id.as_deref()
+                        == Some(crate::computer_control::LEGACY_CUA_MCP_CONNECTOR_ID))
+        });
+        let mcp_available = cua_server.is_some_and(|server| {
+            assistant_snapshot.is_none_or(|assistant| {
+                assistant.mcp_server_ids.iter().any(|server_id| {
+                    crate::computer_control::mcp_server_ids_equivalent(server_id, &server.id)
+                })
+            })
+        });
+        if mcp_available {
+            lines.push(
+                "- Desktop application interaction: prefer Cua Driver; activate the `cua-driver` skill and use its enabled MCP tools.",
+            );
+        }
+    }
+
+    (!lines.is_empty()).then(|| format!("Enabled computer-control tools:\n{}", lines.join("\n")))
 }
 
 pub fn build_chat_system_prompt_with_segments(
@@ -444,6 +506,21 @@ pub fn build_chat_system_prompt_with_segments(
                 text,
             );
         }
+
+        if let Some(text) = computer_control_system_prompt(
+            registry,
+            chat_tools,
+            tools_available,
+            assistant_snapshot,
+        ) {
+            append_context_segment(
+                &mut prompt,
+                &mut segments,
+                "runtime_context",
+                "Runtime context",
+                &text,
+            );
+        }
     }
 
     if let Some(plan) = agent_plan_prompt
@@ -555,24 +632,11 @@ pub fn build_chat_system_prompt_with_segments(
                 &native_prompt,
             );
         }
-        // Sub-agent delegation rules — only when the `agent` spawn tool is
-        // available. The `agent` call is BLOCKING + single-result (Claude Code
-        // Task model); to run sub-agents in parallel, emit MULTIPLE `agent` calls
-        // in ONE message — they execute concurrently and each returns its result.
-        // No polling/collection tool exists. Concise on purpose.
+        // Runtime control semantics are described by the sub-agent tools.
         if available_builtin_tools
             .iter()
             .any(|tool| tool.as_str() == crate::chat::sub_agent::AGENT_TOOL_NAME)
         {
-            let background_prompt =
-                "Delegating to sub-agents: each agent call BLOCKS, waits for the sub-agent to finish, and returns its full result directly. To run sub-agents in PARALLEL, emit MULTIPLE agent tool calls in a SINGLE message — they execute concurrently and each returns its own result. There is no polling or collection tool; do not look for one.";
-            append_context_segment(
-                &mut prompt,
-                &mut segments,
-                "native_tools",
-                "Native tools",
-                background_prompt,
-            );
             // Roles are data, not code: the available ones are listed in the
             // `agent` tool's `subagent_type` description, and a new permanent
             // role is just a `.md` file the model can write with its own tools.
@@ -815,6 +879,45 @@ pub(crate) const IMAGE_PART_TYPES: [&str; 3] = ["image_url", "input_image", "ima
 /// content-part `type` 值：文本部件（按其 `text` 字段估算）。
 pub(crate) const TEXT_PART_TYPES: [&str; 2] = ["text", "input_text"];
 
+/// 原生推理项的可读正文（无正文时用摘要）；密文不是 tokenizer 输入，不能按 base64 长度计数。
+pub(crate) fn estimate_reasoning_item_tokens(item: &Value) -> usize {
+    let text_tokens = |key: &str| -> Option<usize> {
+        let parts = item.get(key)?.as_array()?;
+        let texts: Vec<&str> = parts
+            .iter()
+            .filter_map(|p| p.get("text")?.as_str())
+            .filter(|text| !text.is_empty())
+            .collect();
+        (!texts.is_empty()).then(|| texts.into_iter().map(estimate_tokens).sum())
+    };
+    text_tokens("content")
+        .or_else(|| text_tokens("summary"))
+        .unwrap_or(0)
+}
+
+/// 同一推理可能同时保存在 reasoning_items 和 reasoning_content 中，只计算一份。
+pub(crate) fn estimate_message_reasoning_tokens(message: &Value) -> usize {
+    let native: usize = message
+        .get("reasoning_items")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .map(|entry| estimate_reasoning_item_tokens(entry.get("item").unwrap_or(entry)))
+                .sum()
+        })
+        .unwrap_or(0);
+    if native > 0 {
+        return native;
+    }
+    message
+        .get("reasoning_content")
+        .or_else(|| message.get("reasoning"))
+        .and_then(Value::as_str)
+        .map(estimate_tokens)
+        .unwrap_or(0)
+}
+
 /// 估算任意 `Value`（含多模态数组 content）的 token 数。**图片部件记 0**、文本部件按文本、
 /// 对象按 key+value 递归、字符串按 `estimate_tokens`。压缩侧（estimate_message_tokens /
 /// serialize）与上下文用量条（commands.rs::count_tokens_in_value 委托本函数）**共用同一口径**，
@@ -824,7 +927,28 @@ pub(crate) fn estimate_value_tokens(value: &Value) -> usize {
         Value::String(text) => estimate_tokens(text),
         Value::Array(items) => items.iter().map(estimate_value_tokens).sum(),
         Value::Object(map) => {
+            if map.contains_key("reasoning_items") {
+                return map
+                    .iter()
+                    .filter(|(key, _)| {
+                        !matches!(
+                            key.as_str(),
+                            "reasoning_items" | "reasoning_content" | "reasoning"
+                        )
+                    })
+                    .map(|(key, value)| estimate_tokens(key) + estimate_value_tokens(value))
+                    .sum::<usize>()
+                    + estimate_message_reasoning_tokens(value);
+            }
             if let Some(kind) = map.get("type").and_then(Value::as_str) {
+                if kind == "reasoning"
+                    && (map.contains_key("content") || map.contains_key("summary"))
+                {
+                    return estimate_reasoning_item_tokens(value);
+                }
+                if kind == "video_url" {
+                    return 0;
+                }
                 if IMAGE_PART_TYPES.contains(&kind) {
                     return 0;
                 }
@@ -910,6 +1034,7 @@ fn native_tools_prompt(available_builtin_tools: &[String], _has_workbench: bool)
     let has_web_search = has("web_search");
     let has_web_fetch = has("web_fetch");
     let has_image_generation = has("mixer_generate_image");
+    let has_video_analysis = has("mixer_video_analysis");
     let has_advisor = has("advisor");
     let has_present_artifacts = has("present_artifacts");
     let has_write = has("write");
@@ -996,8 +1121,11 @@ fn native_tools_prompt(available_builtin_tools: &[String], _has_workbench: bool)
     }
     if has_present_artifacts {
         bullets.push(
-            "When the user asks to show, preview, attach, or send a local file or image in the chat, you MUST call present_artifacts at the exact display point. Copy art_ ids from tool results into artifact_ids, or pass paths for existing local files. Arguments are those short strings only — never file contents, base64, or data URLs. Reading or analyzing a file does NOT display it.".to_string(),
+            "Keep internal QA screenshots, extracted frames, intermediate exports, drafts, and failed attempts in the work log by default. In your final answer, select only the deliverables and evidence the user needs. Put [label](artifact:art_ID) for a file or ![description](artifact:art_ID) for an image beside the relevant explanation, using exact art_ IDs from tool results. Do not put every generated file into a gallery or repeat a file card already referenced in the answer. To obtain an ID for a selected existing local file, you MUST call present_artifacts with paths; its default mode prepare registers files without expanding previews. Files with existing IDs can be referenced directly. Use present_artifacts with mode preview only when the user explicitly asks to see work now or needs to inspect alternatives to decide how to continue. Reading or analyzing a file does NOT display it. Never invent file IDs or paths, and never pass file contents, base64, or data URLs as identifiers.".to_string(),
         );
+    }
+    if has_video_analysis {
+        bullets.push("When the user's request needs video details not already in saved observations, call mixer_video_analysis yourself. Do not ask the user to choose an analysis mode or type a command. Reuse observations for follow-ups; unrelated messages need no analysis.".to_string());
     }
     if has_image_generation {
         bullets.push(
@@ -1059,6 +1187,20 @@ mod tests {
         assert!(!prompt.contains("verify it with your tools"), "{prompt}");
     }
 
+    #[test]
+    fn work_style_prompt_requires_actionable_final_answer_after_clarification() {
+        for tools in [vec!["ask_user".to_string()], vec!["bash".to_string()]] {
+            let prompt = work_style_prompt(&tools);
+            assert!(prompt.contains("final answer must be self-contained"));
+            assert!(prompt.contains("exact paths, commands, links, and settings"));
+            assert!(prompt.contains("before an ask_user question"));
+            assert!(prompt.contains("Incorporate the user's selected answer"));
+            assert!(prompt.contains("dedicated reasoning channel"));
+            assert!(!prompt.contains("don't need to restate what changed"));
+            assert!(!prompt.contains("no wrap-up postamble"));
+        }
+    }
+
     fn test_assistant_snapshot(
         mcp_server_ids: Vec<&str>,
         skill_ids: Vec<&str>,
@@ -1073,6 +1215,27 @@ mod tests {
             model: String::new(),
             mcp_server_ids: mcp_server_ids.into_iter().map(str::to_string).collect(),
             skill_ids: skill_ids.into_iter().map(str::to_string).collect(),
+        }
+    }
+
+    fn test_skill_record(id: &str) -> skills::SkillRecord {
+        skills::SkillRecord {
+            meta: skills::SkillMeta {
+                id: id.to_string(),
+                name: id.to_string(),
+                description: String::new(),
+                source: "user".to_string(),
+                path: None,
+                recommended_tools: Vec::new(),
+                disable_model_invocation: false,
+                files: Vec::new(),
+                triggers: Vec::new(),
+                argument_hint: None,
+                arguments: Vec::new(),
+            },
+            location: std::path::PathBuf::new(),
+            base_dir: std::path::PathBuf::new(),
+            body: String::new(),
         }
     }
 
@@ -1135,6 +1298,103 @@ mod tests {
         assert!(prompt.contains("bash"));
         assert!(!prompt.contains("web_search"));
         assert!(!prompt.contains("web_fetch"));
+    }
+
+    #[test]
+    fn chat_prompt_mentions_enabled_playwright_cli() {
+        let registry = skills::SkillRegistry {
+            records: vec![test_skill_record("playwright-cli")],
+            warnings: Vec::new(),
+        };
+        let mut chat_tools = crate::settings::ChatToolsConfig::default();
+        chat_tools.enabled = true;
+        chat_tools.native_tools.skill_runtime = true;
+        chat_tools.native_tools.run_command = true;
+        chat_tools.native_tools.read_file = true;
+
+        let build = |chat_tools: &crate::settings::ChatToolsConfig| {
+            build_chat_system_prompt(
+                "zh-CN",
+                false,
+                false,
+                &registry,
+                chat_tools,
+                true,
+                &["bash".to_string(), "read".to_string()],
+                None,
+                None,
+                None,
+                None,
+                "",
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &[],
+            )
+        };
+
+        let prompt = build(&chat_tools);
+        assert!(
+            prompt.contains("Enabled computer-control tools"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("prefer Playwright CLI over generic web tools"),
+            "{prompt}"
+        );
+
+        chat_tools.disabled_skill_ids = vec!["playwright-cli".to_string()];
+        let disabled_prompt = build(&chat_tools);
+        assert!(
+            !disabled_prompt.contains("prefer Playwright CLI"),
+            "{disabled_prompt}"
+        );
+    }
+
+    #[test]
+    fn computer_control_prompt_requires_cua_skill_and_mcp() {
+        let registry = skills::SkillRegistry {
+            records: vec![test_skill_record("cua-driver")],
+            warnings: Vec::new(),
+        };
+        let mut chat_tools = crate::settings::ChatToolsConfig::default();
+        chat_tools.enabled = true;
+        chat_tools.native_tools.skill_runtime = true;
+        chat_tools.native_tools.run_command = true;
+        chat_tools.native_tools.read_file = true;
+        chat_tools.servers.push(crate::settings::ChatMcpServer {
+            id: "computer-control-cua-driver".to_string(),
+            name: "Cua Driver".to_string(),
+            enabled: true,
+            command: "cua-driver".to_string(),
+            args: vec!["mcp".to_string()],
+            ..Default::default()
+        });
+
+        let prompt =
+            computer_control_system_prompt(&registry, &chat_tools, true, None).expect("Cua prompt");
+        assert!(prompt.contains("prefer Cua Driver"), "{prompt}");
+
+        let legacy_assistant = test_assistant_snapshot(
+            vec![crate::computer_control::LEGACY_CUA_MCP_SERVER_ID],
+            vec!["cua-driver"],
+        );
+        assert!(computer_control_system_prompt(
+            &registry,
+            &chat_tools,
+            true,
+            Some(&legacy_assistant),
+        )
+        .is_some());
+
+        chat_tools.servers[0].enabled = false;
+        assert!(computer_control_system_prompt(&registry, &chat_tools, true, None).is_none());
     }
 
     #[test]
@@ -1349,8 +1609,11 @@ mod tests {
         );
 
         assert!(prompt.contains("MUST call present_artifacts"));
-        assert!(prompt.contains("Copy art_ ids from tool results into artifact_ids"));
-        assert!(prompt.contains("paths for existing local files"));
+        assert!(prompt.contains("using exact art_ IDs from tool results"));
+        assert!(prompt.contains("selected existing local file"));
+        assert!(prompt.contains("mode prepare"));
+        assert!(prompt.contains("[label](artifact:art_ID)"));
+        assert!(prompt.contains("Internal QA") || prompt.contains("internal QA"));
         assert!(prompt.contains("Reading or analyzing a file does NOT display it"));
     }
 
@@ -1506,6 +1769,18 @@ mod tests {
         assert!(tools
             .iter()
             .any(|t| t.source == "mcp" && t.server_id.as_deref() == Some("demo")));
+    }
+
+    #[test]
+    fn assistant_mcp_restrictions_accept_legacy_cua_id() {
+        let assistant = test_assistant_snapshot(vec!["plugin-cua-driver"], vec![]);
+        let mut cua = test_mcp_tool();
+        cua.server_id = Some("computer-control-cua-driver".to_string());
+        let mut tools = vec![cua];
+
+        apply_assistant_mcp_restrictions(&mut tools, Some(&assistant));
+
+        assert_eq!(tools.len(), 1);
     }
 
     #[test]
@@ -1796,6 +2071,49 @@ mod tests {
     }
 
     #[test]
+    fn orchestrate_system_prompt_supports_main_work_and_targeted_followups() {
+        let state = crate::chat::plan::with_mode(
+            &crate::chat::types::AgentPlanState::default(),
+            crate::chat::types::AgentPlanMode::Orchestrate,
+        );
+        let sources = resolve_runtime_prompt_sources(false, "", "", &state);
+        let prompt = build_chat_system_prompt(
+            "zh-CN",
+            false,
+            true,
+            &skills::SkillRegistry::default(),
+            &crate::settings::ChatToolsConfig::default(),
+            true,
+            &[
+                "agent".to_string(),
+                "agent_control".to_string(),
+                "read_file".to_string(),
+            ],
+            None,
+            None,
+            None,
+            None,
+            &sources.custom_system_prompt,
+            sources.is_chat_runtime,
+            None,
+            sources.agent_plan_prompt.as_deref(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &[],
+        );
+        assert!(prompt.contains("advance the main task yourself"));
+        assert!(prompt.contains("specific results you need"));
+        assert!(prompt.contains("Sub-agent roles:"));
+        assert!(!prompt.contains("each agent call BLOCKS"));
+        assert!(!prompt.contains("There is no polling or collection tool"));
+        assert!(!prompt.contains("Required flow"));
+    }
+
+    #[test]
     fn native_tools_prompt_keeps_finite_bash_in_foreground() {
         let names = vec![
             "bash".to_string(),
@@ -1815,10 +2133,7 @@ mod tests {
             !prompt.contains("start it once with background:true"),
             "must not push finite jobs to background: {prompt}"
         );
-        assert!(
-            !prompt.contains("Pass a larger wait_ms"),
-            "{prompt}"
-        );
+        assert!(!prompt.contains("Pass a larger wait_ms"), "{prompt}");
     }
 
     #[test]

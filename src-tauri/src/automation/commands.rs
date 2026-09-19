@@ -68,7 +68,12 @@ pub fn automation_run(
 }
 
 #[tauri::command]
-pub fn automation_test_node(app: AppHandle, id: String, node_id: String, input: super::types::NodeOutput) -> Result<AutomationRunStarted, String> {
+pub fn automation_test_node(
+    app: AppHandle,
+    id: String,
+    node_id: String,
+    input: super::types::NodeOutput,
+) -> Result<AutomationRunStarted, String> {
     runner::test_node(app, id, node_id, input)
 }
 

@@ -40,7 +40,11 @@ pub(crate) async fn chat_set_agent_plan_mode(
     let mut conversation = crate::chat::repository::repository(&app)
         .mutate(&app, &conversation_id, |conversation| {
             if mode != crate::chat::types::AgentPlanMode::Act {
-                if let Some(goal) = conversation.goal_state.as_mut().filter(|g| crate::chat::goal::is_running(g.status)) {
+                if let Some(goal) = conversation
+                    .goal_state
+                    .as_mut()
+                    .filter(|g| crate::chat::goal::is_running(g.status))
+                {
                     goal.version += 1;
                     goal.status = crate::chat::types::GoalStatus::Paused;
                     goal.status_reason = Some("Paused because the Agent mode changed".into());
@@ -72,59 +76,22 @@ pub(crate) async fn chat_set_agent_plan_mode(
 #[tauri::command]
 pub(crate) async fn chat_execute_agent_plan(
     app: AppHandle,
+    state: State<'_, AppState>,
     conversation_id: String,
     message_id: Option<String>,
 ) -> Result<serde_json::Value, String> {
-    let mut conversation = crate::chat::repository::repository(&app)
-        .mutate(&app, &conversation_id, |conversation| {
-            approve_agent_plan_for_execution(conversation, message_id.as_deref())
-        })
-        .await
-        .map_err(crate::chat::repository::repository_error)?;
-    emit_chat_plan_state(
-        &app,
-        &conversation.id,
-        conversation.revision,
-        &conversation.agent_plan_state,
-    );
-
-    strip_transcripts_for_frontend(&mut conversation);
-    Ok(serde_json::json!({
-        "success": true,
-        "conversation": conversation,
-        "planState": conversation.agent_plan_state,
-    }))
-}
-
-pub(super) fn approve_agent_plan_for_execution(
-    conversation: &mut Conversation,
-    message_id: Option<&str>,
-) -> Result<(), String> {
-    let selected_plan =
-        if let Some(message_id) = message_id.map(str::trim).filter(|id| !id.is_empty()) {
-            Some({
-                let message = conversation
-                    .messages
-                    .iter_mut()
-                    .find(|message| message.id == message_id && message.role == "assistant")
-                    .ok_or_else(|| "计划消息不存在".to_string())?;
-                let plan_state = message
-                    .agent_plan
-                    .as_ref()
-                    .ok_or_else(|| "该消息不是可执行计划".to_string())?;
-                if crate::chat::plan::executable_plan_text(plan_state).is_none() {
-                    return Err("该消息不是可执行计划".to_string());
-                }
-                let approved = crate::chat::plan::approve(plan_state);
-                message.agent_plan = Some(approved.clone());
-                approved
-            })
-        } else {
-            None
-        };
-    conversation.agent_plan_state =
-        selected_plan.unwrap_or_else(|| crate::chat::plan::approve(&conversation.agent_plan_state));
-    Ok(())
+    // Legacy command uses the same reserved send path as the document card.
+    super::send::chat_send_message(
+        app,
+        state,
+        conversation_id,
+        "按这条计划开始执行。".into(),
+        vec![],
+        None,
+        None,
+        Some(message_id.unwrap_or_default()),
+    )
+    .await
 }
 
 /// 取消指定对话的当前 Chat 生成或工具执行。
@@ -137,7 +104,11 @@ pub(crate) async fn chat_cancel_stream(
     state.cancel_chat_generation(&conversation_id);
     if let Ok(conversation) = crate::chat::repository::repository(&app)
         .mutate(&app, &conversation_id, |conversation| {
-            if let Some(goal) = conversation.goal_state.as_mut().filter(|g| crate::chat::goal::is_running(g.status)) {
+            if let Some(goal) = conversation
+                .goal_state
+                .as_mut()
+                .filter(|g| crate::chat::goal::is_running(g.status))
+            {
                 goal.version += 1;
                 goal.status = crate::chat::types::GoalStatus::Paused;
                 goal.status_reason = Some("Paused by user".into());
@@ -145,7 +116,8 @@ pub(crate) async fn chat_cancel_stream(
                 goal.updated_at = chrono::Local::now().timestamp();
             }
             Ok(())
-        }).await
+        })
+        .await
     {
         crate::chat::goal::emit_goal_state(&app, &conversation);
     }

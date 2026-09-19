@@ -182,6 +182,7 @@ impl OpenAiResponsesProvider<'_> {
     }
 
     async fn generate_inner(&self, request: GenerateRequest) -> Result<GenerateOutput, ModelError> {
+        crate::chat::video::reject_unimplemented_transport(&request, "Responses")?;
         let label = request_label(&request, "Responses API");
         let started_at = chrono::Local::now().timestamp();
         let started = std::time::Instant::now();
@@ -314,6 +315,7 @@ impl OpenAiResponsesProvider<'_> {
         sink: &mut (dyn StreamSink + Send),
     ) -> Result<GenerateOutput, ModelError> {
         let label = request_label(&request, "Responses stream");
+        crate::chat::video::reject_unimplemented_transport(&request, "Responses")?;
         let started_at = chrono::Local::now().timestamp();
         let started = std::time::Instant::now();
         let mut measured_sink = FirstTokenStreamSink::new(sink, started);
@@ -516,8 +518,7 @@ impl OpenAiResponsesProvider<'_> {
             } else {
                 // summary 必须显式要：官方不 opt-in 就不会下流式思考标题，界面空等
                 // 几十秒再出正文。auto 随模型给 concise/detailed。
-                body["reasoning"] =
-                    serde_json::json!({ "effort": effort, "summary": "auto" });
+                body["reasoning"] = serde_json::json!({ "effort": effort, "summary": "auto" });
                 // 无状态模式：Responses 的 `store` 默认 true（服务端保存会话状态并按
                 // response id 串联轮次）。我们每轮都自带完整 input，不依赖服务端状态，
                 // 让服务端白存一份没有意义；代理渠道多半也没真正实现存储。

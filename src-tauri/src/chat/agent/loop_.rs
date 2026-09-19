@@ -117,16 +117,16 @@ pub(crate) struct RunState {
 pub(crate) const COMPACTION_THRASH_LIMIT: u32 = 2;
 
 impl RunState {
-    /// 把单次模型调用的 usage 累加进本轮总账（None 入参不改变现状）。
+    /// 把单次模型调用的 usage 累加进本轮总账；缺失实报时清除当前锚点。
     /// 同时把这次调用记为**真实用量锚点**（`last_step_usage`）——累计 `usage` 是多步之和不能当
     /// 锚点，锚点必须是单次调用的 usage。`runtime_len_at_last_call`（trailing 切点）不在这里设，
     /// 而在 `rounds.rs` push 完该次响应后设——保证 trailing = 锚点响应**之后**新增（对齐 pi、避免
     /// 与锚点里的 output 双算）。
-    /// 注：即便这次是 recovery（发送的是精简/压缩输入）导致锚点偏小，`effective_context_tokens`
-    /// 的 `max(纯估算)` 下限也会兜底，绝不会因锚点偏小而比现状更乐观。
+    /// 使用独立精简输入的 recovery 必须清除锚点，它的实报不代表完整运行上下文。
     pub(crate) fn merge_usage(&mut self, next: Option<crate::chat::model::ModelUsage>) {
+        self.last_step_usage = next.clone();
+        self.initial_anchor_valid = false;
         let Some(next) = next else { return };
-        self.last_step_usage = Some(next.clone());
         let total = self.usage.get_or_insert_with(Default::default);
         let add = |slot: &mut Option<u64>, value: Option<u64>| {
             if let Some(value) = value {
@@ -163,6 +163,7 @@ struct HookRunGuard<'a> {
 
 impl Drop for HookRunGuard<'_> {
     fn drop(&mut self) {
+        self.host.run_ended(self.conversation_id);
         if let Some(hooks) = self.hooks {
             if !self
                 .host
@@ -359,8 +360,43 @@ pub async fn run_agent_loop(
             // 已经落进历史，本轮还没开始调模型）。信箱为空时零开销。
             inject_steering_messages(&env, &mut state, round).await?;
 
+            let incoming = host
+                .checkpoint_runtime(
+                    &config.conversation_id,
+                    &config.run_id,
+                    &state.runtime_messages,
+                    false,
+                )
+                .await?;
+            state.runtime_messages.extend(incoming.iter().cloned());
+            state.generated_api_messages.extend(
+                incoming
+                    .into_iter()
+                    .filter(|message| message["subagent_parent_persisted"] != true),
+            );
+
             let planned = match planning_step(&env, &mut state, round).await? {
                 PlanningStepOutcome::FinalAnswer => {
+                    let incoming = host
+                        .checkpoint_runtime(
+                            &config.conversation_id,
+                            &config.run_id,
+                            &state.runtime_messages,
+                            true,
+                        )
+                        .await?;
+                    if !incoming.is_empty() {
+                        if let Some(message) = state.planning_final_message.take() {
+                            absorb_final_answer(&mut state, message);
+                        }
+                        state.runtime_messages.extend(incoming.iter().cloned());
+                        state.generated_api_messages.extend(
+                            incoming
+                                .into_iter()
+                                .filter(|message| message["subagent_parent_persisted"] != true),
+                        );
+                        continue;
+                    }
                     // 立刻引导：终答时还有没送达的插话 ⇒ 吸收终答、下一轮轮首注入。
                     // 原生 follow-up：等终答，不打断工具循环；吸收后在本边界注入一条再续跑。
                     if steering_pending(&env, &mut state) {
@@ -385,7 +421,7 @@ pub async fn run_agent_loop(
                     return Ok(attach_usage(result, &mut state))
                 }
                 PlanningStepOutcome::Recovered(result) => {
-                    return Ok(attach_usage(result, &mut state))
+                    return Ok(attach_usage(result, &mut state));
                 }
                 PlanningStepOutcome::Cancelled(result) => {
                     if let Some(hooks) = hooks {
@@ -426,8 +462,43 @@ pub async fn run_agent_loop(
                 &state.generated_api_messages,
             )
             .await;
+            let incoming = host
+                .checkpoint_runtime(
+                    &config.conversation_id,
+                    &config.run_id,
+                    &state.runtime_messages,
+                    false,
+                )
+                .await?;
+            state.runtime_messages.extend(incoming.iter().cloned());
+            state.generated_api_messages.extend(
+                incoming
+                    .into_iter()
+                    .filter(|message| message["subagent_parent_persisted"] != true),
+            );
         }
     }
+
+    // A managed tool may finish cleanup after cancellation. Recheck before
+    // synthesis, including the tool-round-limit path that skips the loop top.
+    if !host.is_generation_active(&config.conversation_id, config.generation) {
+        let result = cancelled_run_result_from_state(&env, &mut state);
+        return Ok(attach_usage(result, &mut state));
+    }
+    let incoming = host
+        .checkpoint_runtime(
+            &config.conversation_id,
+            &config.run_id,
+            &state.runtime_messages,
+            true,
+        )
+        .await?;
+    state.runtime_messages.extend(incoming.iter().cloned());
+    state.generated_api_messages.extend(
+        incoming
+            .into_iter()
+            .filter(|message| message["subagent_parent_persisted"] != true),
+    );
 
     if state.provider_tools_unsupported {
         patch_system_message(

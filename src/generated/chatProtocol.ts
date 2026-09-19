@@ -15,7 +15,7 @@ export type ChatToolArtifactPayload = { id: string | null, name: string, mimeTyp
 
 export type ChatToolPayload = { id: string, name: string, source: string, serverId: string | null, status: string, argumentsPreview: string, resultPreview: string | null, error: string | null, startedAt: number | null, completedAt: number | null, durationMs: number | null, round: number, sensitive: boolean, artifacts: Array<ChatToolArtifactPayload>, traceId: string | null, spanId: string | null, structuredContent: unknown, };
 
-export type ChatContextUsagePayload = { usedTokens: number, contextWindowTokens: number | null, };
+export type ChatContextUsagePayload = { usedTokens: number, contextWindowTokens: number | null, tokenCountSource: string | null, };
 
 export type ChatRunRecoveryMetadata = { groupId: string, groupSize: number, armIndex: number, providerId: string, model: string, };
 
@@ -29,7 +29,7 @@ export type ChatPlanMode = "act" | "plan" | "orchestrate";
 
 export type ChatPlanStatus = "empty" | "draft" | "approved";
 
-export type ChatPlanStatePayload = { mode: ChatPlanMode, status: ChatPlanStatus, plan: string | null, updatedAt: number, };
+export type ChatPlanStatePayload = { document?: { id: string, title: string, path: string, }, mode: ChatPlanMode, status: ChatPlanStatus, plan: string | null, updatedAt: number, };
 
 export type ChatGoalStatus = "active" | "verifying" | "waiting" | "paused" | "blocked" | "completed" | "cancelled";
 

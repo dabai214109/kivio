@@ -62,6 +62,7 @@ pub struct GitDiffResponse {
     pub stat: String,
     pub truncated: bool,
     pub binary_files: Vec<String>,
+    pub file_stats: Vec<GitDiffStatFile>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +74,7 @@ pub struct GitCommitItem {
     pub author_name: String,
     pub author_date: String,
     pub refs: Vec<String>,
+    pub parents: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,6 +161,8 @@ fn kill_git_process_tree(pid: u32, child: &mut Child) {
 }
 
 fn run_git(workdir: &str, args: &[&str]) -> Result<Output, String> {
+    #[cfg(test)]
+    tests::record_git_command(args);
     let mut command = Command::new("git");
     configure_git_command(&mut command);
     command
@@ -630,6 +634,7 @@ fn git_diff_sync(
             stat: String::new(),
             truncated,
             binary_files,
+            file_stats: Vec::new(),
         });
     }
 
@@ -680,6 +685,7 @@ fn git_diff_sync(
         stat,
         truncated,
         binary_files,
+        file_stats: Vec::new(),
     })
 }
 
@@ -756,6 +762,18 @@ fn git_commit_diff_sync(
     let output = git_success(&state.repo_root, &arg_refs)?;
     let (stat, patch) = split_stat_and_patch(&output.stdout);
     let (patch, truncated) = truncate_patch(patch);
+    // Statistics are independent of the capped patch, including binary and renamed files.
+    let stat_args: Vec<String> = args
+        .iter()
+        .filter(|arg| *arg != "--patch" && *arg != "--stat")
+        .cloned()
+        .collect();
+    let mut stat_args = stat_args;
+    stat_args.insert(1, "--numstat".into());
+    stat_args.insert(2, "-z".into());
+    let stat_refs: Vec<&str> = stat_args.iter().map(String::as_str).collect();
+    let stat_output = git_success(&state.repo_root, &stat_refs)?;
+    let (file_stats, binary_files) = parse_commit_numstat(&stat_output.stdout);
     Ok(GitDiffResponse {
         base_ref: if first_parent.is_empty() {
             "ROOT".to_string()
@@ -764,11 +782,12 @@ fn git_commit_diff_sync(
         },
         head_ref: commit,
         mode: "commit".to_string(),
-        files: clean_path.into_iter().collect(),
+        files: file_stats.iter().map(|file| file.path.clone()).collect(),
         patch,
         stat,
         truncated,
-        binary_files: Vec::new(),
+        binary_files,
+        file_stats,
     })
 }
 
@@ -786,6 +805,37 @@ pub async fn dock_git_commit_diff(
 }
 
 // ---- log ----
+
+fn parse_commit_numstat(raw: &str) -> (Vec<GitDiffStatFile>, Vec<String>) {
+    let mut records = raw.split('\0');
+    let mut files = Vec::new();
+    let mut binary = Vec::new();
+    while let Some(record) = records.next() {
+        let mut columns = record.splitn(3, '\t');
+        let (Some(adds), Some(dels), Some(path)) = (columns.next(), columns.next(), columns.next())
+        else {
+            continue;
+        };
+        let path = if path.is_empty() {
+            let _old = records.next();
+            records.next().unwrap_or("")
+        } else {
+            path
+        };
+        if path.is_empty() {
+            continue;
+        }
+        if adds == "-" || dels == "-" {
+            binary.push(path.to_string());
+        }
+        files.push(GitDiffStatFile {
+            path: path.to_string(),
+            additions: adds.parse().unwrap_or(0),
+            deletions: dels.parse().unwrap_or(0),
+        });
+    }
+    (files, binary)
+}
 
 fn parse_git_refs(raw: &str) -> Vec<String> {
     let mut refs = Vec::new();
@@ -824,6 +874,12 @@ fn parse_git_log(raw: &str) -> Vec<GitCommitItem> {
                 author_name: fields[3].trim().to_string(),
                 author_date: fields[4].trim().to_string(),
                 subject: fields[5].trim().to_string(),
+                parents: fields
+                    .get(6)
+                    .unwrap_or(&"")
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect(),
             })
         })
         .collect()
@@ -833,6 +889,7 @@ fn git_log_sync(
     workdir: &str,
     limit: Option<usize>,
     skip: Option<usize>,
+    all_branches: bool,
 ) -> Result<GitLogResponse, String> {
     let state = ensure_ready_state(workdir)?;
     if !ref_exists(&state.repo_root, "HEAD") {
@@ -850,10 +907,14 @@ fn git_log_sync(
         "log".to_string(),
         "--date=iso-strict".to_string(),
         "--decorate=short".to_string(),
-        "--pretty=format:%x1e%H%x1f%h%x1f%D%x1f%an%x1f%aI%x1f%s".to_string(),
+        "--topo-order".to_string(),
+        "--pretty=format:%x1e%H%x1f%h%x1f%D%x1f%an%x1f%aI%x1f%s%x1f%P".to_string(),
         "--max-count".to_string(),
         (limit + 1).to_string(),
     ];
+    if all_branches {
+        args.extend(["--branches", "--remotes", "HEAD"].map(str::to_string));
+    }
     if skip > 0 {
         args.push(format!("--skip={skip}"));
     }
@@ -870,10 +931,13 @@ pub async fn dock_git_log(
     workdir: String,
     limit: Option<usize>,
     skip: Option<usize>,
+    all_branches: Option<bool>,
 ) -> Result<GitLogResponse, String> {
-    tauri::async_runtime::spawn_blocking(move || git_log_sync(&workdir, limit, skip))
-        .await
-        .map_err(|e| format!("dock_git_log join: {e}"))?
+    tauri::async_runtime::spawn_blocking(move || {
+        git_log_sync(&workdir, limit, skip, all_branches.unwrap_or(true))
+    })
+    .await
+    .map_err(|e| format!("dock_git_log join: {e}"))?
 }
 
 // ---- branches ----
@@ -1263,6 +1327,11 @@ pub struct GitDiffStatResponse {
 /// untracked 文件按行数计为新增（与 patch 合成同一 128KB / 文本约束，二进制不计行）。
 fn git_diff_stat_sync(workdir: &str) -> Result<GitDiffStatResponse, String> {
     let state = git_status_sync(workdir)?;
+    git_diff_stat_for_state(&state)
+}
+
+/// 复用本轮状态，避免徽标先 status、统计内部又 status 一次。
+fn git_diff_stat_for_state(state: &GitRepoState) -> Result<GitDiffStatResponse, String> {
     if state.status != "ready" {
         return Ok(GitDiffStatResponse {
             files_changed: 0,
@@ -1332,6 +1401,39 @@ pub async fn dock_git_diff_stat(workdir: String) -> Result<GitDiffStatResponse, 
         .map_err(|e| format!("dock_git_diff_stat join: {e}"))?
 }
 
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitSnapshotResponse {
+    pub state: GitRepoState,
+    pub diff_stat: Option<GitDiffStatResponse>,
+}
+
+fn git_snapshot_sync(
+    workdir: &str,
+    include_diff_stat: bool,
+) -> Result<GitSnapshotResponse, String> {
+    let state = git_status_sync(workdir)?;
+    // 统计是增强信息：失败仍返回分支状态，下轮刷新可恢复。
+    let diff_stat = if include_diff_stat && state.status == "ready" {
+        git_diff_stat_for_state(&state).ok()
+    } else {
+        None
+    };
+    Ok(GitSnapshotResponse { state, diff_stat })
+}
+
+#[tauri::command]
+pub async fn dock_git_snapshot(
+    workdir: String,
+    include_diff_stat: Option<bool>,
+) -> Result<GitSnapshotResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        git_snapshot_sync(&workdir, include_diff_stat.unwrap_or(false))
+    })
+    .await
+    .map_err(|e| format!("dock_git_snapshot join: {e}"))?
+}
+
 fn git_add_to_gitignore_sync(workdir: &str, path: String) -> Result<GitOperationResponse, String> {
     let state = ensure_ready_state(workdir)?;
     let path = validate_repo_relative_path(&path)?;
@@ -1388,9 +1490,29 @@ pub async fn dock_git_status(workdir: String) -> Result<GitRepoState, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static TEMP_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+    thread_local! {
+        static GIT_COMMANDS: RefCell<Option<Vec<Vec<String>>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn record_git_command(args: &[&str]) {
+        GIT_COMMANDS.with(|commands| {
+            if let Some(commands) = commands.borrow_mut().as_mut() {
+                commands.push(args.iter().map(|arg| arg.to_string()).collect());
+            }
+        });
+    }
+
+    fn capture_git_commands<T>(run: impl FnOnce() -> T) -> (T, Vec<Vec<String>>) {
+        GIT_COMMANDS.with(|commands| *commands.borrow_mut() = Some(Vec::new()));
+        let result = run();
+        let commands = GIT_COMMANDS.with(|commands| commands.borrow_mut().take().unwrap());
+        (result, commands)
+    }
 
     fn temp_dir(tag: &str) -> std::path::PathBuf {
         let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1490,6 +1612,26 @@ mod tests {
     }
 
     #[test]
+    fn commit_numstat_handles_renames_binary_and_unusual_paths() {
+        let (files, binary) = parse_commit_numstat(
+            "3\t2\t普通.txt\0-\t-\timage.png\00\t0\t\0old.txt\0new\tname.txt\0",
+        );
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].additions, 3);
+        assert_eq!(files[0].deletions, 2);
+        assert_eq!(files[2].path, "new\tname.txt");
+        assert_eq!(binary, vec!["image.png"]);
+    }
+
+    #[test]
+    fn log_preserves_all_merge_parents() {
+        let commits = parse_git_log(
+            "\x1emerge\x1fm\x1fHEAD -> main\x1fA\x1f2026-09-12\x1fmerge\x1fparent1 parent2 parent3",
+        );
+        assert_eq!(commits[0].parents, vec!["parent1", "parent2", "parent3"]);
+    }
+
+    #[test]
     fn untracked_patch_synthesis() {
         let dir = temp_dir("patch");
         fs::write(dir.join("note.txt"), "hello\nworld\n").expect("write note");
@@ -1561,6 +1703,38 @@ mod tests {
             ],
         )
         .expect("commit");
+        let log = git_log_sync(&root, Some(1), None, true).expect("root history");
+        assert_eq!(log.commits.len(), 1);
+        assert!(log.commits[0].parents.is_empty());
+        let root_diff = git_commit_diff_sync(&root, &log.commits[0].sha, None).expect("root diff");
+        assert_eq!(root_diff.file_stats[0].path, "a.txt");
+        assert_eq!(root_diff.file_stats[0].additions, 3);
+        git_success(&root, &["switch", "-c", "feature"]).expect("feature branch");
+        fs::write(dir.join("feature.txt"), "feature\n").expect("feature file");
+        git_success(&root, &["add", "feature.txt"]).expect("stage feature");
+        git_success(
+            &root,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-m",
+                "feature",
+            ],
+        )
+        .expect("feature commit");
+        git_success(&root, &["checkout", "--detach", &log.commits[0].sha]).expect("return to root");
+        let all = git_log_sync(&root, Some(50), None, true).expect("all branches");
+        let current = git_log_sync(&root, Some(50), None, false).expect("current history");
+        assert_eq!(all.commits.len(), 2);
+        assert_eq!(current.commits.len(), 1);
+        assert_eq!(all.commits[0].parents, vec![log.commits[0].sha.clone()]);
+        let feature_diff =
+            git_commit_diff_sync(&root, &all.commits[0].sha, None).expect("feature diff");
+        assert_eq!(feature_diff.file_stats[0].path, "feature.txt");
+        assert_eq!(feature_diff.file_stats[0].additions, 1);
         // 干净工作区：全零。
         let clean = git_diff_stat_sync(&root).expect("stat ok");
         assert_eq!(
@@ -1587,6 +1761,45 @@ mod tests {
             .find(|f| f.path == "b.txt")
             .expect("b.txt stat");
         assert_eq!((b.additions, b.deletions), (2, 0));
+        let (snapshot, commands) = capture_git_commands(|| git_snapshot_sync(&root, true).unwrap());
+        assert_eq!(snapshot.state.status, "ready");
+        assert_eq!(
+            commands.iter().filter(|args| args[0] == "status").count(),
+            1
+        );
+        assert_eq!(commands.iter().filter(|args| args[0] == "diff").count(), 1);
+        assert_eq!(
+            serde_json::to_value(snapshot.diff_stat.unwrap()).unwrap(),
+            serde_json::to_value(&dirty).unwrap()
+        );
+
+        let (branch_only, commands) =
+            capture_git_commands(|| git_snapshot_sync(&root, false).unwrap());
+        assert_eq!(branch_only.state.status, "ready");
+        assert!(branch_only.diff_stat.is_none());
+        assert_eq!(
+            commands.iter().filter(|args| args[0] == "status").count(),
+            1
+        );
+        assert!(!commands.iter().any(|args| args[0] == "diff"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn snapshot_handles_unborn_and_non_repo_workdirs() {
+        let dir = temp_dir("snapshot");
+        let root = dir.to_str().unwrap();
+        let no_repo = git_snapshot_sync(root, true).expect("non-repo snapshot");
+        assert_eq!(no_repo.state.status, "not_repo");
+        assert!(no_repo.diff_stat.is_none());
+        git_init_sync(root, None).expect("init");
+        fs::write(dir.join("new.txt"), "one\ntwo\n").expect("untracked file");
+        let snapshot = git_snapshot_sync(root, true).expect("unborn snapshot");
+        let stat = snapshot.diff_stat.expect("unborn stats");
+        assert_eq!(
+            (stat.files_changed, stat.additions, stat.deletions),
+            (1, 2, 0)
+        );
         fs::remove_dir_all(&dir).ok();
     }
 }

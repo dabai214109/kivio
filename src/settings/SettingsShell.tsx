@@ -1,9 +1,10 @@
 import { forwardRef, useImperativeHandle, useState, useEffect, useCallback, useMemo, useRef, useReducer } from 'react'
 import {
-  X, RefreshCw,
+  X, RefreshCw, Monitor,
   Download, Upload, ArrowLeft,
 } from 'lucide-react'
 import { open, save } from '@tauri-apps/plugin-dialog'
+import { applyModelCatalog } from '../data/modelCatalog'
 import {
   api,
   type Settings as SettingsType,
@@ -35,8 +36,8 @@ import {
   GeneralIcon, HotkeysIcon, TranslateIcon, LensIcon, ChatIcon, MemoryIcon, MixerIcon,
   AgentIcon, WebSearchIcon, PluginsIcon, SessionsIcon, UsageIcon, ProvidersIcon, AboutIcon, HooksIcon, ImGatewayIcon, RemoteIcon,
 } from './NavIcons'
-import { PluginCenter, type PluginCenterSection } from '../chat/PluginCenter'
 import { SessionCenter, type SessionCenterProps } from '../chat/SessionCenter'
+import { PluginCenter, type PluginCenterSection } from '../chat/PluginCenter'
 import { buildHotkey, formatHotkeyError, getPlatform, isProviderEnabled, resolveSettingsSaveEcho, stableStringify } from './utils'
 import { type ProviderPreset } from './providerPresets'
 import { ProviderModelsPicker } from './ProviderModelsPicker'
@@ -55,6 +56,7 @@ import { ProvidersTab } from './tabs/ProvidersTab'
 import { HooksTab } from './tabs/HooksTab'
 import { ImGatewayTab } from './tabs/ImGatewayTab'
 import { RemoteTab } from './tabs/RemoteTab'
+import { ComputerControlTab } from './tabs/ComputerControlTab'
 import { AppearanceGroup, BehaviorGroup, PermissionsGroup } from './tabs/GeneralTab'
 import { AppInfoGroup, UpdateGroup } from './tabs/AboutTab'
 import { MEMORY_L1_MAX_BYTES, utf8ByteLength, type MemoryLayerKey } from './memoryLayers'
@@ -74,8 +76,9 @@ import {
 import { ConnectorsPanel } from './ConnectorsPanel'
 import { WebSearchPanel } from './WebSearchPanel'
 import { defaultChatTools } from './chatToolsShared'
+import { persistThenClose, type SettingsCloseOptions } from './settingsClose'
 
-export type SettingsTab = 'general' | 'hotkeys' | 'translate' | 'lens' | 'chat' | 'memory' | 'mixer' | 'externalAgents' | 'hooks' | 'imGateway' | 'remote' | 'webSearch' | 'connectors' | 'plugins' | 'sessions' | 'usage' | 'providers' | 'about'
+export type SettingsTab = 'general' | 'hotkeys' | 'translate' | 'lens' | 'chat' | 'memory' | 'mixer' | 'externalAgents' | 'computerControl' | 'hooks' | 'imGateway' | 'remote' | 'webSearch' | 'connectors' | 'plugins' | 'sessions' | 'usage' | 'providers' | 'about'
 
 type SettingsData = SettingsType
 // UI 字号：以 px 展示、以整体缩放（zoom）实现。CSS 全是 px 硬编码，做不了真正的 rem 基准字号，
@@ -92,8 +95,6 @@ export interface SettingsShellProps {
   initialTab?: SettingsTab
   /** embedded 单页模式：隐藏左侧设置导航，只显示 initialTab 对应页（如从扩展点「知识库」进入） */
   hideNav?: boolean
-  /** 插件页「让 AI 代装」：由 Chat 宿主开新对话并发送 install brief */
-  onRequestPluginAiInstall?: (pluginId: string) => void | Promise<void>
   /** 对话库（原扩展中心页）嵌在设置里，选中一条对话时由 Chat 宿主切回去 */
   sessionLibrary?: {
     currentConversationId?: string
@@ -106,7 +107,7 @@ export interface SettingsShellProps {
 }
 
 export interface SettingsShellHandle {
-  requestClose: () => void
+  requestClose: (options?: SettingsCloseOptions) => void
 }
 
 /** 快捷键作用域。原本是组件体内的局部 type，抽 HotkeysTab 后需要跨模块共享，提到模块作用域。 */
@@ -188,6 +189,7 @@ function defaultDefaultModels(chatProviderId = '', chatModel = ''): SettingsData
   return {
     chat: { providerId: chatProviderId, model: chatModel },
     vision: { providerId: '', model: '' },
+    videoAnalysis: { providerId: '', model: '' },
     titleSummary: { providerId: '', model: '' },
     compression: { providerId: '', model: '' },
     imageGeneration: { providerId: '', model: '' },
@@ -205,6 +207,9 @@ function clearDefaultModelProvider(
     vision: defaultModels.vision.providerId === providerId
       ? { providerId: '', model: '' }
       : defaultModels.vision,
+    videoAnalysis: defaultModels.videoAnalysis.providerId === providerId
+      ? { providerId: '', model: '' }
+      : defaultModels.videoAnalysis,
     titleSummary: defaultModels.titleSummary.providerId === providerId
       ? { providerId: '', model: '' }
       : defaultModels.titleSummary,
@@ -235,6 +240,9 @@ function resolveDefaultModelsAfterModelRemoval(
     vision: defaultModels.vision.providerId === providerId
       ? { ...defaultModels.vision, model: resolveAfterRemoval(defaultModels.vision.model) }
       : defaultModels.vision,
+    videoAnalysis: defaultModels.videoAnalysis.providerId === providerId
+      ? { ...defaultModels.videoAnalysis, model: resolveAfterRemoval(defaultModels.videoAnalysis.model) }
+      : defaultModels.videoAnalysis,
     titleSummary: defaultModels.titleSummary.providerId === providerId
       ? { ...defaultModels.titleSummary, model: resolveAfterRemoval(defaultModels.titleSummary.model) }
       : defaultModels.titleSummary,
@@ -258,7 +266,7 @@ function resolveDefaultModelsAfterModelRemoval(
  * 设置面板主组件（standalone / embedded 双宿主）
  */
 export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>(function SettingsShell(
-  { variant, onClose, onSettingsChange, onReady, reserveTrafficLightSpace = false, initialTab, hideNav = false, onRequestPluginAiInstall, sessionLibrary },
+  { variant, onClose, onSettingsChange, onReady, reserveTrafficLightSpace = false, initialTab, hideNav = false, sessionLibrary },
   ref,
 ) {
   const [settings, setSettings] = useState<SettingsData | null>(null)
@@ -362,7 +370,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     initialSettingsSnapshotRef.current = initialSettingsSnapshot
   }, [initialSettingsSnapshot])
 
-  // 设置页 keep-alive：其它面（插件开关、MCP、收藏、语言、聊天模型）会写 settings，
+  // 设置页 keep-alive：其它页面（工具开关、MCP、收藏、语言、聊天模型）会写 settings，
   // 草稿必须按字段跟缓存对齐，否则整份自动保存会把那些改动盖回去。
   useEffect(() => {
     return subscribeSettings((fresh) => {
@@ -896,17 +904,17 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
   }, [saveError, saveWarning])
 
   /**
-   * 关闭设置页：先 flush 未落盘改动，再关（不阻塞 UI 等回包）
+   * 关闭设置页：普通关闭等待 flush；切去对话等导航动作立即退场，保存留在后台完成。
    */
-  const handleCloseRequest = useCallback(() => {
+  const handleCloseRequest = useCallback((options?: SettingsCloseOptions) => {
     if (recordingTarget) return
     if (autosaveTimerRef.current) {
       clearTimeout(autosaveTimerRef.current)
       autosaveTimerRef.current = null
     }
-    // 即使草稿看起来 pristine，也要走 persist：插件开关可能已写进缓存，
+    // 即使草稿看起来 pristine，也要走 persist：工具开关可能已写进缓存，
     // persist 会采用那份 plugin MCP，避免把关闭盖回去。
-    void persistSettingsNow().finally(() => onClose())
+    persistThenClose(persistSettingsNow, onClose, options)
   }, [onClose, persistSettingsNow, recordingTarget])
 
   useImperativeHandle(ref, () => ({ requestClose: handleCloseRequest }), [handleCloseRequest])
@@ -1416,7 +1424,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     setFetchingProviderId(providerId)
     try {
       const currentProvider = settings.providers.find(p => p.id === providerId)
-      const models = await api.fetchModels(providerId, currentProvider
+      const catalog = await api.fetchModelCatalog(providerId, currentProvider
         ? {
           id: currentProvider.id,
           baseUrl: currentProvider.baseUrl,
@@ -1429,7 +1437,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
         }
         : undefined)
       if (currentProvider) {
-        updateProvider(providerId, { availableModels: models })
+        updateProvider(providerId, applyModelCatalog(currentProvider, catalog))
       }
     } catch (err) {
       console.error('Failed to fetch models:', err)
@@ -1744,6 +1752,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
     { id: 'memory' as const, label: t.tabMemory, icon: MemoryIcon },
     { id: 'mixer' as const, label: t.tabMixer, icon: MixerIcon },
     { id: 'externalAgents' as const, label: t.tabExternalAgents, icon: AgentIcon },
+    { id: 'computerControl' as const, label: lang === 'zh' ? '电脑操控' : 'Computer control', icon: Monitor },
     { id: 'hooks' as const, label: t.tabHooks, icon: HooksIcon },
     { id: 'imGateway' as const, label: lang === 'zh' ? 'IM 网关' : 'IM Gateway', icon: ImGatewayIcon },
     { id: 'remote' as const, label: lang === 'zh' ? '远程连接' : 'Remote', icon: RemoteIcon },
@@ -1789,6 +1798,10 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
         ? '按副任务路由模型：视觉、标题总结、上下文压缩、生图。'
         : 'Route models by side task: vision, title summaries, context compression, and image generation.',
     },
+    computerControl: {
+      title: lang === 'zh' ? '电脑操控' : 'Computer control',
+      subtitle: lang === 'zh' ? '管理桌面、浏览器和文档操作工具。' : 'Manage desktop, browser, and document control tools.',
+    },
     externalAgents: {
       title: t.tabExternalAgents,
       subtitle: lang === 'zh'
@@ -1812,8 +1825,8 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
         : 'Pair your phone browser via QR and use Kivio remotely through your own relay.',
     },
     plugins: {
-      title: pluginSection === 'plugins' ? t.tabPlugins : pluginSection === 'apps' ? t.pluginCenterApps : t.tabConnectors,
-      subtitle: pluginSection === 'plugins' ? t.pluginCenterPluginsSubtitle : pluginSection === 'apps' ? t.pluginCenterAppsSubtitle : t.pluginCenterConnectorsSubtitle,
+      title: pluginSection === 'plugins' ? t.tabPlugins : t.tabConnectors,
+      subtitle: pluginSection === 'plugins' ? t.pluginCenterPluginsSubtitle : t.pluginCenterConnectorsSubtitle,
     },
     sessions: {
       title: t.tabSessions,
@@ -1871,7 +1884,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
         <nav className="settings-embedded-nav-list settings-embedded-nav-list--footer">
           <button
             type="button"
-            onClick={handleCloseRequest}
+            onClick={() => handleCloseRequest()}
             className="settings-embedded-back"
             title={lang === 'zh' ? '返回对话' : 'Back to chat'}
             data-tauri-drag-region="false"
@@ -2139,6 +2152,10 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
               />
             )}
 
+            {activeTab === 'computerControl' && (
+              <ComputerControlTab lang={lang} tools={settings.chatTools || defaultChatTools()} onChange={updateChatTools} />
+            )}
+
             {/* ===== Hooks 标签页（对话生命周期） ===== */}
             {activeTab === 'hooks' && (
               <HooksTab
@@ -2165,13 +2182,12 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
               />
             )}
 
-            {/* ===== 插件、第三方应用与连接器 ===== */}
+            {/* ===== 插件与连接器；第三方应用入口已删除 ===== */}
             {activeTab === 'plugins' && (
               <PluginCenter
                 section={pluginSection}
                 onSectionChange={setPluginSection}
                 lang={lang}
-                onRequestAiInstall={onRequestPluginAiInstall}
                 connectors={
                   <ConnectorsPanel
                     servers={chatTools.servers}
@@ -2456,7 +2472,7 @@ export const SettingsShell = forwardRef<SettingsShellHandle, SettingsShellProps>
         <div className="kv-title">{t.settings}</div>
         <button
           type="button"
-          onClick={handleCloseRequest}
+          onClick={() => handleCloseRequest()}
           className="kv-titlebar-close"
           data-tauri-drag-region="false"
           aria-label={t.cancel}

@@ -22,6 +22,16 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(45);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const STDERR_CHARS: usize = 8192;
 
+fn antigravity_session_command(bin: &Path) -> tokio::process::Command {
+    let mut command = cli_command(bin);
+    // agy starts a detached self-updater on launch. CREATE_NO_WINDOW hides the
+    // CLI itself, but cannot constrain that detached helper, which can flash a
+    // console window on the first managed turn. Kivio owns CLI updates through
+    // the installer path, so managed sessions opt out of the background updater.
+    command.env("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+    command
+}
+
 #[derive(Default, Clone, Debug)]
 struct Usage {
     input: u64,
@@ -254,7 +264,7 @@ impl AntigravitySession {
         cwd: &Path,
         resume: Option<&str>,
     ) -> Result<Self, String> {
-        let mut command = cli_command(bin);
+        let mut command = antigravity_session_command(bin);
         command
             .args(args)
             .current_dir(cwd)
@@ -540,6 +550,19 @@ pub fn spawn_antigravity_session_actor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn regular_session_disables_detached_auto_update() {
+        let command = antigravity_session_command(Path::new("agy"));
+        let value = command
+            .as_std()
+            .get_envs()
+            .find_map(|(key, value)| {
+                (key == "AGY_CLI_DISABLE_AUTO_UPDATE").then(|| value.and_then(|v| v.to_str()))
+            })
+            .flatten();
+        assert_eq!(value, Some("true"));
+    }
 
     async fn ask(control: &mpsc::Sender<SessionCommand>, prompt: &str) -> Vec<UnifiedAgentEvent> {
         let (events, mut rx) = mpsc::channel(256);

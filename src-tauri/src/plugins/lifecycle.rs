@@ -276,11 +276,11 @@ mod tests {
         let mut settings = Settings::default();
         settings.chat_tools.servers = vec![
             ChatMcpServer {
-                id: plugin_mcp_server_id("cua-driver"),
-                name: "Cua Driver (插件)".into(),
+                id: plugin_mcp_server_id("officecli"),
+                name: "OfficeCLI (插件)".into(),
                 enabled: true,
-                command: "cua-driver".into(),
-                connector_id: Some("plugin:cua-driver".into()),
+                command: "officecli".into(),
+                connector_id: Some("plugin:officecli".into()),
                 ..Default::default()
             },
             ChatMcpServer {
@@ -292,9 +292,9 @@ mod tests {
             },
         ];
 
-        assert!(disable_mcp_for_plugins(&mut settings, &["cua-driver"]));
+        assert!(disable_mcp_for_plugins(&mut settings, &["officecli"]));
         assert!(!settings.chat_tools.servers[0].enabled);
         assert!(settings.chat_tools.servers[1].enabled);
-        assert!(!disable_mcp_for_plugins(&mut settings, &["cua-driver"]));
+        assert!(!disable_mcp_for_plugins(&mut settings, &["officecli"]));
     }
 }

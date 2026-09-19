@@ -24,6 +24,24 @@ pub(super) struct ChatAgentHost<'a> {
 }
 
 impl crate::chat::agent::AgentHost for ChatAgentHost<'_> {
+    fn run_ended(&self, _conversation_id: &str) {
+        if let Ok(runtime) = crate::chat::sub_agent::control::runtime(&self.app) {
+            runtime.release_parent(&self.run_id);
+        }
+    }
+
+    fn checkpoint_runtime<'b>(
+        &'b self,
+        conversation_id: &'b str,
+        run_id: &'b str,
+        _history: &'b [Value],
+        _finishing: bool,
+    ) -> crate::chat::agent::AgentHostFuture<'b, Result<Vec<Value>, String>> {
+        Box::pin(async move {
+            crate::chat::sub_agent::control::collect_results(&self.app, conversation_id, run_id)
+                .await
+        })
+    }
     fn workflow_hooks(&self) -> Option<&crate::chat::workflow_hooks::Runtime> {
         Some(&self.workflow_hooks)
     }
@@ -70,6 +88,7 @@ impl crate::chat::agent::AgentHost for ChatAgentHost<'_> {
         &self,
         conversation_id: &str,
         used_tokens: u64,
+        token_count_source: Option<&str>,
         context_window_tokens: Option<u64>,
     ) {
         emit_chat_context_usage_live(
@@ -77,6 +96,7 @@ impl crate::chat::agent::AgentHost for ChatAgentHost<'_> {
             conversation_id,
             &self.run_id,
             used_tokens,
+            token_count_source,
             context_window_tokens,
         );
     }
@@ -202,12 +222,31 @@ impl crate::chat::agent::AgentHost for ChatAgentHost<'_> {
 /// 消息内联读取，不靠事件）。generation 相关沿用标准机制，保证超时/取消能生效。
 #[cfg(debug_assertions)]
 pub(super) struct ProbeAgentHost<'a> {
+    pub(super) run_id: String,
     pub(super) app: AppHandle,
     pub(super) state: &'a AppState,
 }
 
 #[cfg(debug_assertions)]
 impl crate::chat::agent::AgentHost for ProbeAgentHost<'_> {
+    fn run_ended(&self, _conversation_id: &str) {
+        if let Ok(runtime) = crate::chat::sub_agent::control::runtime(&self.app) {
+            runtime.release_parent(&self.run_id);
+        }
+    }
+
+    fn checkpoint_runtime<'b>(
+        &'b self,
+        conversation_id: &'b str,
+        run_id: &'b str,
+        _history: &'b [Value],
+        _finishing: bool,
+    ) -> crate::chat::agent::AgentHostFuture<'b, Result<Vec<Value>, String>> {
+        Box::pin(async move {
+            crate::chat::sub_agent::control::collect_results(&self.app, conversation_id, run_id)
+                .await
+        })
+    }
     fn emit_stream_delta(
         &self,
         _conversation_id: &str,
@@ -298,6 +337,7 @@ impl crate::chat::agent::AgentHost for ProbeAgentHost<'_> {
 pub(super) struct RegistryToolExecutor<'a> {
     pub(super) app: AppHandle,
     pub(super) state: &'a AppState,
+    pub(super) video_analysis: tokio::sync::Mutex<crate::chat::video_analysis::VideoTool>,
 }
 impl crate::chat::agent::ToolExecutor for RegistryToolExecutor<'_> {
     fn call<'a>(
@@ -309,14 +349,23 @@ impl crate::chat::agent::ToolExecutor for RegistryToolExecutor<'_> {
     ) -> crate::chat::agent::ToolExecutorFuture<'a> {
         Box::pin(async move {
             if ctx.depth == 0 {
-                if let Ok(conversation) = crate::chat::storage::load_conversation(&self.app, ctx.conversation_id) {
+                if let Ok(conversation) =
+                    crate::chat::storage::load_conversation(&self.app, ctx.conversation_id)
+                {
                     if conversation.goal_state.as_ref().is_some_and(|goal| {
                         goal.status == crate::chat::types::GoalStatus::Completed
                             && goal.active_run_id.as_deref() == Some(ctx.run_id)
                     }) {
-                        return Err("Goal completion was accepted; no further tools may run in this turn".into());
+                        return Err(
+                            "Goal completion was accepted; no further tools may run in this turn"
+                                .into(),
+                        );
                     }
                 }
+            }
+            if tool.source == "mixer" && tool.name == "mixer_video_analysis" {
+                return self.video_analysis.lock().await
+                    .call(&self.app, self.state, ctx, &arguments).await;
             }
             let native_ctx = mcp::registry::NativeToolContext {
                 // Conversation-scoped tools (todo / native workspace) target the

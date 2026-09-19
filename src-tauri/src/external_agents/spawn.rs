@@ -697,7 +697,10 @@ mod tests {
             .await
             .unwrap();
         assert!(output.status.success());
-        assert!(updater_marker.exists(), "normal CLI update behavior changed");
+        assert!(
+            updater_marker.exists(),
+            "normal CLI update behavior changed"
+        );
     }
 
     /// `cli_command` 必须剥掉父会话身份变量，否则 Kivio 从 Claude Code 内启动时，

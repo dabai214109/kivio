@@ -22,7 +22,7 @@ use crate::api::{
 };
 #[cfg(target_os = "windows")]
 use crate::capture_geometry::{
-    monitor_for_region, windows_monitor_region, CaptureMonitor, CaptureRect,
+    monitor_for_physical_frame, windows_window_region, CaptureMonitor, CaptureRect,
 };
 use crate::chat::model::{ModelMessage, ModelRole};
 use crate::lens;
@@ -56,6 +56,8 @@ struct LensFrame {
     y: f64,
     width: f64,
     height: f64,
+    #[cfg(target_os = "windows")]
+    monitor: CaptureMonitor,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +194,51 @@ pub(crate) fn explain_read_image(
     }))
 }
 
+/// The full-screen selection background is large. Keep disk I/O off the window
+/// thread and return raw PNG bytes, avoiding Base64 + JSON encoding/parsing while
+/// the user is already dragging the selection. Only the current freeze frame is
+/// accessible here; callers never supply filesystem paths.
+#[tauri::command]
+pub(crate) async fn lens_read_freeze_frame(
+    app: AppHandle,
+    image_id: String,
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        {
+            let current = state
+                .lens_freeze_frame_image_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if current.as_deref() != Some(image_id.as_str()) {
+                return Err("Freeze frame is no longer active".to_string());
+            }
+        }
+        let path = resolve_explain_image_path(&app, &state, &image_id)?;
+        fs::read(path).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Cropped previews use the same registered-image resolver as explain_read_image,
+/// but disk reads run off the UI thread and PNG bytes avoid Base64/JSON copies.
+#[tauri::command]
+pub(crate) async fn lens_read_image(
+    app: AppHandle,
+    image_id: String,
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        let path = resolve_explain_image_path(&app, &state, &image_id)?;
+        fs::read(path).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
 // ====== Lens 模式命令 ======
 
 /// 把 lens 窗口铺满目标显示器（用于 select 态）。
@@ -278,6 +325,14 @@ fn lens_position_fullscreen(app: &AppHandle, window: &WebviewWindow) -> Option<L
         y: ly,
         width: lw,
         height: lh,
+        #[cfg(target_os = "windows")]
+        monitor: CaptureMonitor {
+            x: mp.x,
+            y: mp.y,
+            width: ms.width,
+            height: ms.height,
+            scale_factor: scale,
+        },
     })
 }
 
@@ -557,12 +612,18 @@ pub(crate) fn lens_request_internal(app: &AppHandle, mode: &str) -> Result<(), S
         _ => "chat",
     };
     let mut freeze_frame_image_id: Option<String> = None;
+    #[cfg(target_os = "windows")]
+    let mut initial_frame = None;
     if safe_mode == "translateText" {
         lens_position_text_floating(app, &window);
     } else {
         // 先在 hidden 状态下尝试定位：即便部分系统下 hidden 窗口 set_position 被忽略，也比
         // 不调强（成功则消除"先在旧位置闪一帧再跳到全屏"的可见跳变）。
         let frame = lens_position_fullscreen(app, &window);
+        #[cfg(target_os = "windows")]
+        {
+            initial_frame = frame;
+        }
         eprintln!(
             "[lens-timing]   ..after_position +{}ms",
             __t0.elapsed().as_millis()
@@ -593,7 +654,24 @@ pub(crate) fn lens_request_internal(app: &AppHandle, mode: &str) -> Result<(), S
         None
     } else {
         // show 后再调，处理 always_on_top + visible_on_all_workspaces 把首次 set_position 吃掉的情况
-        lens_position_fullscreen(app, &window)
+        #[cfg(target_os = "windows")]
+        {
+            // Keep the display that supplied the frozen pixels. Re-reading the
+            // cursor here can move the overlay onto another monitor mid-open.
+            if let Some(frame) = initial_frame {
+                let monitor = frame.monitor;
+                let _ = window.set_position(tauri::PhysicalPosition::new(monitor.x, monitor.y));
+                let _ = window.set_size(tauri::PhysicalSize::new(monitor.width, monitor.height));
+                lens_clear_interactive_region(&window);
+                Some(frame)
+            } else {
+                lens_position_fullscreen(app, &window)
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            lens_position_fullscreen(app, &window)
+        }
     };
     let reset_detail = match frame {
         Some(frame) => serde_json::json!({
@@ -714,8 +792,9 @@ pub(crate) async fn lens_capture_region(
 ) -> Result<serde_json::Value, String> {
     // SCK 路径：把自己 PID 传给 capture_region_image，SCK 在 GPU compositor 排除 lens webview，
     // 不再需要 hide webview + sleep 60ms 等 NSWindow.orderOut 生效（旧 `screencapture -R` 会截到全屏透明 lens 自己）。
-    // Windows 版 capture_region_image 忽略 exclude_self_pid 参数。
+    // Windows 版用当前浮窗的物理坐标定位显示器，并在现场截图前短暂隐藏浮窗。
     let _ = active_overlay_window(&app); // 仍引用以保证当前浮窗 webview 存活
+    #[cfg(not(target_os = "windows"))]
     let exclude_self_pid: Option<i32> = {
         #[cfg(target_os = "macos")]
         {
@@ -748,6 +827,12 @@ pub(crate) async fn lens_capture_region(
                 let _ = w.hide();
                 std::thread::sleep(std::time::Duration::from_millis(60));
             }
+            #[cfg(target_os = "windows")]
+            let live = {
+                let _ = (absolute_x, absolute_y);
+                capture_region_image(overlay.as_ref(), x, y, width, height, scale_factor)
+            };
+            #[cfg(not(target_os = "windows"))]
             let live = capture_region_image(
                 absolute_x,
                 absolute_y,
@@ -2131,14 +2216,9 @@ pub(crate) async fn lens_replace_translate(
     // 盖板填充 + PNG 编码是 CPU 密集路径，必须 spawn_blocking，
     // 否则 tokio::join! 无法真正让本地擦除与云端翻译并行。
     let cleaning_future = async move {
-        tokio::task::spawn_blocking(move || {
-            crate::replace_translation::encode_rgb_png(plate_fill(
-                &source_for_cleaning,
-                &plate_blocks,
-            ))
-        })
-        .await
-        .map_err(|error| format!("plate fill worker failed: {error}"))?
+        tokio::task::spawn_blocking(move || plate_fill(&source_for_cleaning, &plate_blocks))
+            .await
+            .map_err(|error| format!("plate fill worker failed: {error}"))
     };
     let (translation_result, cleaned_result) = tokio::join!(translation_future, cleaning_future);
 
@@ -2175,9 +2255,25 @@ pub(crate) async fn lens_replace_translate(
             group.translated = translated.clone();
         }
     }
-    let cleaned_png = match cleaned_result {
-        Ok(png) => png,
+    let mut cleaned = match cleaned_result {
+        Ok(image) => image,
         Err(error) => return fail(&error),
+    };
+    let groups_for_restore = geometry.groups.clone();
+    let cleaned_png = match tokio::task::spawn_blocking(move || {
+        crate::replace_translation::mask::restore_unchanged_groups(
+            &source_image,
+            &mut cleaned,
+            &groups_for_restore,
+            &replace_spans,
+        );
+        crate::replace_translation::encode_rgb_png(cleaned)
+    })
+    .await
+    {
+        Ok(Ok(png)) => png,
+        Ok(Err(error)) => return fail(&error),
+        Err(error) => return fail(&format!("plate encode worker failed: {error}")),
     };
     let cleaned_image = format!(
         "data:image/png;base64,{}",
@@ -2274,33 +2370,39 @@ pub(crate) fn lens_take_reset_payload(state: State<'_, AppState>) -> Option<Stri
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 fn prepare_freeze_frame(app: &AppHandle, frame: Option<LensFrame>) -> Option<String> {
     let frame = frame?;
-    let width = frame.width.round().max(1.0) as u32;
-    let height = frame.height.round().max(1.0) as u32;
-    let exclude_self_pid: Option<i32> = {
-        #[cfg(target_os = "macos")]
-        {
-            Some(std::process::id() as i32)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            None
-        }
+    #[cfg(target_os = "windows")]
+    let captured = capture_monitor_frame(frame.monitor);
+    #[cfg(not(target_os = "windows"))]
+    let captured = {
+        let width = frame.width.round().max(1.0) as u32;
+        let height = frame.height.round().max(1.0) as u32;
+        let exclude_self_pid: Option<i32> = {
+            #[cfg(target_os = "macos")]
+            {
+                Some(std::process::id() as i32)
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                None
+            }
+        };
+        capture_region_image(
+            frame.x.round() as i32,
+            frame.y.round() as i32,
+            0,
+            0,
+            width,
+            height,
+            1.0,
+            exclude_self_pid,
+        )
     };
-    let path = capture_region_image(
-        frame.x.round() as i32,
-        frame.y.round() as i32,
-        0,
-        0,
-        width,
-        height,
-        1.0,
-        exclude_self_pid,
-    )
-    .map_err(|err| {
-        eprintln!("[lens-freeze] capture failed: {err}");
-        err
-    })
-    .ok()?;
+    let path = captured
+        .map_err(|err| {
+            eprintln!("[lens-freeze] capture failed: {err}");
+            err
+        })
+        .ok()?;
     eprintln!("[lens-freeze] captured frame -> {}", path.display());
     let image_id = insert_temp_explain_image(app, path);
     let state = app.state::<AppState>();
@@ -2376,6 +2478,12 @@ fn crop_freeze_frame_image(
     .ok_or_else(|| "Invalid freeze-frame capture region".to_string())?;
     let cropped = image.crop_imm(rect.x, rect.y, rect.width, rect.height);
     let temp_path = std::env::temp_dir().join(format!("screenshot-{}.png", Uuid::new_v4()));
+    #[cfg(target_os = "windows")]
+    {
+        let rgba = cropped.into_rgba8();
+        write_png_fast(&temp_path, rgba.as_raw(), rgba.width(), rgba.height())?;
+    }
+    #[cfg(not(target_os = "windows"))]
     cropped.save(&temp_path).map_err(|e| e.to_string())?;
     Ok(temp_path)
 }
@@ -2397,25 +2505,26 @@ fn freeze_frame_crop_rect(
     } else {
         1.0
     };
-    let x = (x as f64 * scale).round() as i32;
-    let y = (y as f64 * scale).round() as i32;
-    let width = (width as f64 * scale).round().max(1.0) as u32;
-    let height = (height as f64 * scale).round().max(1.0) as u32;
-
-    let left = x.clamp(0, image_width as i32);
-    let top = y.clamp(0, image_height as i32);
-    let right = (x as i64 + width as i64).clamp(left as i64, image_width as i64) as i32;
-    let bottom = (y as i64 + height as i64).clamp(top as i64, image_height as i64) as i32;
+    // Round shared edges, not origin and extent independently: adjacent logical
+    // rectangles must meet at the same physical pixel at fractional DPI.
+    let left = (x as f64 * scale).round().clamp(0.0, image_width as f64) as u32;
+    let top = (y as f64 * scale).round().clamp(0.0, image_height as f64) as u32;
+    let right = ((x as f64 + width as f64) * scale)
+        .round()
+        .clamp(0.0, image_width as f64) as u32;
+    let bottom = ((y as f64 + height as f64) * scale)
+        .round()
+        .clamp(0.0, image_height as f64) as u32;
 
     if right <= left || bottom <= top {
         return None;
     }
 
     Some(ImageCropRect {
-        x: left as u32,
-        y: top as u32,
-        width: (right - left) as u32,
-        height: (bottom - top) as u32,
+        x: left,
+        y: top,
+        width: right - left,
+        height: bottom - top,
     })
 }
 
@@ -2610,17 +2719,66 @@ pub(crate) fn lens_animate_floating(
 /// Windows 平台：截取指定区域的屏幕图像
 /// 需要将逻辑坐标根据缩放因子转换为物理坐标，再转换为相对于显示器的相对坐标
 #[cfg(target_os = "windows")]
+fn capture_monitor_frame(target: CaptureMonitor) -> Result<PathBuf, String> {
+    let monitors = Monitor::all().map_err(|e| e.to_string())?;
+    let geometry = monitors
+        .iter()
+        .map(|m| {
+            Ok(CaptureMonitor {
+                x: m.x().map_err(|e| e.to_string())?,
+                y: m.y().map_err(|e| e.to_string())?,
+                width: m.width().map_err(|e| e.to_string())?,
+                height: m.height().map_err(|e| e.to_string())?,
+                scale_factor: m.scale_factor().map_err(|e| e.to_string())? as f64,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let index = monitor_for_physical_frame(target, &geometry)
+        .ok_or_else(|| "Capture monitor changed while opening Lens".to_string())?;
+    // No logical-coordinate round trip: preserve every physical edge pixel,
+    // including fractional-DPI and portrait displays with odd dimensions.
+    let started = std::time::Instant::now();
+    let image = monitors[index].capture_image().map_err(|e| e.to_string())?;
+    if image.width() != target.width || image.height() != target.height {
+        return Err("Capture monitor resolution changed while opening Lens".to_string());
+    }
+    eprintln!(
+        "[lens-timing]     ...xcap.capture_monitor +{}ms",
+        started.elapsed().as_millis()
+    );
+    let path = std::env::temp_dir().join(format!("screenshot-{}.png", Uuid::new_v4()));
+    let started = std::time::Instant::now();
+    write_png_fast(&path, image.as_raw(), image.width(), image.height())?;
+    eprintln!(
+        "[lens-timing]     ...png.save +{}ms",
+        started.elapsed().as_millis()
+    );
+    Ok(path)
+}
+
+#[cfg(target_os = "windows")]
 fn capture_region_image(
-    absolute_x: i32,
-    absolute_y: i32,
+    window: Option<&WebviewWindow>,
     x: i32,
     y: i32,
     width: u32,
     height: u32,
     scale_factor: f64,
-    _exclude_self_pid: Option<i32>,
 ) -> Result<PathBuf, String> {
-    let _ = (x, y, scale_factor);
+    // The caller retains the handle before hiding it for capture.
+    let window = window.ok_or_else(|| "Capture window is no longer active".to_string())?;
+    let position = window.outer_position().map_err(|e| e.to_string())?;
+    let display = window
+        .current_monitor()
+        .map_err(|e| e.to_string())?
+        .ok_or_else(|| "Capture monitor is no longer available".to_string())?;
+    let target = CaptureMonitor {
+        x: display.position().x,
+        y: display.position().y,
+        width: display.size().width,
+        height: display.size().height,
+        scale_factor: display.scale_factor(),
+    };
     let __tc = std::time::Instant::now();
     let monitors = Monitor::all().map_err(|e| e.to_string())?;
     eprintln!(
@@ -2640,15 +2798,21 @@ fn capture_region_image(
         })
         .collect::<Result<Vec<_>, String>>()?;
     let region = CaptureRect {
-        x: absolute_x as f64,
-        y: absolute_y as f64,
+        x: x as f64,
+        y: y as f64,
         width: width as f64,
         height: height as f64,
     };
-    let monitor_index = monitor_for_region(region, &monitor_geometry)
+    let monitor_index = monitor_for_physical_frame(target, &monitor_geometry)
         .ok_or_else(|| "No monitor found for capture region".to_string())?;
-    let capture_region = windows_monitor_region(region, monitor_geometry[monitor_index])
-        .ok_or_else(|| "Invalid capture region".to_string())?;
+    let capture_region = windows_window_region(
+        region,
+        position.x,
+        position.y,
+        scale_factor,
+        monitor_geometry[monitor_index],
+    )
+    .ok_or_else(|| "Invalid capture region".to_string())?;
     let monitor = &monitors[monitor_index];
 
     let __tcap = std::time::Instant::now();
@@ -2677,14 +2841,15 @@ fn capture_region_image(
 
 /// 快速无损 PNG 编码：`image` 默认编码器对全屏 4MP 图做自适应滤波 + 默认 zlib 压缩，
 /// 单帧编码约 350ms，是冻结帧/截图首帧出现的主要延迟。冻结帧只需「无损 + 快」，
-/// 改用 Fast 压缩 + 无滤波，编码降到几十毫秒（文件略大，临时文件可接受）。
+/// Fast + Sub 保留无损像素，并利用屏幕相邻像素的相似性降低压缩工作量。
+/// 实测 2560×1600 桌面：NoFilter 约 270ms/13MB，Sub 约 105ms/2.5MB。
 #[cfg(target_os = "windows")]
 fn write_png_fast(path: &Path, rgba: &[u8], width: u32, height: u32) -> Result<(), String> {
     use image::codecs::png::{CompressionType, FilterType, PngEncoder};
     use image::{ExtendedColorType, ImageEncoder};
     let file = std::fs::File::create(path).map_err(|e| e.to_string())?;
     let writer = std::io::BufWriter::new(file);
-    PngEncoder::new_with_quality(writer, CompressionType::Fast, FilterType::NoFilter)
+    PngEncoder::new_with_quality(writer, CompressionType::Fast, FilterType::Sub)
         .write_image(rgba, width, height, ExtendedColorType::Rgba8)
         .map_err(|e| e.to_string())
 }
@@ -2722,6 +2887,7 @@ fn capture_region_image(
     _width: u32,
     _height: u32,
     _scale_factor: f64,
+    _exclude_self_pid: Option<i32>,
 ) -> Result<PathBuf, String> {
     Err("Region capture is not supported on this platform".to_string())
 }
@@ -2970,6 +3136,38 @@ pub(crate) fn lens_delete_history_image(app: AppHandle, image_id: String) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn freeze_crop_rounds_edges_not_width_independently() {
+        for scale in [1.25, 1.5, 1.75, 2.25, 2.5, 2.75] {
+            for x in 0..20 {
+                for width in 1..20 {
+                    let rect = freeze_frame_crop_rect(x, 0, width, 10, scale, 500, 500).unwrap();
+                    assert_eq!(
+                        rect.x + rect.width,
+                        ((x as f64 + width as f64) * scale).round() as u32,
+                        "scale={scale}, x={x}, width={width}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn fast_png_roundtrip_preserves_pixels_and_crop() {
+        let image = image::RgbaImage::from_fn(97, 53, |x, y| {
+            image::Rgba([(x * 7) as u8, (y * 13) as u8, (x ^ y) as u8, (x + y) as u8])
+        });
+        let path = std::env::temp_dir().join(format!("lens-png-test-{}.png", Uuid::new_v4()));
+        write_png_fast(&path, image.as_raw(), image.width(), image.height()).unwrap();
+        assert_eq!(image::open(&path).unwrap().to_rgba8(), image);
+        let cropped_path = crop_freeze_frame_image(&path, 7, 9, 31, 23, 1.0).unwrap();
+        let expected = image::imageops::crop_imm(&image, 7, 9, 31, 23).to_image();
+        assert_eq!(image::open(&cropped_path).unwrap().to_rgba8(), expected);
+        fs::remove_file(cropped_path).unwrap();
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn freeze_frame_crop_rect_clamps_to_image_bounds() {
