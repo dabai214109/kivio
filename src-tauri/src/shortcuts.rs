@@ -1,10 +1,10 @@
-use std::{collections::HashSet, sync::atomic::Ordering, time::Duration};
+use std::{collections::HashSet, time::Duration};
 
 use arboard::Clipboard;
 use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow};
 use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
 
-use crate::commands::{apply_launch_at_startup, should_apply_launch_at_startup};
+use crate::commands::apply_launch_at_startup;
 use crate::lens_commands::{
     lens_close, lens_request, lens_request_replace, lens_request_screenshot,
     lens_request_translate, lens_request_translate_text, request_lens_close,
@@ -13,7 +13,7 @@ use crate::settings::Settings;
 use crate::state::AppState;
 use crate::windows::{
     apply_chat_window_chrome, apply_frameless_window_chrome, ensure_chat_window,
-    ensure_chat_window_with_hash, ensure_main_window, normalize_chat_window_behavior,
+    ensure_chat_window_with_hash, ensure_translator_window, normalize_chat_window_behavior,
 };
 #[cfg(target_os = "macos")]
 use crate::windows::{
@@ -543,6 +543,34 @@ fn classify_hotkey_error(scope: HotkeyScope, hotkey: String, raw: String) -> Hot
 /// JSON 序列化后由前端按界面语言渲染。
 pub(crate) fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
     let settings = app.state::<AppState>().settings_read().clone();
+    register_hotkeys_for_settings(app, &settings)
+}
+
+/// Only fields consumed by register_hotkeys_for_settings require unregister_all.
+/// Unrelated saves must not temporarily remove every global shortcut.
+pub(crate) fn hotkey_bindings_changed(previous: &Settings, next: &Settings) -> bool {
+    previous.hotkey != next.hotkey
+        || previous.chat_hotkey != next.chat_hotkey
+        || previous.close_chat_hotkey != next.close_chat_hotkey
+        || previous.screenshot_translation.enabled != next.screenshot_translation.enabled
+        || previous.screenshot_translation.hotkey != next.screenshot_translation.hotkey
+        || previous.screenshot_translation.text_hotkey != next.screenshot_translation.text_hotkey
+        || previous.screenshot_translation.replace_enabled
+            != next.screenshot_translation.replace_enabled
+        || previous.screenshot_translation.replace_hotkey
+            != next.screenshot_translation.replace_hotkey
+        || previous.screenshot_annotate.enabled != next.screenshot_annotate.enabled
+        || previous.screenshot_annotate.hotkey != next.screenshot_annotate.hotkey
+        || previous.lens.enabled != next.lens.enabled
+        || previous.lens.hotkey != next.lens.hotkey
+}
+
+/// Register hotkeys from an explicit candidate. Full settings saves use this before their CAS
+/// commit so they do not have to publish uncommitted settings merely to apply runtime bindings.
+pub(crate) fn register_hotkeys_for_settings(
+    app: &AppHandle,
+    settings: &Settings,
+) -> Result<(), String> {
     let shortcut_manager = app.global_shortcut();
     shortcut_manager
         .unregister_all()
@@ -563,7 +591,7 @@ pub(crate) fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
         } else if let Err(err) =
             shortcut_manager.on_shortcut(hotkey.as_str(), move |app, _shortcut, event| {
                 if event.state == ShortcutState::Pressed {
-                    toggle_main_window(app);
+                    toggle_translator_window(app);
                 }
             })
         {
@@ -835,9 +863,13 @@ pub(crate) fn register_hotkeys(app: &AppHandle) -> Result<(), String> {
                     let app = app.clone();
                     let id = automation_id.clone();
                     tauri::async_runtime::spawn(async move {
-                        if let Err(err) =
-                            crate::automation::enqueue(app, id, crate::automation::RunOrigin::Hotkey, None, None)
-                        {
+                        if let Err(err) = crate::automation::enqueue(
+                            app,
+                            id,
+                            crate::automation::RunOrigin::Hotkey,
+                            None,
+                            None,
+                        ) {
                             eprintln!("automation hotkey: {err}");
                         }
                     });
@@ -867,15 +899,15 @@ pub(crate) fn get_mouse_position(app: &AppHandle) -> Option<tauri::PhysicalPosit
 }
 
 /// 切换输入翻译窗口。
-/// 可见时关闭销毁 main WebView；显示时跟随鼠标位置偏移 (10,10) 弹出，翻译器保持置顶。
-pub(crate) fn toggle_main_window(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window("main") {
+/// 可见时关闭销毁 translator WebView；显示时跟随鼠标位置偏移 (10,10) 弹出，翻译器保持置顶。
+pub(crate) fn toggle_translator_window(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(crate::windows::TRANSLATOR_WINDOW_LABEL) {
         if window.is_visible().unwrap_or(false) {
             #[cfg(target_os = "macos")]
             {
                 crate::windows::destroy_overlay_window(&window);
                 let st = app.state::<AppState>();
-                restore_previous_frontmost_app(app, &st.prev_frontmost_pid_main);
+                restore_previous_frontmost_app(app, st.frontmost_apps().translator());
             }
             #[cfg(not(target_os = "macos"))]
             let _ = window.close();
@@ -886,18 +918,18 @@ pub(crate) fn toggle_main_window(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     {
         let st = app.state::<AppState>();
-        remember_frontmost_app(&st.prev_frontmost_pid_main);
+        remember_frontmost_app(st.frontmost_apps().translator());
     }
 
-    let window = match ensure_main_window(app) {
+    let window = match ensure_translator_window(app) {
         Ok(window) => window,
         Err(err) => {
             #[cfg(target_os = "macos")]
             {
                 let st = app.state::<AppState>();
-                restore_previous_frontmost_app(app, &st.prev_frontmost_pid_main);
+                restore_previous_frontmost_app(app, st.frontmost_apps().translator());
             }
-            eprintln!("Failed to ensure main window: {}", err);
+            eprintln!("Failed to ensure translator window: {}", err);
             return;
         }
     };
@@ -907,15 +939,14 @@ pub(crate) fn toggle_main_window(app: &AppHandle) {
     #[cfg(target_os = "macos")]
     {
         ensure_overlay_panel(&window);
-        // ensure_main_window 的冷创建若短暂激活了 Kivio，在显示非激活 Panel 前立刻纠正；
+        // ensure_translator_window 的冷创建若短暂激活了 Kivio，在显示非激活 Panel 前立刻纠正；
         // 不触碰 Chat 窗口本身。
         let st = app.state::<AppState>();
-        reassert_previous_frontmost_app(app, &st.prev_frontmost_pid_main);
+        reassert_previous_frontmost_app(app, st.frontmost_apps().translator());
     }
 
-    // 重置 hash 为翻译模式；main 现在只承载输入翻译。
     let _ = window.eval(
-        "window.location.hash = ''; window.dispatchEvent(new HashChangeEvent('hashchange'));",
+        "window.location.hash = '#translator'; window.dispatchEvent(new HashChangeEvent('hashchange'));",
     );
 
     let pos = get_mouse_position(app).map(|cursor| {
@@ -939,7 +970,7 @@ pub(crate) fn toggle_main_window(app: &AppHandle) {
             // 某些 macOS/tao 组合即便已带 NonactivatingPanel tag，冷创建后的首次
             // makeKeyWindow 仍会激活宿主 App；显示后再校正一次，确保普通 Chat 不被带到前面。
             let st = app_for_task.state::<AppState>();
-            reassert_previous_frontmost_app(&app_for_task, &st.prev_frontmost_pid_main);
+            reassert_previous_frontmost_app(&app_for_task, st.frontmost_apps().translator());
             refocus_overlay_after_frontmost_reassert(&window_for_task);
         });
         return;
@@ -961,27 +992,16 @@ pub(crate) fn toggle_main_window(app: &AppHandle) {
 
 /// 恢复运行时设置
 /// 当保存设置失败时，将设置、热键、托盘等回滚到之前的状态
-pub(crate) fn restore_runtime_settings(
-    app: &AppHandle,
-    state: &State<AppState>,
-    previous: &Settings,
-) {
-    let current_startup = state.settings_read().launch_at_startup;
-    if should_apply_launch_at_startup(Some(current_startup), previous.launch_at_startup) {
-        if let Err(err) = apply_launch_at_startup(app, previous.launch_at_startup) {
-            eprintln!("Failed to rollback launch-at-startup setting: {err}");
-        }
-    }
-
-    {
-        let mut guard = state.settings_write();
-        *guard = previous.clone();
+pub(crate) fn restore_runtime_settings(app: &AppHandle, state: &State<AppState>) {
+    let current = state.settings_read().clone();
+    if let Err(err) = apply_launch_at_startup(app, current.launch_at_startup) {
+        eprintln!("Failed to rollback launch-at-startup setting: {err}");
     }
     state
         .sub_agents
-        .set_concurrency(previous.chat_tools.sub_agent_concurrency);
+        .set_concurrency(current.chat_tools.sub_agent_concurrency);
 
-    if let Err(err) = register_hotkeys(app) {
+    if let Err(err) = register_hotkeys_for_settings(app, &current) {
         eprintln!(
             "Failed to rollback hotkeys: {}",
             display_hotkey_errors(&err)
@@ -1079,9 +1099,9 @@ pub(crate) fn send_paste_shortcut() {
 }
 
 /// 恢复并聚焦已有 Chat 窗口。
-fn reveal_chat_window(app: &AppHandle, window: &WebviewWindow) {
+fn reveal_chat_window(_app: &AppHandle, window: &WebviewWindow) {
     #[cfg(target_os = "macos")]
-    set_macos_regular_activation_policy(app);
+    set_macos_regular_activation_policy(_app);
 
     if window.is_minimized().ok().unwrap_or(false) {
         let _ = window.unminimize();
@@ -1165,8 +1185,8 @@ pub(crate) fn open_chat_window(app: &AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let st = app.state::<AppState>();
-        forget_frontmost_app(&st.prev_frontmost_pid_lens);
-        forget_frontmost_app(&st.prev_frontmost_pid_main);
+        forget_frontmost_app(st.frontmost_apps().lens());
+        forget_frontmost_app(st.frontmost_apps().translator());
     }
     let existing_window = app.get_webview_window("chat");
     let window = ensure_chat_window(app)?;
@@ -1204,8 +1224,8 @@ pub(crate) fn open_chat_settings_window(app: &AppHandle) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
         let st = app.state::<AppState>();
-        forget_frontmost_app(&st.prev_frontmost_pid_lens);
-        forget_frontmost_app(&st.prev_frontmost_pid_main);
+        forget_frontmost_app(st.frontmost_apps().lens());
+        forget_frontmost_app(st.frontmost_apps().translator());
     }
     let existing_window = app.get_webview_window("chat");
     let window = ensure_chat_window_with_hash(app, "chat/settings")?;
@@ -1244,18 +1264,7 @@ fn lens_is_active(app: &AppHandle) -> bool {
     };
 
     if let Some(state) = app.try_state::<AppState>() {
-        if state.lens_busy.load(Ordering::SeqCst) {
-            if any_overlay_visible() {
-                return true;
-            }
-            // "刚开启"宽限期内窗口可能还没来得及可见（开启要先截冻结帧，200-500ms）。
-            // 此时既不能清 busy（否则快速连按热键会并发双开 lens_request_internal，
-            // take-once 复位载荷被吞），也不当作 active（避免把正在开启的会话误关）。
-            if state.lens_open_in_grace() {
-                return false;
-            }
-            state.lens_busy.store(false, Ordering::SeqCst);
-        }
+        return state.lens().is_active_or_recover(any_overlay_visible);
     }
 
     any_overlay_visible()
@@ -1284,7 +1293,7 @@ pub(crate) fn open_settings_window_for_activation(app: &AppHandle) -> Result<(),
     // 激活（单实例二次启动 / Windows 普通启动）时，优先把用户当前已开的主窗口带到前台：
     // 绝不强跳 Chat，更不能把正在 #chat/settings 配置的用户重置回 #chat（会丢失填到一半的
     // API key）。只有一个主窗口都没开时，才新开 Chat 作为默认入口。
-    for label in ["settings", "chat", "main"] {
+    for label in ["settings", "chat", "translator"] {
         let Some(window) = app.get_webview_window(label) else {
             continue;
         };
@@ -1384,7 +1393,7 @@ pub(crate) fn setup_tray(app: &AppHandle) -> Result<(), String> {
                     eprintln!("Failed to open chat window: {}", err);
                 }
             }
-            "show" => match ensure_main_window(app) {
+            "show" => match ensure_translator_window(app) {
                 Ok(window) => {
                     apply_frameless_window_chrome(&window);
                     #[cfg(not(target_os = "macos"))]
@@ -1392,7 +1401,7 @@ pub(crate) fn setup_tray(app: &AppHandle) -> Result<(), String> {
                     #[cfg(target_os = "macos")]
                     {
                         let st = app.state::<AppState>();
-                        remember_frontmost_app(&st.prev_frontmost_pid_main);
+                        remember_frontmost_app(st.frontmost_apps().translator());
                         ensure_overlay_panel(&window);
                     }
                     let _ = window.eval(
@@ -1405,7 +1414,7 @@ pub(crate) fn setup_tray(app: &AppHandle) -> Result<(), String> {
                     #[cfg(not(target_os = "macos"))]
                     let _ = window.set_focus();
                 }
-                Err(err) => eprintln!("Failed to ensure main window: {}", err),
+                Err(err) => eprintln!("Failed to ensure translator window: {}", err),
             },
             "settings" => {
                 if let Err(err) = open_chat_settings_window(app) {
@@ -1445,4 +1454,36 @@ pub(crate) fn setup_tray(app: &AppHandle) -> Result<(), String> {
     tray.set_tooltip(Some("Kivio Desktop".to_string()))
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[cfg(test)]
+mod runtime_settings_tests {
+    use super::hotkey_bindings_changed;
+    use crate::settings::Settings;
+
+    #[test]
+    fn unrelated_settings_do_not_reinstall_global_hotkeys() {
+        let previous = Settings::default();
+        let mut next = previous.clone();
+        next.theme = "dark".into();
+        next.settings_language = Some("en".into());
+        next.screenshot_translation.model = "another-model".into();
+        assert!(!hotkey_bindings_changed(&previous, &next));
+    }
+
+    #[test]
+    fn registration_fields_do_reinstall_global_hotkeys() {
+        let previous = Settings::default();
+        let mut next = previous.clone();
+        next.chat_hotkey = "Control+Shift+Q".into();
+        assert!(hotkey_bindings_changed(&previous, &next));
+
+        let mut next = previous.clone();
+        next.screenshot_translation.replace_enabled = !next.screenshot_translation.replace_enabled;
+        assert!(hotkey_bindings_changed(&previous, &next));
+
+        let mut next = previous.clone();
+        next.lens.enabled = !next.lens.enabled;
+        assert!(hotkey_bindings_changed(&previous, &next));
+    }
 }

@@ -6,7 +6,7 @@ import { FileChip } from './fileChip'
 import { fileLocationAction } from './fileLocation'
 import { openChatImageViewer } from './imageViewer'
 import { PastedTextEditorModal } from './PastedTextEditorModal'
-import { useT } from '../settings/i18n'
+import { useT } from '../components/i18n'
 
 type ChatAttachmentsProps = {
   attachments: DisplayAttachment[]
@@ -124,6 +124,7 @@ function FileAttachmentCard({
   return (
     <FileChip
       name={attachment.name}
+      kind={attachment.type === 'folder' ? 'folder' : undefined}
       onRevealLocation={fileLocationAction(attachment.path, conversationId)}
       onClick={() => {
         if (typeof attachment.content === 'string' && onEdit) {

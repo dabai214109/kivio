@@ -492,7 +492,7 @@ fn load_last_assistant(app: &AppHandle, conv_id: &str) -> Option<String> {
 fn cancel_generation(app: &AppHandle, conv_id: &str) {
     let Some(state) = app.try_state::<AppState>() else { return };
     state.cancel_chat_generation(conv_id);
-    if let Some(control) = state.external_live_session_control_any(conv_id) {
+    if let Some(control) = state.external_live_sessions().control_any(conv_id) {
         tauri::async_runtime::spawn(async move {
             let _ = control.send(crate::external_agents::session::live::SessionCommand::Cancel).await;
         });

@@ -40,8 +40,8 @@ use super::messages::{
 use super::reply_runtime::{ArmReplyOutcome, ChatReplyGuard, ReplyArm};
 use super::resolve_thinking;
 use super::tooling::{
-    append_agent_ask_user_tools, append_agent_todo_tools, append_goal_tools,
-    apply_agent_plan_tool_filter, apply_chat_mode_tool_filter,
+    allowed_mcp_server_ids, append_agent_ask_user_tools, append_agent_todo_tools,
+    append_goal_tools, apply_agent_plan_tool_filter, apply_chat_mode_tool_filter,
     apply_inline_code_request_tool_filter, apply_web_search_mode_tool_filter,
     await_chat_tool_discovery, list_tools_for_chat, resolve_request_skill,
 };
@@ -77,7 +77,10 @@ pub(super) async fn complete_assistant_reply(
         {
             break;
         }
-        if state.has_goal_user_queue_pending(&conversation.id) {
+        if state
+            .chat_runtime()
+            .has_goal_user_queue_pending(&conversation.id)
+        {
             break;
         }
         let continuation_skill = conversation.active_skill_id.clone();
@@ -148,8 +151,8 @@ pub(super) async fn complete_assistant_reply_inner(
 ) -> Result<ArmReplyOutcome, String> {
     if conversation.agent_runtime.is_external() {
         // 外部 CLI 路径在 run.rs 内自带 generation；这里登记一条 per-run 回复槽位，
-        // 让 `conversation_has_active_reply` 在外部回复期间也能拒绝并发新发送（防回归）。
-        let ext_generation = state.next_chat_generation(&conversation.id);
+        // 让 `chat_runtime().has_active_reply` 在外部回复期间也能拒绝并发新发送（防回归）。
+        let ext_generation = state.chat_runtime().begin_generation(&conversation.id);
         let ext_run_id = format!("chat-run-ext-{}-{}", ext_generation, Uuid::new_v4());
         let _ext_reply_guard =
             ChatReplyGuard::try_new(state.inner(), &conversation.id, &ext_run_id, ext_generation);
@@ -262,7 +265,7 @@ pub(super) async fn complete_assistant_reply_inner(
                 .into(),
         );
     }
-    let run_generation = state.next_chat_generation(&conversation.id);
+    let run_generation = state.chat_runtime().begin_generation(&conversation.id);
     let run_id = format!("chat-run-{}-{}", run_generation, Uuid::new_v4());
     let assistant_message_id = format!("msg_{}", Uuid::new_v4());
     if let Some(goal) = conversation
@@ -509,6 +512,7 @@ pub(super) async fn complete_assistant_reply_inner(
             state.inner(),
             &settings,
             Some(session_model_for_conversation(conversation)),
+            allowed_mcp_server_ids(conversation, &settings),
         ),
     )
     .await;
@@ -691,7 +695,9 @@ pub(super) async fn complete_assistant_reply_inner(
     };
     if !video_plan.send_video && !video_plan.reports.is_empty() {
         crate::chat::video_analysis::apply_saved_reports(
-            &mut runtime_messages, &video_plan.reports, &language,
+            &mut runtime_messages,
+            &video_plan.reports,
+            &language,
         );
     }
     let mut fallback_chat_tools = effective_chat_tools.clone();
@@ -798,7 +804,8 @@ pub(super) async fn complete_assistant_reply_inner(
         app: app.clone(),
         state: state.inner(),
         video_analysis: tokio::sync::Mutex::new(crate::chat::video_analysis::VideoTool::new(
-            conversation.clone(), video_plan,
+            conversation.clone(),
+            video_plan,
         )),
     };
     let max_output_tokens = chat_max_output_tokens_on_wire(
@@ -812,7 +819,7 @@ pub(super) async fn complete_assistant_reply_inner(
         resolve_usage_anchor(conversation, Some(&provider));
     let result = crate::chat::agent::run_agent_loop(
         crate::chat::agent::AgentRunConfig {
-            state: state.inner(),
+            provider_runtime: state.inner(),
             conversation_id: conversation.id.clone(),
             tool_conversation_id: conversation.id.clone(),
             depth: 0,

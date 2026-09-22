@@ -70,7 +70,7 @@
 
 ## 功能
 
-完整记录见 [Releases](https://github.com/ZMGID/kivio/releases) · 当前版本说明：[v2.9.9](docs/releases/v2.9.9.md)
+完整记录见 [Releases](https://github.com/ZMGID/kivio/releases) · 当前版本说明：[v3.0.0](docs/releases/v3.0.0.md)
 
 ### 聊天与 Agent
 
@@ -229,7 +229,7 @@ npm run protocol:check
 - 供应商适配器：OpenAI Chat、Anthropic Messages、Gemini、OpenAI Responses（含 xAI Grok）
 - 设置存在 `settings.json`（含 API Key），对话在 `conversations/`，崩溃草稿走 JSONL journal
 
-更细的模块地图见 [CLAUDE.md](CLAUDE.md)。
+开发约定见[统一工程规范](docs/engineering-standards.md)。
 
 </details>
 

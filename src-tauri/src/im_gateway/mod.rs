@@ -903,7 +903,7 @@ async fn handle_command(gateway: &Arc<Gateway>, user: &UserKey, session_key: &st
 fn cancel_turn(app: &AppHandle, conv_id: &str) {
     let Some(state) = app.try_state::<AppState>() else { return };
     state.cancel_chat_generation(conv_id);
-    if let Some(control) = state.external_live_session_control_any(conv_id) {
+    if let Some(control) = state.external_live_sessions().control_any(conv_id) {
         // 控制通道是异步的；这里用 block_on 会有嵌套运行时风险（调用方本就在 runtime 里），
         // 改为 spawn 投递。
         tauri::async_runtime::spawn(async move {

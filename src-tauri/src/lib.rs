@@ -15,21 +15,21 @@ pub mod fonts;
 pub mod im_gateway;
 pub mod lens;
 pub mod lens_commands;
+#[cfg(any(target_os = "macos", test))]
+mod macos_hang_watchdog;
 #[cfg(target_os = "macos")]
 pub mod macos_ocr;
 pub mod mcp;
 pub mod native_tools;
 pub mod notes;
 pub mod offline_models;
+mod opencode_free;
 pub mod path_env;
 pub mod plugins;
 pub mod proc;
-#[cfg(any(target_os = "macos", test))]
-mod macos_hang_watchdog;
 pub mod prompts;
-pub mod provider_request;
 pub mod provider_oauth;
-mod opencode_free;
+pub mod provider_request;
 pub mod rapidocr;
 pub mod remote_bridge;
 pub mod replace_translation;
@@ -45,6 +45,8 @@ pub mod updates;
 pub mod usage;
 pub mod utils;
 pub mod web_search;
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) mod window_focus;
 pub mod windows;
 #[cfg(target_os = "windows")]
 pub mod windows_ocr;
@@ -76,7 +78,7 @@ use windows::{ensure_overlay_panel, restore_previous_frontmost_app};
 const AUTOSTART_ARG: &str = "--from-autostart";
 
 #[cfg(target_os = "macos")]
-const USER_WINDOW_LABELS: &[&str] = &["chat", "main"];
+const USER_WINDOW_LABELS: &[&str] = &["chat", "translator"];
 
 #[cfg(target_os = "macos")]
 fn first_visible_user_window(app: &tauri::AppHandle) -> Option<tauri::WebviewWindow> {
@@ -196,15 +198,15 @@ pub fn run() {
                     }
                     return;
                 }
-                // 翻译窗（main）若仍收到默认 CloseRequested，必须拦截并走安全销毁：先恢复
+                // 翻译浮层若仍收到默认 CloseRequested，必须拦截并走安全销毁：先恢复
                 // TaoWindow 原类，再 destroy WebView/NSPanel，同时把前台交还给打开它之前的 App。
                 #[cfg(target_os = "macos")]
-                if window.label() == "main" {
+                if window.label() == windows::TRANSLATOR_WINDOW_LABEL {
                     api.prevent_close();
                     let handle = window.app_handle();
                     let st = handle.state::<AppState>();
-                    restore_previous_frontmost_app(handle, &st.prev_frontmost_pid_main);
-                    if let Some(webview_window) = handle.get_webview_window("main") {
+                    restore_previous_frontmost_app(handle, st.frontmost_apps().translator());
+                    if let Some(webview_window) = handle.get_webview_window(windows::TRANSLATOR_WINDOW_LABEL) {
                         windows::destroy_overlay_window(&webview_window);
                     }
                     return;
@@ -226,6 +228,9 @@ pub fn run() {
             }
             tauri::WindowEvent::Destroyed => {
                 let label = window.label();
+                if let Some(flows) = window.app_handle().try_state::<connectors::OAuthFlows>() {
+                    flows.cancel_window(label);
+                }
                 chat::notification_viewing::clear_window(label);
                 if crate::chat::popout::is_popout_label(label) {
                     crate::chat::popout::on_popout_destroyed(window.app_handle(), label);
@@ -281,7 +286,7 @@ pub fn run() {
                         let Some(state) = sweeper.try_state::<AppState>() else {
                             continue;
                         };
-                        state.sweep_idle_external_live_sessions(
+                        state.external_live_sessions().sweep_idle(
                             crate::external_agents::session::live::LIVE_SESSION_IDLE_TTL,
                         );
                     }
@@ -372,6 +377,7 @@ pub fn run() {
                 rapidocr::RapidOcrClient::new(offline_models),
             ));
             app.manage(chat::repository::ConversationRepository::default());
+            app.manage(connectors::OAuthFlows::default());
 
             // 崩溃残留的中断草稿日志:按每个 message_id 的最后一行合并回会话文件后删除。
             // setup 阶段不可能有活跃 run,没有并发写冲突。
@@ -621,6 +627,9 @@ pub fn run() {
             chat::commands::context::chat_compress_context,
             chat::commands::context::chat_clear_context,
             chat::commands::interaction::chat_take_external_sends,
+            chat::commands::interaction::chat_ack_external_send,
+            chat::commands::interaction::chat_renew_external_sends,
+            chat::commands::interaction::chat_release_external_sends,
             chat::commands::interaction::chat_set_agent_plan_mode,
             chat::commands::interaction::chat_execute_agent_plan,
             chat::goal::chat_get_goal,
@@ -645,12 +654,15 @@ pub fn run() {
             chat::commands::interaction::chat_steer_message,
             chat::commands::interaction::chat_follow_up_message,
             chat::commands::attachments::chat_read_attachment,
+            chat::artifacts::chat_artifacts_list,
+            chat::artifacts::chat_artifact_action,
             chat::commands::attachments::chat_open_attachment,
             chat::commands::attachments::chat_reveal_attachment,
             chat::commands::attachments::chat_open_generated_artifact,
             chat::commands::attachments::chat_reveal_generated_artifact,
             chat::commands::attachments::chat_save_pasted_image,
             chat::commands::attachments::chat_save_pasted_attachment,
+            chat::commands::attachments::chat_inspect_attachment_paths,
             chat::commands::attachments::chat_read_clipboard_files,
             chat::commands::attachments::chat_read_clipboard,
             chat::commands::attachments::chat_write_clipboard_text,
@@ -723,6 +735,7 @@ pub fn run() {
             mcp::registry::chat_mcp_reload_server,
             mcp::registry::chat_mcp_warmup,
             connectors::connector_oauth_connect,
+            connectors::connector_oauth_cancel,
             connectors::obsidian::list_obsidian_vaults_cmd,
             plugins::plugins_list,
             plugins::packages::plugin_packages_list,
@@ -886,7 +899,7 @@ pub fn run() {
                     let closed = tauri::async_runtime::block_on(async {
                         tokio::time::timeout(
                             std::time::Duration::from_secs(3),
-                            state.close_all_external_live_sessions(),
+                            state.external_live_sessions().close_all(),
                         )
                         .await
                     });
@@ -895,7 +908,7 @@ pub fn run() {
                     }
                     // 杀掉所有跟踪中的后台 run_command 进程组（跨 turn 存活，只在这里或
                     // 显式 kill_background 才清理），删除其 per-job 日志，避免孤儿进程/文件。
-                    let killed = state.kill_all_background_commands();
+                    let killed = state.background_commands_handle().kill_all();
                     if killed > 0 {
                         eprintln!("Killed {killed} background command process group(s) on exit.");
                     }

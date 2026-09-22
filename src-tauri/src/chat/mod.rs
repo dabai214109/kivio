@@ -1,5 +1,6 @@
 // Chat 模块：AI 客户端核心功能
 pub mod agent;
+pub(crate) mod artifacts;
 pub mod ask_user;
 pub mod attachments;
 pub mod commands;
@@ -7,12 +8,14 @@ mod completion_notification;
 pub mod draft_journal;
 pub mod dsml_tools;
 pub mod export;
+pub(crate) mod external_send;
 pub mod gc;
 pub mod goal;
 pub mod hooks;
 mod image_collage;
 pub mod image_generation;
 mod image_prep;
+pub(crate) mod interaction_state;
 pub mod knowledge_base;
 mod mcp_image_feedback;
 pub mod memory;
@@ -25,8 +28,11 @@ pub mod popout;
 #[cfg(debug_assertions)]
 pub mod probe;
 pub mod protocol;
+pub(crate) mod provider_runtime;
 pub mod repository;
 pub mod request_debug;
+pub(crate) mod route_contract;
+pub(crate) mod runtime_state;
 pub mod storage;
 pub mod sub_agent;
 pub mod todo;

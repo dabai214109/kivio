@@ -19,18 +19,19 @@ use crate::prompts::{
 };
 use crate::rapidocr;
 use crate::settings::{
-    default_chat_system_prompt, default_lens_system_prompt, default_question_prompt,
-    persist_settings, sanitize_settings, ProviderApiFormat, Settings,
+    commit_settings, default_chat_system_prompt, default_lens_system_prompt,
+    default_question_prompt, persist_settings, sanitize_settings, settings_snapshot,
+    update_settings, ProviderApiFormat, Settings, SettingsError, SettingsSnapshot, SettingsVersion,
 };
 #[cfg(target_os = "macos")]
 use crate::shortcuts::{check_accessibility, check_screen_recording_permission};
 use crate::shortcuts::{
-    open_chat_settings_window as open_settings_window_impl, register_hotkeys,
+    open_chat_settings_window as open_settings_window_impl, register_hotkeys_for_settings,
     restore_runtime_settings, send_paste_shortcut, setup_tray,
 };
 use crate::state::AppState;
 use crate::utils::{language_name, resolve_target_lang};
-use crate::windows::get_main_window;
+use crate::windows::get_translator_window;
 
 pub(crate) fn apply_launch_at_startup(app: &AppHandle, enabled: bool) -> Result<(), String> {
     let auto_launch = app.autolaunch();
@@ -69,9 +70,11 @@ pub(crate) fn initialize_launch_at_startup(
 
 /// 获取当前应用设置
 #[tauri::command]
-pub(crate) fn get_settings(app: AppHandle, state: State<AppState>) -> Settings {
+pub(crate) fn get_settings(app: AppHandle, state: State<AppState>) -> SettingsSnapshot {
     crate::plugins::heal_and_persist_disabled_plugin_mcp(&app, &state);
-    state.settings_read().clone()
+    let mut snapshot = settings_snapshot(&state);
+    snapshot.settings = sanitize_settings(snapshot.settings);
+    snapshot
 }
 
 /// 获取默认提示词模板
@@ -114,8 +117,9 @@ pub(crate) async fn save_settings(
     app: AppHandle,
     state: State<'_, AppState>,
     settings: Settings,
-) -> Result<Settings, String> {
-    apply_settings(&app, &state, settings, true).await
+    expected_version: SettingsVersion,
+) -> Result<SettingsSnapshot, SettingsError> {
+    apply_settings(&app, &state, settings, expected_version, true).await
 }
 
 /// trim + 去空 + 去重（保序）。
@@ -142,14 +146,12 @@ pub(crate) fn set_favorite_models(
     app: AppHandle,
     state: State<AppState>,
     models: Vec<String>,
-) -> Result<(), String> {
+) -> Result<SettingsSnapshot, SettingsError> {
     let cleaned = dedup_preserve_order(models);
-    let snapshot = {
-        let mut guard = state.settings_write();
-        guard.favorite_models = cleaned;
-        guard.clone()
-    };
-    persist_settings(&app, &snapshot)
+    update_settings(&app, &state, move |settings| {
+        settings.favorite_models = cleaned;
+        Ok(())
+    })
 }
 
 /// 轻量持久化快速翻译卡宽度（拖拽缩放的记忆；高度始终自动不持久化）。
@@ -160,17 +162,15 @@ pub(crate) fn set_translate_card_size(
     app: AppHandle,
     state: State<AppState>,
     width: u32,
-) -> Result<(), String> {
+) -> Result<SettingsSnapshot, SettingsError> {
     let clamped = width.clamp(360, 720);
-    let snapshot = {
-        let mut guard = state.settings_write();
-        guard.screenshot_translation.card_width = clamped;
-        guard.clone()
-    };
-    persist_settings(&app, &snapshot)?;
+    let canonical = update_settings(&app, &state, |settings| {
+        settings.screenshot_translation.card_width = clamped;
+        Ok(())
+    })?;
     // 通知可能开着的设置页同步草稿里的宽度，避免其随后 save_settings 用陈旧草稿覆盖掉这次拖拽。
     let _ = tauri::Emitter::emit_to(&app, "chat", "translate-card-width", clamped);
-    Ok(())
+    Ok(canonical)
 }
 
 /// sanitize → 应用运行时（自启/热键/托盘）→ 持久化，失败回滚。save_settings 与 import_settings 共用。
@@ -178,9 +178,20 @@ async fn apply_settings(
     app: &AppHandle,
     state: &State<'_, AppState>,
     settings: Settings,
+    expected_version: SettingsVersion,
     preserve_oauth: bool,
-) -> Result<Settings, String> {
-    let previous_settings = state.settings_read().clone();
+) -> Result<SettingsSnapshot, SettingsError> {
+    // Only one full save may own workspace migration at a time. This async lock deliberately does
+    // not cover lightweight writers; their revision bump makes this save fail its final CAS.
+    let _full_save = state.begin_settings_save().await;
+    let snapshot = settings_snapshot(state);
+    if snapshot.version != expected_version {
+        return Err(SettingsError::version_conflict(
+            expected_version,
+            snapshot.version,
+        ));
+    }
+    let previous_settings = snapshot.settings.clone();
     let mut sanitized = sanitize_settings(settings);
     if preserve_oauth {
         crate::mcp::manager::preserve_live_oauth(&mut sanitized, &previous_settings);
@@ -191,65 +202,86 @@ async fn apply_settings(
     ) {
         apply_launch_at_startup(app, sanitized.launch_at_startup)?;
     }
-    {
-        let mut guard = state.settings_write();
-        *guard = sanitized.clone();
-    }
     state
         .sub_agents
         .set_concurrency(sanitized.chat_tools.sub_agent_concurrency);
 
-    if let Err(err) = register_hotkeys(app) {
-        // 热键被系统/其他应用占用不该阻断保存——能注册的已注册,失败的作为警告推给前端,
-        // 设置照常落盘(否则用户连"删掉这个冲突热键"的改动都存不下)。
-        let _ = tauri::Emitter::emit(app, "hotkey-warning", err);
+    if crate::shortcuts::hotkey_bindings_changed(&previous_settings, &sanitized) {
+        if let Err(err) = register_hotkeys_for_settings(app, &sanitized) {
+            // 热键被系统/其他应用占用不该阻断保存——能注册的已注册,失败的作为警告推给前端,
+            // 设置照常落盘(否则用户连"删掉这个冲突热键"的改动都存不下)。
+            let _ = tauri::Emitter::emit(app, "hotkey-warning", err);
+        }
     }
 
-    let old_working_directory = &previous_settings.chat_tools.native_tools.working_directory;
-    let new_working_directory = &sanitized.chat_tools.native_tools.working_directory;
+    let old_working_directory = previous_settings
+        .chat_tools
+        .native_tools
+        .working_directory
+        .clone();
+    let new_working_directory = sanitized.chat_tools.native_tools.working_directory.clone();
     let workspace_root_changed = old_working_directory.trim() != new_working_directory.trim();
     if workspace_root_changed {
         if let Err(err) = crate::chat::storage::migrate_ordinary_conversation_workspaces(
             app,
-            old_working_directory,
-            new_working_directory,
+            &old_working_directory,
+            &new_working_directory,
         )
         .await
         {
-            restore_runtime_settings(app, state, &previous_settings);
-            return Err(format!("Failed to migrate conversation workspaces: {err}"));
+            restore_runtime_settings(app, state);
+            return Err(format!("Failed to migrate conversation workspaces: {err}").into());
         }
     }
 
-    if let Err(err) = persist_settings(app, &sanitized) {
-        eprintln!("Failed to save settings: {err}");
-        if workspace_root_changed {
-            if let Err(rollback_err) =
-                crate::chat::storage::migrate_ordinary_conversation_workspaces(
-                    app,
-                    new_working_directory,
-                    old_working_directory,
-                )
-                .await
-            {
-                eprintln!("Failed to roll back conversation workspace migration: {rollback_err}");
+    let committed = match commit_settings(app, state, snapshot.version, sanitized) {
+        Ok(committed) => committed,
+        Err(err) => {
+            eprintln!("Failed to save settings: {err}");
+            if workspace_root_changed {
+                // A conflicting writer may itself have changed the configured workspace. Roll
+                // toward the value that actually won the commit, not this stale save's snapshot.
+                let committed_working_directory = state
+                    .settings_read()
+                    .chat_tools
+                    .native_tools
+                    .working_directory
+                    .clone();
+                if let Err(rollback_err) =
+                    crate::chat::storage::migrate_ordinary_conversation_workspaces(
+                        app,
+                        &new_working_directory,
+                        &committed_working_directory,
+                    )
+                    .await
+                {
+                    eprintln!(
+                        "Failed to roll back conversation workspace migration: {rollback_err}"
+                    );
+                }
             }
+            restore_runtime_settings(app, state);
+            return Err(err);
         }
-        restore_runtime_settings(app, state, &previous_settings);
-        return Err(err);
-    }
+    };
 
-    state.sync_preferred_api_keys(&previous_settings, &sanitized);
+    state
+        .provider_runtime()
+        .sync_preferred_api_keys(&previous_settings, &committed.settings);
 
-    if previous_settings.keep_chat_window_alive && !sanitized.keep_chat_window_alive {
+    if previous_settings.keep_chat_window_alive && !committed.settings.keep_chat_window_alive {
         crate::shortcuts::destroy_hidden_chat_window(app);
     }
 
-    if let Err(err) = setup_tray(app) {
-        eprintln!("Failed to update tray: {err}");
+    if previous_settings.settings_language != committed.settings.settings_language
+        || app.tray_by_id("main").is_none()
+    {
+        if let Err(err) = setup_tray(app) {
+            eprintln!("Failed to update tray: {err}");
+        }
     }
 
-    Ok(sanitized)
+    Ok(committed)
 }
 
 /// 设置备份文件格式版本。结构变化不兼容时递增。
@@ -258,7 +290,7 @@ const SETTINGS_BACKUP_VERSION: u32 = 1;
 /// 导出全部设置（含供应商/模型配置与 API Key）到指定路径的 JSON 备份文件。
 #[tauri::command]
 pub(crate) fn export_settings(state: State<AppState>, path: String) -> Result<(), String> {
-    let settings = state.settings_read().clone();
+    let settings = sanitize_settings(state.settings_read().clone());
     let backup = serde_json::json!({
         "app": "kivio",
         "type": "settings-backup",
@@ -276,19 +308,20 @@ pub(crate) async fn import_settings(
     app: AppHandle,
     state: State<'_, AppState>,
     path: String,
-) -> Result<Settings, String> {
+    expected_version: SettingsVersion,
+) -> Result<SettingsSnapshot, SettingsError> {
     let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取失败: {e}"))?;
     let value: serde_json::Value =
         serde_json::from_str(&raw).map_err(|_| "文件不是有效的 JSON".to_string())?;
     if value.get("type").and_then(|v| v.as_str()) != Some("settings-backup") {
-        return Err("这不是 Kivio 设置备份文件".to_string());
+        return Err("这不是 Kivio 设置备份文件".into());
     }
     let settings_value = value
         .get("settings")
         .ok_or_else(|| "备份文件缺少 settings 字段".to_string())?;
     let settings: Settings = serde_json::from_value(settings_value.clone())
         .map_err(|e| format!("备份内容无法解析: {e}"))?;
-    apply_settings(&app, &state, settings, false).await
+    apply_settings(&app, &state, settings, expected_version, false).await
 }
 
 #[tauri::command]
@@ -297,12 +330,15 @@ pub(crate) fn open_settings_window(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub(crate) fn close_translator_window(app: AppHandle, state: State<'_, AppState>) {
-    if let Some(window) = get_main_window(&app) {
+pub(crate) fn close_translator_window(app: AppHandle, _state: State<'_, AppState>) {
+    if let Some(window) = get_translator_window(&app) {
         #[cfg(target_os = "macos")]
         {
             crate::windows::destroy_overlay_window(&window);
-            crate::windows::restore_previous_frontmost_app(&app, &state.prev_frontmost_pid_main);
+            crate::windows::restore_previous_frontmost_app(
+                &app,
+                _state.frontmost_apps().translator(),
+            );
         }
         #[cfg(not(target_os = "macos"))]
         let _ = window.close();
@@ -372,18 +408,18 @@ pub(crate) async fn commit_translation(
     // commit 用下面的 [NSApp hide:] 把前台让回原 App（成熟路径）。先清掉翻译窗的前台快照，
     // 避免后续窗口事件再次驱动焦点交还。
     #[cfg(target_os = "macos")]
-    crate::windows::forget_frontmost_app(&state.prev_frontmost_pid_main);
+    crate::windows::forget_frontmost_app(state.frontmost_apps().translator());
 
     // macOS 输入翻译窗口被重分类为 KivioOverlayPanel；必须先换回 TaoWindow 再 destroy，
     // 否则 WebKit 清理 contentLayoutRect KVO observer 时会抛 ObjC 异常并让 Rust abort。
     #[cfg(target_os = "macos")]
-    if let Some(window) = get_main_window(&app) {
+    if let Some(window) = get_translator_window(&app) {
         crate::windows::destroy_overlay_window(&window);
     }
 
     // 其他平台没有 macOS TSM/IMK 的销毁问题，保持原有的关闭释放行为。
     #[cfg(not(target_os = "macos"))]
-    if let Some(window) = get_main_window(&app) {
+    if let Some(window) = get_translator_window(&app) {
         let _ = window.close();
     }
 
@@ -407,10 +443,7 @@ pub(crate) async fn commit_translation(
 /// None），所以读不清除不会产生跨次 stale：当前这次打开读到的始终是这次的值。
 #[tauri::command]
 pub(crate) fn take_lens_selection(state: State<'_, AppState>) -> Result<String, String> {
-    match state.pending_selection.lock() {
-        Ok(guard) => Ok(guard.clone().unwrap_or_default()),
-        Err(_) => Ok(String::new()),
-    }
+    Ok(state.lens().selection().unwrap_or_default())
 }
 
 /// 使用系统默认浏览器打开外部链接（仅限 http/https）
@@ -913,7 +946,9 @@ pub(crate) async fn fetch_models(
         return Err("Missing API Key".to_string());
     }
     if let Some(idx) = preferred_idx {
-        state.prefer_key(&provider_id, idx.min(api_keys.len() - 1));
+        state
+            .provider_runtime()
+            .prefer_key(&provider_id, idx.min(api_keys.len() - 1));
     }
 
     let base = base_url.trim_end_matches('/');

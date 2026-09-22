@@ -1,13 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { VList } from 'virtua'
 import { GitBranch, Loader2, X } from 'lucide-react'
-import { i18n, type Lang } from '../../settings/i18n'
+import { i18n, type Lang } from '../../components/i18n'
 import { dockApi } from './api'
 import { DiffView } from './DiffView'
 import { GRAPH_COLORS, layoutGitGraph, type GraphRow } from './gitGraph'
 import { relativeTime } from './gitReviewModel'
 import { workspaceActivity } from './workspaceActivity'
-import type { GitCommitItem, GitDiffResult } from './types'
+import type { GitCommitItem, GitDiffResult } from '../../api/dockContracts'
 
 function GraphCell({ row, columns }: { row: GraphRow; columns: number }) {
   const x = (lane: number) => 10 + lane * 12
