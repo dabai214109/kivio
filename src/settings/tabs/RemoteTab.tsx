@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { MonitorSmartphone, QrCode } from 'lucide-react'
 import type { RemoteBridgeConfig, RemoteBridgeStatus, RemotePairingStatus } from '../../api/tauri'
 import { api } from '../../api/tauri'
-import type { Lang } from '../i18n'
+import type { Lang } from '../../components/i18n'
 import { Input, SettingsGroup, SettingRow, Toggle } from '../components'
 
 /**

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import { MessageCircle } from 'lucide-react'
 import type { ImGatewayConfig, ImGatewayStatusInfo, RemotePairingStatus } from '../../api/tauri'
 import { api } from '../../api/tauri'
-import type { Lang } from '../i18n'
+import type { Lang } from '../../components/i18n'
 import { Input, Select, SettingsGroup, SettingRow, TextArea, Toggle } from '../components'
 
 /**
