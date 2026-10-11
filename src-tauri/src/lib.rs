@@ -9,6 +9,7 @@ pub mod chat;
 pub mod commands;
 mod computer_control;
 pub mod connectors;
+pub mod desktop_pet;
 pub mod dock;
 pub mod external_agents;
 pub mod fonts;
@@ -19,6 +20,7 @@ pub mod lens_commands;
 mod macos_hang_watchdog;
 #[cfg(target_os = "macos")]
 pub mod macos_ocr;
+pub mod market;
 pub mod mcp;
 pub mod native_tools;
 pub mod notes;
@@ -33,6 +35,7 @@ pub mod provider_request;
 pub mod rapidocr;
 pub mod remote_bridge;
 pub mod replace_translation;
+pub mod scheduled_tasks;
 #[cfg(target_os = "macos")]
 pub mod sck;
 pub mod screenshot;
@@ -377,6 +380,13 @@ pub fn run() {
                 rapidocr::RapidOcrClient::new(offline_models),
             ));
             app.manage(chat::repository::ConversationRepository::default());
+            app.manage(scheduled_tasks::ScheduledTasks::load(
+                app.path()
+                    .app_data_dir()
+                    .map_err(|err| format!("app_data_dir unavailable: {err}"))?
+                    .join("scheduled_tasks"),
+            ));
+            app.manage(chat::media_station::MediaStation::default());
             app.manage(connectors::OAuthFlows::default());
 
             // 崩溃残留的中断草稿日志:按每个 message_id 的最后一行合并回会话文件后删除。
@@ -432,7 +442,11 @@ pub fn run() {
                     display_hotkey_errors(&err)
                 );
             }
+            if let Err(err) = desktop_pet::initialize(&app.handle()) {
+                eprintln!("Failed to initialize desktop pet: {err}");
+            }
             crate::automation::spawn_scheduler(app.handle().clone());
+            crate::scheduled_tasks::spawn_scheduler(app.handle().clone());
             if let Err(err) = setup_tray(&app.handle()) {
                 eprintln!("Failed to setup tray: {err}");
             }
@@ -518,12 +532,22 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            desktop_pet::desktop_pet_get_enabled,
+            desktop_pet::desktop_pet_set_enabled,
             provider_oauth::provider_oauth_start,
             provider_oauth::provider_oauth_poll,
             provider_oauth::provider_oauth_cancel,
             provider_oauth::provider_oauth_disconnect,
             provider_oauth::usage::provider_oauth_usage,
             provider_oauth::account::provider_oauth_account,
+            chat::media_station::media_station_list,
+            chat::media_station::media_station_start,
+            chat::media_station::media_station_cancel,
+            chat::media_station::media_station_delete,
+            chat::media_station::media_station_resume,
+            chat::media_station::media_station_read,
+            chat::media_station::media_station_export,
+            chat::media_station::media_station_reference,
             commands::get_settings,
             windows::chat_window_apply_mica,
             windows::chat_window_set_opaque,
@@ -539,6 +563,7 @@ pub fn run() {
             commands::import_settings,
             commands::open_settings_window,
             commands::close_translator_window,
+            commands::resolve_translation_target_lang,
             commands::translate_text,
             commands::commit_translation,
             commands::open_external,
@@ -583,6 +608,7 @@ pub fn run() {
             commands::replace_translation_pack_status,
             commands::replace_translation_pack_install,
             usage::usage_get_stats,
+            usage::usage_get_conversation_cost,
             usage::usage_clear,
             chat::commands::interaction::get_request_debug_records,
             chat::commands::interaction::clear_request_debug_records,
@@ -601,7 +627,12 @@ pub fn run() {
             chat::commands::catalog::chat_search_conversations,
             chat::commands::catalog::chat_query_conversations,
             chat::commands::catalog::chat_get_conversation,
+            chat::commands::catalog::chat_get_conversation_window,
+            chat::commands::catalog::chat_get_conversation_page,
+            chat::commands::catalog::chat_get_conversation_revision,
             chat::export::chat_export_conversation_markdown,
+            chat::export::chat_export_set_backup,
+            chat::export::chat_import_set_backup,
             chat::commands::catalog::chat_create_conversation,
             chat::commands::catalog::chat_import_external_conversation,
             chat::commands::catalog::chat_create_builder_conversation,
@@ -672,7 +703,7 @@ pub fn run() {
             chat::commands::prompt_optimize::chat_optimize_prompt,
             chat::commands::mutations::chat_bulk_update_conversations,
             chat::commands::mutations::chat_bulk_delete_conversations,
-            chat::commands::reasoning::chat_reasoning_efforts_for_model,
+            chat::commands::reasoning::chat_thinking_capabilities_for_model,
             chat::commands::mutations::chat_update_message,
             chat::commands::mutations::chat_delete_message,
             chat::commands::mutations::chat_set_group_selection,
@@ -737,8 +768,19 @@ pub fn run() {
             connectors::connector_oauth_connect,
             connectors::connector_oauth_cancel,
             connectors::obsidian::list_obsidian_vaults_cmd,
+            market::market_snapshot,
+            market::market_install,
+            market::market_uninstall,
+            market::market_set_enabled,
             plugins::plugins_list,
             plugins::packages::plugin_packages_list,
+            plugins::packages::details::plugin_packages_describe,
+            plugins::marketplaces::plugin_marketplaces_describe,
+            plugins::marketplaces::plugin_marketplaces_list,
+            plugins::marketplaces::plugin_marketplaces_add,
+            plugins::marketplaces::plugin_marketplaces_refresh,
+            plugins::marketplaces::plugin_marketplaces_remove,
+            plugins::marketplaces::plugin_marketplaces_install,
             plugins::packages::plugin_packages_import,
             plugins::packages::plugin_packages_set_enabled,
             plugins::packages::plugin_packages_remove,
@@ -774,6 +816,14 @@ pub fn run() {
             automation::commands::automation_import,
             automation::commands::automation_runs_list,
             automation::commands::automation_run_get,
+            scheduled_tasks::commands::scheduled_tasks_list,
+            scheduled_tasks::commands::scheduled_task_save,
+            scheduled_tasks::commands::scheduled_task_delete,
+            scheduled_tasks::commands::scheduled_task_set_enabled,
+            scheduled_tasks::commands::scheduled_task_run_now,
+            scheduled_tasks::commands::scheduled_task_runs,
+            scheduled_tasks::commands::scheduled_task_preview,
+            scheduled_tasks::commands::scheduled_task_run_delete,
             skills::chat_skills_list,
             skills::chat_skills_read,
             skills::chat_skills_import,
@@ -797,6 +847,7 @@ pub fn run() {
             dock::fs::dock_fs_list,
             dock::fs::dock_fs_search,
             dock::fs::dock_fs_read,
+            dock::fs::dock_project_icon,
             dock::fs::dock_fs_write,
             dock::fs::dock_fs_create,
             dock::fs::dock_fs_rename,
@@ -917,6 +968,11 @@ pub fn run() {
                     // OfficeCLI live preview (`officecli watch`) 等插件附属进程
                     crate::plugins::stop_all_previews();
                 }
+            }
+            // 桌宠只在最终退出时拆掉。ExitRequested 在用户关窗（code 为空）
+            // 和子进程清理未完成时都会 prevent_exit，那种路径进程还活着。
+            tauri::RunEvent::Exit => {
+                desktop_pet::shutdown(app_handle);
             }
             #[cfg(target_os = "macos")]
             tauri::RunEvent::Reopen {

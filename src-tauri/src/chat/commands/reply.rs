@@ -18,7 +18,7 @@ use crate::chat::vision::{
     user_content_with_auxiliary_vision_result,
 };
 use crate::chat::{
-    chat_missing_model_error, format_chat_missing_api_key_error, session_model_for_conversation,
+    chat_missing_model_error, format_chat_login_required_error, session_model_for_conversation,
     Conversation, ToolCallStatus,
 };
 use crate::skills;
@@ -218,8 +218,8 @@ pub(super) async fn complete_assistant_reply_inner(
         .get_provider(&resolved_provider_id)
         .ok_or_else(|| "Chat provider not found".to_string())?
         .clone();
-    if !provider.has_credentials() {
-        return Err(format_chat_missing_api_key_error(&provider.name));
+    if !provider.authentication_ready() {
+        return Err(format_chat_login_required_error(&provider.name));
     }
     if resolved_model.trim().is_empty() {
         return Err(chat_missing_model_error());
@@ -235,13 +235,13 @@ pub(super) async fn complete_assistant_reply_inner(
         }
     }
     let language = crate::settings::resolve_chat_language(&settings);
-    // 思考：每对话等级覆盖全局开关。None=跟随全局（现状）；"off"=强制关；low/medium/high=按家族注入。
+    // Validate the conversation choice against model capabilities before generating.
     let (thinking_enabled, thinking_level) = resolve_thinking(
         conversation.thinking_level.as_deref(),
         settings.chat.thinking_enabled,
         Some(&provider),
         &resolved_model,
-    );
+    )?;
     let retry_attempts = if settings.retry_enabled {
         settings.retry_attempts as usize
     } else {
@@ -572,16 +572,21 @@ pub(super) async fn complete_assistant_reply_inner(
         user_tools_available,
     );
     let ask_user_tools_available = append_agent_ask_user_tools(&mut tools);
-    let todo_tools_available = if chat_mode || plan_mode {
-        false
-    } else {
-        append_agent_todo_tools(&mut tools)
-    };
+    if !chat_mode && !plan_mode {
+        append_agent_todo_tools(&mut tools);
+    }
     let goal_tools_available = if !chat_mode && !plan_mode && !orchestrate_mode && arm.is_none() {
         append_goal_tools(&mut tools, conversation.goal_state.as_ref())
     } else {
         false
     };
+    if settings.chat_tools.native_tools.scheduled_tasks
+        && !plan_mode
+        && !builder_mode
+        && arm.is_none()
+    {
+        crate::scheduled_tasks::tools::append_tools(app, &conversation.id, &mut tools);
+    }
     // Resolved here (rather than further down with the other prompt context) so
     // the sub-agent role registry below can reuse the project root instead of
     // resolving the conversation's project a second time.
@@ -602,14 +607,6 @@ pub(super) async fn complete_assistant_reply_inner(
     }
     let runtime_tools_available = !tools.is_empty();
     let available_builtin_tools = agent_prepare::available_builtin_tool_names(&tools);
-    let agent_todo_prompt = if chat_mode || plan_mode {
-        None
-    } else {
-        Some(crate::chat::todo::format_prompt(
-            &conversation.agent_todo_state,
-            todo_tools_available,
-        ))
-    };
     let agent_ask_user_prompt = crate::chat::ask_user::format_prompt(ask_user_tools_available);
     let runtime_prompts = agent_prepare::resolve_runtime_prompt_sources(
         chat_mode,
@@ -652,7 +649,6 @@ pub(super) async fn complete_assistant_reply_inner(
         memory_prompt.as_deref(),
         runtime_prompts.agent_plan_prompt.as_deref(),
         Some(&agent_ask_user_prompt),
-        agent_todo_prompt.as_deref(),
         project_prompt_context.as_ref(),
         workbench_dir.as_deref(),
         knowledge_base_prompt.as_deref(),
@@ -721,15 +717,6 @@ pub(super) async fn complete_assistant_reply_inner(
         memory_prompt.as_deref(),
         runtime_prompts.agent_plan_prompt.as_deref(),
         Some(&crate::chat::ask_user::format_prompt(false)),
-        if chat_mode || plan_mode {
-            None
-        } else {
-            Some(crate::chat::todo::format_prompt(
-                &conversation.agent_todo_state,
-                false,
-            ))
-        }
-        .as_deref(),
         project_prompt_context.as_ref(),
         workbench_dir.as_deref(),
         knowledge_base_prompt.as_deref(),
@@ -758,6 +745,8 @@ pub(super) async fn complete_assistant_reply_inner(
         // 多模型臂不直接落盘（最终由协调者统一 upsert + save），因此抑制 loop 的
         // mid-run 部分快照写盘，避免 N 条并发 run 同写 conversations/{id}.json 的竞态。
         suppress_partial_persist: arm.is_some(),
+        context_owner: arm.is_none() || (resolved_provider_id == conversation.provider_id
+            && resolved_model == conversation.model),
         // 生命周期 Hooks：无启用条目时为 None，loop 完全不感知。先用 `any_enabled`
         // 短路，没配 Hook 时连下面这几个 id / model 字符串都不分配（验收 6）。
         hooks: crate::chat::hooks::HookDispatcher::any_enabled(&settings.chat_tools.hooks)
@@ -817,6 +806,10 @@ pub(super) async fn complete_assistant_reply_inner(
     // （对齐 pi/opencode 的 ground-truth 口径，避免字符估算低估导致压缩过晚/超窗）。
     let (initial_anchor_total_tokens, initial_anchor_trailing_estimate) =
         resolve_usage_anchor(conversation, Some(&provider));
+    state.chat_runtime().seed_context_measurement(
+        &conversation.id, conversation.context_state.lifecycle_id, conversation.context_state.measurement_seq,
+        conversation.context_state.request_measurement.as_ref(),
+    );
     let result = crate::chat::agent::run_agent_loop(
         crate::chat::agent::AgentRunConfig {
             provider_runtime: state.inner(),
@@ -841,9 +834,11 @@ pub(super) async fn complete_assistant_reply_inner(
             retry_attempts,
             assistant_snapshot: conversation.assistant_snapshot.clone(),
             provider_tools_fallback_system_prompt,
+            initial_cache_usage: super::context::conversation_cache_usage(conversation, &settings),
             initial_anchor_total_tokens,
             initial_anchor_trailing_estimate,
             skill_project_cwd: skill_cwd.clone(),
+            todo_state: conversation.agent_todo_state.clone(),
         },
         host,
         &executor,
@@ -927,6 +922,8 @@ pub(super) async fn complete_assistant_reply_inner(
         );
         // 降级兜底的结构化描述挂到消息上，前端渲染成独立错误卡片（正文不再混故障文案）。
         let mut message = message;
+        message.cache_pair_input = result.cache_pairs.map(|pair| pair.0);
+        message.cache_pair_read = result.cache_pairs.map(|pair| pair.1);
         message.degraded = result.degraded;
         protocol_guard.defer_terminal();
         return Ok(ArmReplyOutcome {

@@ -1,0 +1,45 @@
+<!doctype html>
+<html><head><meta charset="UTF-8"><title>Chat scroll regression fixture</title></head>
+<body><div id="root"></div><script type="module">
+// Development-only fixture: real chat components, synthetic data, no model calls.
+import React from 'react';
+import { createRoot } from 'react-dom/client';
+import { MessageList } from '/src/chat/MessageList.tsx';
+import { createChatPerformanceFixture } from '/src/chat/performanceFixtures.ts';
+import '/src/styles/app.css';
+
+const heavy = new URLSearchParams(location.search).has('heavy');
+const messages = createChatPerformanceFixture('F2').messages.map(message => {
+  if (!heavy || message.role !== 'assistant') return message;
+  return {...message, content: message.content.replaceAll(
+    '  return input.trim().toUpperCase()',
+    Array.from({length: 50}, (_, index) => `  const result${index} = input.trim().toUpperCase()`).join('\n'),
+  )};
+});
+const paged = new URLSearchParams(location.search).has('history');
+function HistoryFixture() {
+  const [start, setStart] = React.useState(Math.max(0, messages.length - 10));
+  const [error, setError] = React.useState(null);
+  window.chatHistoryPaging ??= { requests: 0, commits: 0, failNext: false };
+  window.chatHistoryPaging.start = start;
+  const load = async () => {
+    window.chatHistoryPaging.requests++;
+    setError(null);
+    await new Promise(resolve => setTimeout(resolve, 200));
+    if (window.chatHistoryPaging.failNext) {
+      window.chatHistoryPaging.failNext = false;
+      setError('加载更早消息失败，请重试。');
+      return;
+    }
+    window.chatHistoryPaging.commits++;
+    setStart(value => Math.max(0, value - 10));
+  };
+  return React.createElement(MessageList, {
+    conversationId: 'history-scroll-regression', messages: messages.slice(start),
+    historyStart: start, onLoadOlder: load, historyLoadError: error,
+  });
+}
+createRoot(document.getElementById('root')).render(React.createElement('div', {
+  className: 'chat-main-pane', style: {height: '100vh', display: 'flex', flexDirection: 'column'},
+}, paged ? React.createElement(HistoryFixture) : React.createElement(MessageList, {conversationId: 'scroll-regression', messages})));
+</script></body></html>

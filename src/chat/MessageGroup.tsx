@@ -1,11 +1,14 @@
 import { memo, useMemo, useState, type CSSProperties, type ReactNode } from 'react'
-import { Check, Columns2, Square } from 'lucide-react'
+import { Check, Columns2, Square, Trash2 } from 'lucide-react'
 import type { ChatMessage, ChatToolArtifact, ModelRef } from './types'
 import { MessageBubble } from './MessageBubble'
+import { ReasoningPreviewContext } from './reasoningPreview'
 import type { MarkdownOutlineSourceUpdate } from './ChatMarkdown'
 import { ModelIcon } from '../components/ModelIcon'
 import { getActiveGroup, useGroupVersion, type GroupColumnSnapshot } from './groupStreamingStore'
 import { useMultiAnswerViewMode } from './multiAnswerViewMode'
+import { IconButton } from '../components/Button'
+import { useT } from '../components/i18n'
 
 // 多模型一问多答（任务 06-30 / 步骤 6 + 8）：把同一 group_id 的 N 条 assistant 答案展示出来。
 // 两种来源互斥：
@@ -19,8 +22,8 @@ import { useMultiAnswerViewMode } from './multiAnswerViewMode'
 // 组末尾 footer：视图切换控件 + 一排模型 chip（点 chip = 切显示条 +「续聊选中条」一举两用）。
 //
 // 性能降级（步骤 8 / R10）：N 列同时全量渲染 reasoning + markdown 是内存/CPU 大头。
-// 「聚焦列」（hover 的列 / tabs 模式当前显示列）展开 reasoning 流式；其余「非聚焦列」把
-// reasoningStreaming 置 false → ReasoningBlock 折叠并把正文从 DOM 卸载（hideBody）。
+// 「聚焦列」（鼠标悬停或键盘聚焦的列 / tabs 模式当前显示列）展开 reasoning 流式；其余「非聚焦列」
+// 通过 ReasoningPreviewContext 暂停预览并卸载正文，不能把失焦当成思考完成。
 // 复用既有 KaTeX Shadow DOM / rAF 合帧（touchGroup）/ virtualizer 屏外卸载，不重复造轮子。
 
 interface MessageGroupProps {
@@ -91,7 +94,7 @@ function GroupColumnView({
   isFocused,
   showColumnChrome,
   groupId,
-  onMouseEnter,
+  onActivate,
   onSelectColumn,
   onUpdateMessage,
   onRegenerateMessage,
@@ -112,7 +115,7 @@ function GroupColumnView({
   // columns 模式渲染列头（model 标签 + 「用这条继续」按钮）；tabs 模式列头交给 footer chip。
   showColumnChrome: boolean
   groupId: string
-  onMouseEnter?: () => void
+  onActivate?: () => void
   onSelectColumn?: (groupId: string, messageId: string) => void
   onUpdateMessage?: (messageId: string, content: string) => Promise<void>
   onRegenerateMessage?: (messageId: string) => Promise<void>
@@ -129,13 +132,16 @@ function GroupColumnView({
     ? `chat-message-group-col flex max-h-[min(560px,70vh)] min-w-[280px] flex-1 flex-col rounded-2xl border px-3 py-2 ${
         isSelected
           ? 'border-emerald-400/70 bg-emerald-50/40 dark:border-emerald-500/50 dark:bg-emerald-950/20'
-          : 'border-neutral-200/70 bg-neutral-50/40 dark:border-neutral-700/60 dark:bg-neutral-900/30'
+          : 'border-neutral-200/70 bg-neutral-50/40'
       }`
     : 'chat-message-group-tab flex w-full flex-col'
   return (
+    <ReasoningPreviewContext.Provider value={!live || isFocused}>
     <div
-      onMouseEnter={onMouseEnter}
+      onMouseEnter={onActivate}
+      onFocusCapture={onActivate}
       className={wrapperClass}
+      data-message-id={message.id}
       data-chat-message-group-focused={isFocused ? 'true' : 'false'}
     >
       {showColumnChrome && (
@@ -155,7 +161,7 @@ function GroupColumnView({
               className={`inline-flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-medium transition-colors ${
                 isSelected
                   ? 'bg-emerald-500/90 text-white'
-                  : 'border border-neutral-200 text-neutral-500 hover:bg-neutral-100 dark:border-neutral-700 dark:text-neutral-400 dark:hover:bg-neutral-800'
+                  : 'border border-neutral-200 text-neutral-500 hover:bg-neutral-100 dark:text-neutral-400'
               }`}
             >
               <Check size={11} strokeWidth={2.5} />
@@ -177,8 +183,7 @@ function GroupColumnView({
             // 实时列先结束的臂保持「出字中」上下文（mermaid 源码 / eager 岛不在原地翻转）；
             // 这些内容变化留给落库后的 group twin 首挂一次完成。
             markdownStreaming={live || streaming}
-            // 性能降级（R10）：非聚焦列把 reasoningStreaming 置 false，让 ReasoningBlock 折叠
-            // 并把思维链正文从 DOM 卸载（hideBody）；聚焦列正常展示流式思考。
+            // 非聚焦列由外层 context 暂停预览；聚焦列正常展示流式思考。
             reasoningStreaming={streaming && isFocused}
             onUpdateMessage={!live ? onUpdateMessage : undefined}
             onRegenerateMessage={!live ? onRegenerateMessage : undefined}
@@ -212,6 +217,7 @@ function GroupColumnView({
         />
       )}
     </div>
+    </ReasoningPreviewContext.Provider>
   )
 }
 
@@ -223,6 +229,7 @@ function GroupFooter({
   activeMessageId,
   markContext,
   onSelectChip,
+  onDeleteMessage,
 }: {
   columns: GroupColumn[]
   viewMode: 'tabs' | 'columns'
@@ -232,11 +239,13 @@ function GroupFooter({
   // 高亮 chip 是否代表「已选为下一轮上下文」（落库后为 true；流式中上下文未定为 false）。
   markContext: boolean
   onSelectChip: (messageId: string) => void
+  onDeleteMessage?: (messageId: string) => Promise<void>
 }) {
+  const t = useT()
   return (
-    <div className="chat-message-group-footer mt-2 flex flex-wrap items-center gap-2 border-t border-neutral-200/60 pt-2.5 dark:border-neutral-700/50">
+    <div className="chat-message-group-footer mt-2 flex flex-wrap items-center gap-2 border-t border-neutral-200/60 pt-2.5">
       {/* 视图切换：iOS 风分段控件，激活项白底浮起，克制不抢眼 */}
-      <div className="inline-flex shrink-0 items-center rounded-lg bg-neutral-100 p-0.5 dark:bg-neutral-800/60">
+      <div className="inline-flex shrink-0 items-center rounded-lg bg-neutral-100 p-0.5">
         {([
           ['tabs', Square, '切换', '切换显示（一次一条）'],
           ['columns', Columns2, '并排', '并排显示（多列）'],
@@ -249,8 +258,8 @@ function GroupFooter({
             title={hint}
             className={`inline-flex items-center gap-1 rounded-md px-2 py-1 text-[11px] font-medium transition-colors ${
               viewMode === mode
-                ? 'bg-white text-neutral-800 shadow-sm dark:bg-neutral-700 dark:text-neutral-100'
-                : 'text-neutral-400 hover:text-neutral-600 dark:text-neutral-500 dark:hover:text-neutral-300'
+                ? 'bg-neutral-50 text-neutral-800 shadow-sm'
+                : 'text-neutral-400 hover:text-neutral-600 dark:text-neutral-500'
             }`}
           >
             <Icon size={12} strokeWidth={2} />
@@ -264,24 +273,35 @@ function GroupFooter({
           const isActive = message.id === activeMessageId
           const shortLabel = (message.model ?? '').trim() || columnModelLabel(message.provider_id, message.model)
           return (
-            <button
-              key={message.id}
-              type="button"
-              onClick={() => onSelectChip(message.id)}
-              aria-pressed={isActive}
-              title={columnModelLabel(message.provider_id, message.model)}
-              className={`inline-flex max-w-[160px] shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors ${
-                isActive
-                  ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
-                  : 'text-neutral-500 hover:bg-neutral-100 dark:text-neutral-400 dark:hover:bg-neutral-800'
-              }`}
-            >
-              {message.model && <ModelIcon model={message.model} size={13} />}
-              <span className="min-w-0 truncate">{shortLabel}</span>
-              {isActive && markContext && (
-                <Check size={12} strokeWidth={2.5} className="shrink-0 text-emerald-600 dark:text-emerald-400" />
+            <div key={message.id} className="inline-flex items-center">
+              <button
+                type="button"
+                onClick={() => onSelectChip(message.id)}
+                aria-pressed={isActive}
+                title={columnModelLabel(message.provider_id, message.model)}
+                className={`inline-flex max-w-[160px] shrink-0 items-center gap-1.5 rounded-full px-2.5 py-1 text-[11px] font-medium transition-colors ${
+                  isActive
+                    ? 'bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                    : 'text-neutral-500 hover:bg-neutral-100 dark:text-neutral-400'
+                }`}
+              >
+                {message.model && <ModelIcon model={message.model} size={13} />}
+                <span className="min-w-0 truncate">{shortLabel}</span>
+                {isActive && markContext && (
+                  <Check size={12} strokeWidth={2.5} className="shrink-0 text-emerald-600 dark:text-emerald-400" />
+                )}
+              </button>
+              {onDeleteMessage && (
+                <IconButton
+                  variant="ghost"
+                  size="xs"
+                  label={`${t.dialogDelete} ${shortLabel}`}
+                  onClick={() => { void onDeleteMessage(message.id) }}
+                >
+                  <Trash2 size={12} />
+                </IconButton>
               )}
-            </button>
+            </div>
           )
         })}
       </div>
@@ -373,7 +393,7 @@ function MessageGroupBase({
               isFocused={index === focusedIndex}
               showColumnChrome
               groupId={groupId}
-              onMouseEnter={() => setFocusedIndex(index)}
+              onActivate={() => setFocusedIndex(index)}
               onSelectColumn={onSelectColumn}
               onUpdateMessage={onUpdateMessage}
               onRegenerateMessage={onRegenerateMessage}
@@ -418,6 +438,7 @@ function MessageGroupBase({
         activeMessageId={footerActiveId}
         markContext={!live}
         onSelectChip={handleChipClick}
+        onDeleteMessage={!live ? onDeleteMessage : undefined}
       />
     </div>
   )

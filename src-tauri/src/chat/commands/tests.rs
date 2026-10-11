@@ -16,34 +16,109 @@ use crate::skills;
 
 use super::catalog::{assistant_from_builder_args, strip_transcripts_for_frontend};
 use super::context::{
-    apply_context_clear, build_chat_api_messages, count_tokens_in_value,
-    estimate_image_tokens_for_dimensions, group_answer_excluded_from_context,
-    mark_summary_stale_if_needed, resolve_usage_anchor, should_auto_compress_context,
+    apply_context_clear, build_chat_api_messages, conversation_cache_usage,
+    count_tokens_in_value, estimate_image_tokens,
+    group_answer_excluded_from_context, mark_summary_stale_if_needed, resolve_usage_anchor,
 };
 use super::interaction::{format_tool_approval_summary, stream_delta_event_kinds};
 use super::messages::{
     assistant_model_messages_for_storage, build_assistant_message, build_error_arm_message,
-    content_from_segments, normalize_assistant_segments, reasoning_from_segments,
-    reconcile_orphan_tool_segments, replace_final_text_segments_for_edit,
+    content_from_segments, history_unchanged, normalize_assistant_segments,
+    reasoning_from_segments, reconcile_orphan_tool_segments, replace_final_text_segments_for_edit,
 };
 use super::mutations::{
     apply_regenerate_truncation, apply_reply_with_model_result, build_fork_messages,
-    build_fork_messages_before_anchor, prepare_reply_with_model,
+    build_fork_messages_before_anchor, prepare_reply_with_model, remove_assistant_answer,
 };
 use super::reply_runtime::resolve_reply_arms;
 use super::sanitization::sanitize_image_payloads_for_model;
 use super::title::{build_title_summary_prompt, generate_title, sanitize_generated_title};
 use super::tooling::{
+    apply_agent_plan_tool_filter, apply_inline_code_request_tool_filter,
     apply_chat_mode_tool_filter, resolve_request_skill, should_answer_inline_without_file_write,
     try_apply_skill_slash_trigger,
 };
 use super::*;
 
 #[test]
+fn history_window_and_pages_resolve_only_missing_artifact_dependencies() {
+    let artifact = serde_json::json!({"id":"art_early", "name":"early.png",
+        "mime_type":"image/png", "data_url":"data:image/png;base64,AAAA", "path":"early.png"});
+    let mut messages: Vec<ChatMessage> = (0..130)
+        .map(|index| test_chat_message(&format!("m{index}"), "assistant", "reply", index))
+        .collect();
+    messages[0].artifacts = serde_json::from_value(serde_json::json!([
+        artifact, {"id":"art_unused", "name":"unused.png", "mime_type":"image/png", "data_url":"large-unused"}
+    ])).unwrap();
+    messages[129].content = "![earlier](artifact:art_early) `artifact:art_unused`".into();
+    messages[69].content = "[earlier again](artifact://art_early)".into();
+    for end in [130, 70] {
+        let start = super::catalog::history_window_start(&messages, end);
+        assert_eq!(end - start, 60);
+        let dependencies =
+            crate::chat::artifacts::history_reference_artifacts(&messages, start..end);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].id.as_deref(), Some("art_early"));
+        assert_eq!(dependencies[0].path.as_deref(), Some("early.png"));
+    }
+    assert!(
+        messages[129].artifacts.is_empty(),
+        "display dependencies must not change message ownership"
+    );
+    assert!(crate::chat::artifacts::history_reference_artifacts(&messages, 0..130).is_empty());
+}
+
+#[test]
+fn history_window_resolves_segment_and_presentation_dependencies_from_tools() {
+    let artifact = serde_json::json!({"id":"art_tool", "name":"tool.png", "mime_type":"image/png", "data_url":""});
+    let mut origin = test_chat_message("origin", "assistant", "", 1);
+    origin.tool_calls = serde_json::from_value(serde_json::json!([{
+        "id":"read", "name":"read", "source":"native", "arguments":"{}", "status":"success", "artifacts":[artifact]
+    }])).unwrap();
+    let mut target = test_chat_message("target", "assistant", "", 2);
+    target.segments = serde_json::from_value(serde_json::json!([{
+        "id":"text", "kind":"text", "phase":"plain", "order":0, "text":"![tool](artifact:art_tool)"
+    }]))
+    .unwrap();
+    let mut messages = vec![origin, target];
+    assert_eq!(
+        crate::chat::artifacts::history_reference_artifacts(&messages, 1..2).len(),
+        1
+    );
+    messages[1].segments.clear();
+    for mode in ["preview", "prepare"] {
+        messages[1].tool_calls = serde_json::from_value(serde_json::json!([{
+            "id":"present", "name":"present_artifacts", "source":"native", "arguments":"{}", "status":"success",
+            "structured_content":{"type":"artifact_presentation", "artifactIds":["art_tool", "art_tool", "art_missing"], "mode":mode}
+        }])).unwrap();
+        let dependencies = crate::chat::artifacts::history_reference_artifacts(&messages, 1..2);
+        assert_eq!(dependencies.len(), 1);
+        assert_eq!(dependencies[0].id.as_deref(), Some("art_tool"));
+    }
+}
+
+#[test]
+fn history_window_bounds_payload_and_keeps_oversized_message_reachable() {
+    let messages: Vec<ChatMessage> = (0..60)
+        .map(|index| {
+            serde_json::from_value(serde_json::json!({
+        "id": format!("m{index}"), "role": "user", "content": "x".repeat(180_000), "timestamp": 1
+    })).unwrap()
+        })
+        .collect();
+    assert!(super::catalog::history_window_start(&messages, 60) > 55);
+    let mut oversized = messages[0].clone();
+    oversized.content = "x".repeat(900_000);
+    assert_eq!(super::catalog::history_window_start(&[oversized], 1), 0);
+}
+
+#[test]
 fn resolve_thinking_maps_levels_and_defaults_to_high() {
     // 有 effort 旋钮的模型（gpt-5.6 支持 low/medium/high/xhigh/max）。模型库里查得到，
     // 不需要 provider（provider 只用于读 model_overrides + Anthropic 家族兜底）。
-    let r = |level: Option<&str>, global: bool| resolve_thinking(level, global, None, "gpt-5.6");
+    let r = |level: Option<&str>, global: bool| {
+        resolve_thinking(level, global, None, "gpt-5.6").unwrap()
+    };
     // 未设置 → 默认档 high，不再跟随全局（全局只服务 lens / 翻译）。
     assert_eq!(r(None, true), (true, Some("high".to_string())));
     assert_eq!(r(None, false), (true, Some("high".to_string())));
@@ -104,7 +179,7 @@ fn video_analysis_tool_is_available_in_chat_and_plan_without_extra_approval() {
 fn resolve_thinking_drops_level_for_models_without_effort_knob() {
     // 模型库里 `reasoningEfforts: []` = 没有思考深度旋钮。
     assert_eq!(
-        resolve_thinking(Some("high"), true, None, "claude-3.5-haiku"),
+        resolve_thinking(Some("high"), true, None, "claude-3.5-haiku").unwrap(),
         (true, None)
     );
     // Claude 4：UI 档位会下发（适配器再映射成 budget_tokens / adaptive+effort）。
@@ -115,19 +190,19 @@ fn resolve_thinking_drops_level_for_models_without_effort_knob() {
         "claude-sonnet-4.5",
     ] {
         assert_eq!(
-            resolve_thinking(Some("high"), true, None, model),
+            resolve_thinking(Some("high"), true, None, model).unwrap(),
             (true, Some("high".to_string())),
             "{model}"
         );
     }
     // 4.6+ 反过来必须带上。
     assert_eq!(
-        resolve_thinking(Some("max"), true, None, "claude-opus-4.7"),
+        resolve_thinking(Some("max"), true, None, "claude-opus-4.7").unwrap(),
         (true, Some("max".to_string()))
     );
     // off 仍然优先：关思考就是关思考。
     assert_eq!(
-        resolve_thinking(Some("off"), true, None, "claude-opus-4.7"),
+        resolve_thinking(Some("off"), true, None, "claude-opus-4.7").unwrap(),
         (false, None)
     );
 }
@@ -249,7 +324,6 @@ fn slash_trigger_keeps_user_task_and_loads_instructions_once() {
                 None,
                 None,
                 None,
-                None,
                 &[],
             );
             assert_eq!(prompt.matches("Create distinctive interfaces.").count(), 1);
@@ -304,6 +378,55 @@ fn slash_trigger_ignores_non_slash_and_unknown() {
     assert!(
         try_apply_skill_slash_trigger(&registry, &chat_tools, None, "/unknown x", false).is_none()
     );
+}
+
+#[test]
+fn slash_trigger_activates_inline_skills_without_losing_the_task() {
+    let registry = slash_skill_registry(slash_skill_record("commit", "Commit", vec!["/commit"]));
+    let config = crate::settings::ChatToolsConfig::default();
+    for content in [
+        "请用/commit fix login",
+        "please /commit fix login",
+        "please\n/commit fix login",
+    ] {
+        let (id, body) =
+            try_apply_skill_slash_trigger(&registry, &config, None, content, false).unwrap();
+        assert_eq!(id, "commit");
+        assert!(body.contains("Write a commit for: fix login"));
+    }
+    for content in [
+        "https://host/commit",
+        "`/commit`",
+        "/commit/file",
+        "> /commit",
+    ] {
+        assert!(try_apply_skill_slash_trigger(&registry, &config, None, content, false).is_none());
+    }
+}
+
+#[test]
+fn slash_trigger_loads_multiple_inline_skills_once() {
+    let registry = skills::SkillRegistry {
+        records: vec![
+            slash_skill_record("review", "Review", vec![]),
+            slash_skill_record("commit", "Commit", vec![]),
+        ],
+        warnings: vec![],
+    };
+    let mut config = crate::settings::ChatToolsConfig::default();
+    let (id, detail) = resolve_request_skill(
+        &registry,
+        &mut config,
+        None,
+        "please /review changes then /commit fix login /review again",
+        None,
+        false,
+    );
+    assert_eq!(id.as_deref(), Some("review"));
+    let body = detail.unwrap().body;
+    assert_eq!(body.matches("<skill_content name=\"Review\">").count(), 1);
+    assert_eq!(body.matches("<skill_content name=\"Commit\">").count(), 1);
+    assert!(body.contains("Write a commit for: fix login"));
 }
 
 #[test]
@@ -1543,6 +1666,8 @@ fn editing_assistant_reply_replaces_final_text_segments_only() {
         stream_outcome: None,
         usage: None,
         anchor_usage: None,
+        cache_pair_input: None,
+        cache_pair_read: None,
         group_id: None,
         provider_id: None,
         model: None,
@@ -1646,6 +1771,8 @@ fn editing_assistant_reply_rewrites_replay_to_edited_final_answer() {
         stream_outcome: None,
         usage: None,
         anchor_usage: None,
+        cache_pair_input: None,
+        cache_pair_read: None,
         group_id: None,
         provider_id: None,
         model: None,
@@ -1683,6 +1810,8 @@ fn test_chat_message(id: &str, role: &str, content: &str, timestamp: i64) -> Cha
         stream_outcome: None,
         usage: None,
         anchor_usage: None,
+        cache_pair_input: None,
+        cache_pair_read: None,
         group_id: None,
         provider_id: None,
         model: None,
@@ -1732,6 +1861,7 @@ fn test_conversation_with_summary(stale: bool) -> Conversation {
                 model: "model".to_string(),
                 stale,
                 file_ledger: None,
+                replay: None,
             }),
             ..ConversationContextState::default()
         },
@@ -1802,43 +1932,6 @@ fn strip_transcripts_for_frontend_keeps_interrupted_draft_drops_completed() {
 }
 
 #[test]
-fn effective_side_models_auto_use_session_main_model() {
-    let mut settings = Settings::default();
-    settings.providers.push(test_provider(
-        "global",
-        "Global",
-        vec!["gemini-3.1-flash-lite"],
-    ));
-    settings
-        .providers
-        .push(test_provider("session", "Session", vec!["gpt-4.1"]));
-    settings.default_models.chat.provider_id = "global".to_string();
-    settings.default_models.chat.model = "gemini-3.1-flash-lite".to_string();
-
-    let session = SessionModel {
-        provider_id: "session",
-        model: "gpt-4.1",
-    };
-
-    assert_eq!(
-        settings.effective_compression_model_for_session(Some(session)),
-        ("session".to_string(), "gpt-4.1".to_string())
-    );
-    assert_eq!(
-        settings.effective_title_summary_model_for_session(Some(session)),
-        ("session".to_string(), "gpt-4.1".to_string())
-    );
-    assert_eq!(
-        settings.effective_prompt_optimize_model_for_session(Some(session)),
-        ("session".to_string(), "gpt-4.1".to_string())
-    );
-    assert_eq!(
-        settings.effective_vision_model_for_session(Some(session)),
-        ("session".to_string(), "gpt-4.1".to_string())
-    );
-}
-
-#[test]
 fn effective_side_models_honor_explicit_mixer_selection() {
     let mut settings = Settings::default();
     settings.providers.push(test_provider(
@@ -1866,89 +1959,6 @@ fn effective_side_models_honor_explicit_mixer_selection() {
 }
 
 #[test]
-fn should_auto_compress_allows_recompression_when_summary_exists() {
-    let mut conversation = test_conversation_with_summary(false);
-    for i in 0..12 {
-        let role = if i % 2 == 0 { "user" } else { "assistant" };
-        let content = format!("extra content {i} ").repeat(1_000);
-        conversation.messages.push(test_chat_message(
-            &format!("msg_extra_{i}"),
-            role,
-            &content,
-            10 + i,
-        ));
-    }
-    let context_state = ConversationContextState {
-        usage_ratio: Some(0.9),
-        ..ConversationContextState::default()
-    };
-    assert!(should_auto_compress_context(&context_state, &conversation));
-}
-
-#[test]
-fn should_auto_compress_false_when_no_new_compressible_range() {
-    let mut conversation = test_conversation_with_summary(false);
-    conversation
-        .context_state
-        .summary
-        .as_mut()
-        .expect("summary")
-        .source_until_message_id = "msg_assistant_2".to_string();
-    let context_state = ConversationContextState {
-        usage_ratio: Some(0.9),
-        ..ConversationContextState::default()
-    };
-    assert!(!should_auto_compress_context(&context_state, &conversation));
-}
-
-#[test]
-fn token_split_starts_after_existing_summary() {
-    let mut conversation = test_conversation_with_summary(false);
-    // summary source_until = msg_assistant_1（index 1）→ summary_start = 2。
-    // 推 3 条大消息（每条 ~20000 tokens，ASCII 4 chars/token），recent 尾窗 20000 只够最后 1 条，
-    // 其余进 old_segment；boundary 落在倒数第 2 条（index = len-2）。
-    for i in 0..3 {
-        let role = if i % 2 == 0 { "user" } else { "assistant" };
-        conversation.messages.push(test_chat_message(
-            &format!("msg_extra_{i}"),
-            role,
-            &"a".repeat(80_000),
-            10 + i as i64,
-        ));
-    }
-    let summary_start = 2;
-    let boundary = crate::chat::agent::compaction::token_split_chat_messages(
-        &conversation.messages,
-        summary_start,
-        crate::chat::agent::compaction::RECENT_KEEP_TOKENS,
-    )
-    .expect("boundary");
-    assert_eq!(boundary, conversation.messages.len() - 2);
-    assert!(boundary > summary_start);
-}
-
-#[test]
-fn token_split_returns_none_when_recent_window_covers_all() {
-    // 全是小消息，远不到 20k 尾窗 → 没有可摘要旧段。
-    let mut conversation = test_conversation_with_summary(false);
-    for i in 0..5 {
-        let role = if i % 2 == 0 { "user" } else { "assistant" };
-        conversation.messages.push(test_chat_message(
-            &format!("msg_small_{i}"),
-            role,
-            "x",
-            10 + i as i64,
-        ));
-    }
-    let split = crate::chat::agent::compaction::token_split_chat_messages(
-        &conversation.messages,
-        2,
-        crate::chat::agent::compaction::RECENT_KEEP_TOKENS,
-    );
-    assert!(split.is_none());
-}
-
-#[test]
 fn build_chat_api_messages_replays_saved_child_report_as_external_input() {
     let mut conversation = test_conversation_with_summary(false);
     conversation.context_state = Default::default();
@@ -1967,6 +1977,179 @@ fn build_chat_api_messages_replays_saved_child_report_as_external_input() {
     assert_eq!(
         conversation.messages[0].role, "assistant",
         "UI provenance remains unchanged"
+    );
+}
+
+#[test]
+fn compaction_replay_round_trip_uses_exact_tail_once() {
+    let mut conversation = test_conversation_with_summary(false);
+    conversation.context_state.summary.as_mut().unwrap().replay = Some(
+        crate::chat::types::CompactionReplay {
+            through_message_id: "msg_assistant_2".into(),
+            messages: vec![
+                serde_json::json!({"role":"assistant", "tool_calls":[{"id":"kept", "type":"function", "function":{"name":"read","arguments":"{}"}}]}),
+                serde_json::json!({"role":"tool","tool_call_id":"kept","content":"exact preserved result"}),
+                serde_json::json!({"role":"assistant","content":"preserved final answer"}),
+            ],
+        },
+    );
+    let disk = serde_json::to_vec(&conversation).unwrap();
+    let mut restored: Conversation = serde_json::from_slice(&disk).unwrap();
+    restored
+        .messages
+        .push(test_chat_message("next", "user", "continue", 10));
+    let messages =
+        build_chat_api_messages(None, "fresh system", &restored, None, None, &[]).unwrap();
+    let text = serde_json::to_string(&messages).unwrap();
+    assert_eq!(messages[0]["content"], "fresh system");
+    assert_eq!(text.matches("exact preserved result").count(), 1);
+    assert!(!text.contains("recent assistant content"));
+    assert_eq!(messages.last().unwrap()["content"], "continue");
+    mark_summary_stale_if_needed(&mut restored, 3);
+    assert!(restored.context_state.summary.as_ref().unwrap().stale);
+    let messages = build_chat_api_messages(None, "system", &restored, None, None, &[]).unwrap();
+    assert!(!serde_json::to_string(&messages)
+        .unwrap()
+        .contains("exact preserved result"));
+}
+
+/// A manual compaction commit survives revision bumps that leave the summarized
+/// history intact (statistics refresh, rename, new messages), but not edits,
+/// answer re-selection or a context clear.
+#[test]
+fn compaction_commit_accepts_only_unchanged_history() {
+    let source = test_conversation_with_summary(false);
+    let mut latest = source.clone();
+    latest.revision += 3;
+    latest.title = "renamed".into();
+    latest.context_state.estimated_input_tokens = 42;
+    latest
+        .messages
+        .push(test_chat_message("later", "user", "later", 9));
+    assert!(history_unchanged(&latest, &source, None));
+
+    let mut edited = source.clone();
+    edited.messages[1].content = "edited".into();
+    assert!(!history_unchanged(&edited, &source, None));
+
+    let mut reselected = source.clone();
+    reselected
+        .group_selections
+        .insert("group".into(), "msg_assistant_1".into());
+    assert!(!history_unchanged(&reselected, &source, None));
+
+    let mut cleared = source.clone();
+    apply_context_clear(&mut cleared).unwrap();
+    assert!(!history_unchanged(&cleared, &source, None));
+}
+
+/// Auto compaction keeps a tail that starts with an assistant tool call. The
+/// persisted summary must stay a user turn: as a system message it would be
+/// hoisted into the system prompt, leaving the tool call as the first provider
+/// message, which Gemini rejects. Run-scoped system notices saved in older
+/// snapshots must not be hoisted into later system prompts either.
+#[test]
+fn compaction_replay_starts_with_user_summary_and_drops_run_notices() {
+    let mut conversation = test_conversation_with_summary(false);
+    conversation.context_state.summary.as_mut().unwrap().replay = Some(
+        crate::chat::types::CompactionReplay {
+            through_message_id: "msg_assistant_2".into(),
+            messages: vec![
+                serde_json::json!({"role":"assistant","content":null,"tool_calls":[{"id":"kept","type":"function","function":{"name":"read","arguments":"{}"}}]}),
+                serde_json::json!({"role":"tool","tool_call_id":"kept","content":"kept result"}),
+                crate::chat::agent::stop::step_limit_system_message(),
+                serde_json::json!({"role":"assistant","content":"kept final answer"}),
+            ],
+        },
+    );
+    conversation
+        .messages
+        .push(test_chat_message("next", "user", "continue", 10));
+
+    let messages =
+        build_chat_api_messages(None, "fresh system", &conversation, None, None, &[]).unwrap();
+    assert_eq!(messages[1]["role"], "user");
+    assert!(messages[1]["content"]
+        .as_str()
+        .unwrap()
+        .starts_with("Previous conversation summary:"));
+    assert!(!serde_json::to_string(&messages)
+        .unwrap()
+        .contains("工具调用轮次上限"));
+
+    let request = crate::chat::model::generate_request_from_openai_messages(
+        "test-model",
+        messages,
+        None,
+        Default::default(),
+        "test",
+        Default::default(),
+    );
+    assert_eq!(request.system, "fresh system");
+    assert!(matches!(request.messages[0].role, ModelRole::User));
+    let contents = crate::chat::model::gemini::gemini_contents_from_generate_request(&request);
+    assert_eq!(contents[0]["role"], "user");
+    assert!(contents[0]
+        .to_string()
+        .contains("summary of older messages"));
+}
+
+/// A child report delivered during a compacted run lives both in the snapshot
+/// (where the run saw it) and as a persisted `subagent-result-*` message that
+/// may sort after the reply. It must reach the model exactly once.
+#[test]
+fn compaction_replay_does_not_duplicate_snapshot_child_reports() {
+    let mut conversation = test_conversation_with_summary(false);
+    let mut report = crate::chat::sub_agent::control::report_input("CHILD_A findings");
+    report[crate::chat::sub_agent::control::REPORT_MESSAGE_ID_KEY] =
+        serde_json::json!("subagent-result-a");
+    conversation.context_state.summary.as_mut().unwrap().replay =
+        Some(crate::chat::types::CompactionReplay {
+            through_message_id: "msg_assistant_2".into(),
+            messages: vec![
+                report,
+                serde_json::json!({"role":"assistant","content":"kept final answer"}),
+            ],
+        });
+    conversation.messages.push(test_chat_message(
+        "subagent-result-a",
+        "assistant",
+        "CHILD_A findings",
+        10,
+    ));
+    conversation.messages.push(test_chat_message(
+        "subagent-result-b",
+        "assistant",
+        "CHILD_B findings",
+        11,
+    ));
+
+    let text = serde_json::to_string(
+        &build_chat_api_messages(None, "system", &conversation, None, None, &[]).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(text.matches("CHILD_A findings").count(), 1);
+    assert_eq!(
+        text.matches("CHILD_B findings").count(),
+        1,
+        "reports outside the snapshot still replay"
+    );
+}
+
+#[test]
+fn clear_context_discards_compacted_tail_too() {
+    let mut conversation = test_conversation_with_summary(false);
+    conversation.context_state.summary.as_mut().unwrap().replay =
+        Some(crate::chat::types::CompactionReplay {
+            through_message_id: "msg_assistant_2".into(),
+            messages: vec![serde_json::json!({"role":"user","content":"old retained details"})],
+        });
+    apply_context_clear(&mut conversation).unwrap();
+    assert_eq!(
+        build_chat_api_messages(None, "system", &conversation, None, None, &[])
+            .unwrap()
+            .len(),
+        1
     );
 }
 
@@ -2177,6 +2360,52 @@ fn regenerate_truncation_edits_user_content_and_truncates_after() {
 }
 
 #[test]
+fn truncating_history_rewinds_the_todo_list_to_the_retained_snapshot() {
+    use crate::chat::types::{AgentTodoItem, AgentTodoStatus, ToolCallRecord};
+    fn snapshot(content: &str) -> AgentTodoState {
+        AgentTodoState {
+            items: vec![AgentTodoItem {
+                id: "1".to_string(),
+                content: content.to_string(),
+                status: AgentTodoStatus::InProgress,
+                ..Default::default()
+            }],
+            updated_at: 1,
+        }
+    }
+    fn todo_call(state: &AgentTodoState) -> ToolCallRecord {
+        let mut record: ToolCallRecord = serde_json::from_value(serde_json::json!({
+            "id": "call", "name": "todo_write", "status": "success"
+        }))
+        .unwrap();
+        record.structured_content = Some(serde_json::json!({ "todoState": state }));
+        record
+    }
+    let mut conversation = test_conversation_with_summary(false);
+    conversation.messages[1].tool_calls = vec![todo_call(&snapshot("early step"))];
+    conversation.messages[3].tool_calls = vec![todo_call(&snapshot("later step"))];
+    conversation.agent_todo_state = snapshot("later step");
+
+    // Regenerating the last answer drops its todo_write; the list follows the history.
+    apply_regenerate_truncation(&mut conversation, 3, None).unwrap();
+    super::mutations::restore_todo_state_from_history(&mut conversation);
+    assert_eq!(conversation.agent_todo_state.items[0].content, "early step");
+
+    // Going back before any todo_write empties it.
+    conversation.messages.truncate(1);
+    super::mutations::restore_todo_state_from_history(&mut conversation);
+    assert!(conversation.agent_todo_state.items.is_empty());
+
+    // External CLIs keep their own list: not every CLI leaves a record to rebuild it from.
+    let mut external = test_conversation_with_summary(false);
+    external.agent_runtime.kind = crate::chat::types::AgentRuntimeKind::External;
+    external.agent_runtime.external_agent_id = Some("codex".to_string());
+    external.agent_todo_state = snapshot("codex plan");
+    super::mutations::restore_todo_state_from_history(&mut external);
+    assert_eq!(external.agent_todo_state.items[0].content, "codex plan");
+}
+
+#[test]
 fn regenerate_truncation_rejects_bad_edit_targets() {
     // 空内容 → 报错且对话未被改动。
     let mut conversation = test_conversation_with_summary(false);
@@ -2303,6 +2532,8 @@ fn build_chat_api_messages_replays_hidden_tool_transcript() {
                 stream_outcome: None,
                 usage: None,
                 anchor_usage: None,
+                cache_pair_input: None,
+                cache_pair_read: None,
                 group_id: None,
                 provider_id: None,
                 model: None,
@@ -2350,6 +2581,8 @@ fn build_chat_api_messages_replays_hidden_tool_transcript() {
                 stream_outcome: None,
                 usage: None,
                 anchor_usage: None,
+                cache_pair_input: None,
+                cache_pair_read: None,
                 group_id: None,
                 provider_id: None,
                 model: None,
@@ -2481,6 +2714,8 @@ fn build_chat_api_messages_sanitizes_image_payloads_in_replayed_history() {
                     stream_outcome: None,
                     usage: None,
                     anchor_usage: None,
+                    cache_pair_input: None,
+                    cache_pair_read: None,
                     group_id: None,
                     provider_id: None,
                     model: None,
@@ -2549,27 +2784,27 @@ fn context_token_count_ignores_image_data_url_payloads() {
 #[test]
 fn image_token_estimates_follow_provider_dimension_rules() {
     assert_eq!(
-        estimate_image_tokens_for_dimensions(None, "gpt-4o", 1024, 1024),
+        estimate_image_tokens(None, "gpt-4o", Some((1024, 1024)), None),
         765
     );
     assert_eq!(
-        estimate_image_tokens_for_dimensions(None, "gpt-4o", 2048, 4096),
+        estimate_image_tokens(None, "gpt-4o", Some((2048, 4096)), None),
         1105
     );
     assert_eq!(
-        estimate_image_tokens_for_dimensions(None, "gpt-4.1-mini", 1024, 1024),
+        estimate_image_tokens(None, "gpt-4.1-mini", Some((1024, 1024)), None),
         1659
     );
     assert_eq!(
-        estimate_image_tokens_for_dimensions(None, "claude-sonnet-4", 1000, 1000),
+        estimate_image_tokens(None, "claude-sonnet-4", Some((1000, 1000)), None),
         1334
     );
     assert_eq!(
-        estimate_image_tokens_for_dimensions(None, "gemini-2.0-flash", 384, 384),
+        estimate_image_tokens(None, "gemini-2.0-flash", Some((384, 384)), None),
         258
     );
     assert_eq!(
-        estimate_image_tokens_for_dimensions(None, "gemini-2.0-flash", 1024, 1024),
+        estimate_image_tokens(None, "gemini-2.0-flash", Some((1024, 1024)), None),
         1032
     );
 }
@@ -2723,6 +2958,7 @@ fn test_settings_with_providers(provider_ids: &[&str]) -> Settings {
 fn assistant_with_anchor(id: &str, ts: i64, input_tokens: u64) -> ChatMessage {
     let mut m = test_chat_message(id, "assistant", "reply", ts);
     m.provider_id = Some("openai".to_string());
+    m.model = Some("gpt-4o".to_string());
     m.anchor_usage = Some(crate::chat::model::ModelUsage {
         input_tokens: Some(input_tokens),
         output_tokens: Some(100),
@@ -2742,6 +2978,27 @@ fn boundary_at(created_at: i64) -> CompactionBoundaryRecord {
         trigger: "manual".to_string(),
         created_at,
     }
+}
+
+#[test]
+fn history_directory_keeps_compaction_after_display_anchor_deletion() {
+    let mut conversation = test_conversation_with_messages(vec![
+        test_chat_message("u1", "user", "old question", 1),
+        test_chat_message("a2", "assistant", "replacement", 3),
+    ]);
+    let mut boundary = boundary_at(2);
+    boundary.display_after_message_id = Some("deleted-assistant".to_string());
+    conversation
+        .context_state
+        .compaction_boundaries
+        .push(boundary);
+    let directory = super::catalog::conversation_history_directory(&conversation);
+    let entry = directory
+        .iter()
+        .find(|entry| entry["kind"] == "compaction")
+        .expect("the fallback compaction marker must stay navigable");
+    assert_eq!(entry["message_id"], "u1");
+    assert_eq!(entry["message_index"], 0);
 }
 
 #[test]
@@ -3075,31 +3332,35 @@ fn group_excludes_only_non_selected_assistants() {
 
 #[test]
 fn stale_group_selection_falls_back_to_first_remaining() {
-    // D5/AC4：删除显式选中条后，清掉指向已删消息的 group_selections，选中条回退到组内
-    // 顺序第一条（这里模拟 chat_delete_message / chat_regenerate_message 的清理后状态）。
+    // 删掉显式选中的那一条：只少这一条，组选中记录被清掉，续聊回退到剩余的第一条。
     let messages = vec![
         test_chat_message("msg_user", "user", "q", 1),
         grouped_assistant("msg_a1", "answer one", "grp_1", 2),
         grouped_assistant("msg_a2", "answer two", "grp_1", 3),
+        grouped_assistant("msg_a3", "answer three", "grp_1", 4),
+        test_chat_message("msg_user_2", "user", "next question", 5),
+        test_chat_message("msg_later", "assistant", "later answer", 6),
     ];
     let mut conversation = test_conversation_with_messages(messages);
-    // 用户显式选了第二条。
     conversation
         .group_selections
         .insert("grp_1".to_string(), "msg_a2".to_string());
-
-    // 模拟删除被选中的 msg_a2：移除消息 + 删除命令对 group_selections 的清理。
-    conversation.messages.retain(|m| m.id != "msg_a2");
-    if conversation
+    conversation
         .group_selections
-        .get("grp_1")
-        .map(String::as_str)
-        == Some("msg_a2")
-    {
-        conversation.group_selections.remove("grp_1");
-    }
+        .insert("grp_other".to_string(), "msg_later".to_string());
 
-    // 残余的 msg_a1 必须仍进上下文（回退到组内第一条），而非被整组排除。
+    remove_assistant_answer(&mut conversation, "msg_a2").unwrap();
+
+    let ids: Vec<&str> = conversation.messages.iter().map(|m| m.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["msg_user", "msg_a1", "msg_a3", "msg_user_2", "msg_later"]
+    );
+    assert!(conversation.group_selections.get("grp_1").is_none());
+    assert_eq!(
+        conversation.group_selections.get("grp_other").map(String::as_str),
+        Some("msg_later")
+    );
     assert!(!group_answer_excluded_from_context(
         &conversation,
         &conversation.messages[1]
@@ -3108,6 +3369,42 @@ fn stale_group_selection_falls_back_to_first_remaining() {
         build_chat_api_messages(None, "system", &conversation, Some(0), None, &[]).expect("build");
     let serialized = serde_json::to_string(&built).unwrap();
     assert!(serialized.contains("answer one"));
+    assert!(!serialized.contains("answer two"));
+    assert!(!serialized.contains("answer three"));
+    assert!(serialized.contains("next question"));
+    assert!(serialized.contains("later answer"));
+}
+
+#[test]
+fn remove_assistant_answer_keeps_selection_when_another_sibling_is_deleted() {
+    let mut conversation = test_conversation_with_messages(vec![
+        test_chat_message("msg_user", "user", "q", 1),
+        grouped_assistant("msg_a1", "answer one", "grp_1", 2),
+        grouped_assistant("msg_a2", "answer two", "grp_1", 3),
+    ]);
+    conversation
+        .group_selections
+        .insert("grp_1".to_string(), "msg_a2".to_string());
+
+    remove_assistant_answer(&mut conversation, "msg_a1").unwrap();
+
+    assert_eq!(
+        conversation
+            .messages
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["msg_user", "msg_a2"]
+    );
+    assert_eq!(
+        conversation.group_selections.get("grp_1").map(String::as_str),
+        Some("msg_a2")
+    );
+    assert_eq!(
+        remove_assistant_answer(&mut conversation, "msg_user").unwrap_err(),
+        "仅支持删除助手回复"
+    );
+    assert_eq!(conversation.messages.len(), 2);
 }
 
 // ===== 对话分支（方案 B）=====
@@ -3256,17 +3553,17 @@ fn file_ledger_flows_into_replayed_summary_message() {
     let messages =
         build_chat_api_messages(None, "system prompt", &conversation, Some(2), None, &[]).unwrap();
 
-    // The injected summary system message (index 1) must carry the ledger block.
+    // The injected summary message (a user turn at index 1) must carry the ledger block.
     let summary_sys = messages
         .iter()
         .find(|m| {
-            m.get("role").and_then(|r| r.as_str()) == Some("system")
+            m.get("role").and_then(|r| r.as_str()) == Some("user")
                 && m.get("content")
                     .and_then(|c| c.as_str())
                     .map(|c| c.contains("### Files touched"))
                     .unwrap_or(false)
         })
-        .expect("a system message carries the Files touched block");
+        .expect("the summary message carries the Files touched block");
     let content = summary_sys["content"].as_str().unwrap();
     assert!(
         content.contains(r#"Modified: "src/main.rs""#),
@@ -3300,5 +3597,565 @@ fn empty_delta_with_segment_still_emits_a_placeholder_event() {
     assert_eq!(
         stream_delta_event_kinds("", Some(""), false),
         (false, false)
+    );
+}
+
+#[test]
+fn late_compaction_preserves_concurrent_edits_but_allows_title_changes() {
+    let mut source = test_conversation_with_summary(false);
+    source.context_state.summary.as_mut().unwrap().replay =
+        Some(crate::chat::types::CompactionReplay {
+            through_message_id: "completed-reply".into(),
+            messages: vec![],
+        });
+    let mut latest = source.clone();
+    latest.context_state.summary = None;
+    latest.title = "user renamed".into();
+    super::messages::adopt_compacted_context(&mut latest, &source, "completed-reply");
+    assert!(latest.context_state.summary.is_some());
+    assert_eq!(latest.title, "user renamed");
+
+    latest.context_state.summary = None;
+    latest.messages[0].content = "concurrent correction".into();
+    super::messages::adopt_compacted_context(&mut latest, &source, "completed-reply");
+    assert!(latest.context_state.summary.is_none());
+    assert_eq!(latest.messages[0].content, "concurrent correction");
+
+    let mut cleared = source.clone();
+    apply_context_clear(&mut cleared).unwrap();
+    super::messages::adopt_compacted_context(&mut cleared, &source, "completed-reply");
+    assert!(cleared.context_state.summary.is_none());
+    assert_eq!(cleared.context_state.clear_boundaries.len(), 1);
+}
+
+#[test]
+fn compaction_fix_new_selected_answer_invalidates_saved_tail() {
+    let mut conversation = test_conversation_with_summary(false);
+    conversation.context_state.summary.as_mut().unwrap().replay =
+        Some(crate::chat::types::CompactionReplay {
+            through_message_id: "msg_assistant_2".into(),
+            messages: vec![
+                serde_json::json!({"role":"assistant","content":"STALE_SNAPSHOT_ANSWER"}),
+            ],
+        });
+    let prep = prepare_reply_with_model(
+        &conversation,
+        "msg_assistant_2",
+        "other",
+        "other",
+        Some("g"),
+    )
+    .unwrap();
+    let mut answer = test_chat_message("answer_b", "assistant", "SELECTED_ANSWER_B", 6);
+    answer.group_id = Some("g".into());
+    apply_reply_with_model_result(&mut conversation, &prep, answer);
+    let restored: Conversation =
+        serde_json::from_slice(&serde_json::to_vec(&conversation).unwrap()).unwrap();
+    let wire = serde_json::to_string(
+        &build_chat_api_messages(None, "system", &restored, None, None, &[]).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !wire.contains("STALE_SNAPSHOT_ANSWER"),
+        "obsolete replay survived selection change: {wire}"
+    );
+    assert!(wire.contains("SELECTED_ANSWER_B"));
+    assert!(!wire.contains("recent assistant content"));
+}
+
+#[test]
+fn compaction_fix_late_summary_does_not_override_answer_selection() {
+    let mut source = test_conversation_with_summary(false);
+    source.context_state.summary.as_mut().unwrap().replay =
+        Some(crate::chat::types::CompactionReplay {
+            through_message_id: "reply".into(),
+            messages: vec![],
+        });
+    source.messages[3].group_id = Some("g".into());
+    let mut other = test_chat_message("answer_b", "assistant", "B", 6);
+    other.group_id = Some("g".into());
+    source.messages.push(other);
+    let mut latest = source.clone();
+    latest
+        .group_selections
+        .insert("g".into(), "answer_b".into());
+    latest.context_state.summary = None;
+    super::messages::adopt_compacted_context(&mut latest, &source, "reply");
+    assert!(
+        latest.context_state.summary.is_none(),
+        "late compaction ignored the changed selection"
+    );
+}
+
+#[test]
+fn compaction_fix_selection_respects_snapshot_boundary_and_no_op() {
+    for replay in [false, true] {
+        let mut conversation = test_conversation_with_summary(false);
+        conversation.messages[1].group_id = Some("old-group".into());
+        conversation.messages[3].group_id = Some("new-group".into());
+        conversation
+            .group_selections
+            .insert("old-group".into(), "msg_assistant_1".into());
+        if replay {
+            conversation.context_state.summary.as_mut().unwrap().replay =
+                Some(crate::chat::types::CompactionReplay {
+                    through_message_id: "msg_assistant_2".into(),
+                    messages: vec![serde_json::json!({"role":"assistant","content":"snapshot"})],
+                });
+        }
+        // Selecting the explicit current answer again must leave the snapshot usable.
+        conversation.select_group_answer("old-group".into(), "msg_assistant_1".into());
+        assert!(!conversation.context_state.summary.as_ref().unwrap().stale);
+        conversation.select_group_answer("new-group".into(), "msg_assistant_2".into());
+        // The older format ends before this group; the replay format includes it.
+        assert_eq!(
+            conversation.context_state.summary.as_ref().unwrap().stale,
+            replay
+        );
+
+        let mut alternative = test_chat_message("alternative", "assistant", "CHOSEN", 7);
+        alternative.group_id = Some("old-group".into());
+        conversation.messages.insert(2, alternative);
+        conversation.select_group_answer("old-group".into(), "alternative".into());
+        assert!(conversation.context_state.summary.as_ref().unwrap().stale);
+        let wire = serde_json::to_string(
+            &build_chat_api_messages(None, "system", &conversation, None, None, &[]).unwrap(),
+        )
+        .unwrap();
+        assert!(wire.contains("CHOSEN"));
+        assert!(!wire.contains("old assistant content"));
+        assert!(!wire.contains("Previous conversation summary"));
+    }
+}
+
+#[test]
+fn usage_anchor_requires_matching_model_identity() {
+    let mut conversation = test_conversation_with_messages(vec![
+        assistant_with_anchor("a1", 2, 30_000),
+    ]);
+    let provider = test_provider("openai", "OpenAI", vec!["gpt-4o"]);
+    assert_eq!(resolve_usage_anchor(&conversation, Some(&provider)).0, Some(30_100));
+    conversation.model = "different-model".into();
+    assert_eq!(resolve_usage_anchor(&conversation, Some(&provider)), (None, 0));
+    conversation.model = "gpt-4o".into();
+    conversation.messages[0].model = None;
+    assert_eq!(resolve_usage_anchor(&conversation, Some(&provider)), (None, 0));
+}
+
+#[test]
+fn display_meter_ignores_an_older_anchor_when_the_latest_request_did_not_report() {
+    let mut latest = assistant_with_anchor("a2", 3, 900);
+    latest.anchor_usage = None;
+    let mut conversation = test_conversation_with_messages(vec![
+        assistant_with_anchor("a1", 2, 7_000),
+        latest,
+    ]);
+    conversation.context_state.lifecycle_id = 1;
+    conversation.context_state.measurement_seq = 5;
+    conversation.context_state.request_measurement = Some(crate::chat::types::ContextRequestMeasurement {
+        seq: 5,
+        lifecycle_id: 1,
+        request_id: "run-latest".into(),
+        provider_id: "openai".into(),
+        model: "gpt-4o".into(),
+        reported_tokens: None,
+        segments: Vec::new(),
+    });
+    let display = crate::chat::agent::context_measure::resolve_display(&conversation, None);
+    assert_eq!(display.reported_tokens, None);
+    let provider = test_provider("openai", "OpenAI", vec!["gpt-4o"]);
+    assert_eq!(
+        resolve_usage_anchor(&conversation, Some(&provider)).0,
+        Some(7_100)
+    );
+}
+
+#[test]
+fn live_measurement_outranks_an_older_disk_report_and_a_lower_seq_does_not() {
+    let mut conversation = test_conversation_with_messages(Vec::new());
+    conversation.context_state.lifecycle_id = 1;
+    conversation.context_state.request_measurement = Some(crate::chat::types::ContextRequestMeasurement {
+        seq: 2,
+        lifecycle_id: 1,
+        request_id: "disk".into(),
+        provider_id: "openai".into(),
+        model: "gpt-4o".into(),
+        reported_tokens: Some(7_100),
+        segments: Vec::new(),
+    });
+    let live = crate::chat::agent::context_measure::LiveContextMeasurement {
+        seq: 9,
+        lifecycle_id: 1,
+        request_id: "run".into(),
+        provider_id: "openai".into(),
+        model: "gpt-4o".into(),
+        reported_tokens: Some(53_000),
+        report_received: true,
+        ..Default::default()
+    };
+    let display = crate::chat::agent::context_measure::resolve_display(&conversation, Some(&live));
+    assert_eq!(display.reported_tokens, Some(53_000));
+    let stale = crate::chat::agent::context_measure::LiveContextMeasurement {
+        seq: 1,
+        reported_tokens: Some(1_000),
+        ..live
+    };
+    let display = crate::chat::agent::context_measure::resolve_display(&conversation, Some(&stale));
+    assert_eq!(display.reported_tokens, Some(7_100));
+    let blank = crate::chat::agent::context_measure::LiveContextMeasurement {
+        seq: 99,
+        ..Default::default()
+    };
+    let display = crate::chat::agent::context_measure::resolve_display(&conversation, Some(&blank));
+    assert_eq!(display.reported_tokens, Some(7_100));
+}
+
+#[test]
+fn returning_to_a_previous_model_does_not_restore_its_display_report() {
+    let mut conversation =
+        test_conversation_with_messages(vec![assistant_with_anchor("a1", 2, 7_000)]);
+    conversation.context_state.lifecycle_id = 4;
+    conversation.context_state.measurement_seq = 4;
+    conversation.context_state.reported_context_tokens = None;
+    conversation.context_state.token_count_source = None;
+    conversation.context_state.request_measurement = None;
+    let display = crate::chat::agent::context_measure::resolve_display(&conversation, None);
+    assert_eq!(display.reported_tokens, None);
+    let provider = test_provider("openai", "OpenAI", vec!["gpt-4o"]);
+    assert_eq!(
+        resolve_usage_anchor(&conversation, Some(&provider)).0,
+        Some(7_100)
+    );
+}
+
+#[test]
+fn persisted_cache_pairs_keep_the_same_total_when_a_later_request_omits_telemetry() {
+    let mut complete = assistant_with_anchor("a1", 1, 100);
+    complete.cache_pair_input = Some(100);
+    complete.cache_pair_read = Some(90);
+    complete.usage = Some(crate::chat::model::ModelUsage {
+        input_tokens: Some(100),
+        cached_input_tokens: Some(90),
+        ..Default::default()
+    });
+    let mut missing = assistant_with_anchor("a2", 2, 900);
+    missing.usage = Some(crate::chat::model::ModelUsage {
+        input_tokens: Some(900),
+        cached_input_tokens: None,
+        ..Default::default()
+    });
+    let mut child = assistant_with_anchor("subagent-result-child", 3, 50);
+    child.cache_pair_input = Some(50);
+    child.cache_pair_read = Some(50);
+    let conversation = test_conversation_with_messages(vec![complete, missing, child]);
+    assert_eq!(
+        conversation_cache_usage(&conversation, &Settings::default()),
+        Some((100, 90))
+    );
+}
+
+#[test]
+fn request_measurement_refresh_preserves_last_report_until_replacement() {
+    use crate::chat::agent::context_measure::resolve_display;
+    use crate::chat::runtime_state::ChatRuntimeState;
+
+    let runtime = ChatRuntimeState::default();
+    let mut conversation = test_conversation_with_messages(Vec::new());
+    let id = conversation.id.clone();
+    let segments = vec![crate::chat::ContextUsageSegment {
+        id: "tools".into(), label: "Tools".into(),
+        estimated_tokens: 42, chars: 168, color: None,
+    }];
+    runtime.bind_prepared_context(&id, "first", "reply", "openai", "gpt-4o", &segments, None);
+    // Without any provider report the meter really is unknown.
+    assert_eq!(resolve_display(&conversation, runtime.context_measurement(&id).as_ref()).reported_tokens, None);
+    runtime.report_context_tokens(&id, "first", 7_100).unwrap();
+    let first = resolve_display(&conversation, runtime.context_measurement(&id).as_ref());
+    conversation.context_state.measurement_seq = first.seq;
+    conversation.context_state.request_measurement = first.persist;
+
+    let mut next_segments = segments.clone();
+    next_segments[0].estimated_tokens = 84;
+    runtime.bind_prepared_context(&id, "second", "reply", "openai", "gpt-4o", &next_segments, None);
+    // Reopening/refreshing during the next request must show one coherent report.
+    let waiting = resolve_display(&conversation, runtime.context_measurement(&id).as_ref());
+    assert_eq!(waiting.reported_tokens, Some(7_100));
+    assert_eq!(waiting.segments[0].estimated_tokens, 42);
+    assert!(runtime.report_context_tokens(&id, "first", 99_000).is_none());
+
+    runtime.report_context_tokens(&id, "second", 53_000).unwrap();
+    let refreshed = resolve_display(&conversation, runtime.context_measurement(&id).as_ref());
+    assert_eq!(refreshed.reported_tokens, Some(53_000));
+    assert_eq!(refreshed.segments[0].estimated_tokens, 84);
+    assert!(refreshed.seq > waiting.seq);
+
+    // An unreported request must not erase the latest valid report, even when
+    // disk still contains the first request and another request follows it.
+    for request in ["third", "fourth"] {
+        runtime.bind_prepared_context(&id, request, "reply", "openai", "gpt-4o", &segments, None);
+        assert!(runtime.finish_unreported_context(&id, request).is_none());
+        let retained = resolve_display(&conversation, runtime.context_measurement(&id).as_ref());
+        assert_eq!(retained.reported_tokens, Some(53_000));
+        assert_eq!(retained.segments[0].estimated_tokens, 84);
+    }
+    let retained = resolve_display(&conversation, runtime.context_measurement(&id).as_ref());
+    conversation.context_state.measurement_seq = retained.seq;
+    conversation.context_state.request_measurement = retained.persist;
+    let restored: Conversation = serde_json::from_slice(&serde_json::to_vec(&conversation).unwrap()).unwrap();
+    assert_eq!(resolve_display(&restored, None).reported_tokens, Some(53_000));
+    let restarted = ChatRuntimeState::default();
+    restarted.seed_context_measurement(&id, restored.context_state.lifecycle_id,
+        restored.context_state.measurement_seq, restored.context_state.request_measurement.as_ref());
+    restarted.bind_prepared_context(&id, "fifth", "reply", "openai", "gpt-4o", &segments, None);
+    let waiting = resolve_display(&restored, restarted.context_measurement(&id).as_ref());
+    assert_eq!(waiting.reported_tokens, Some(53_000));
+    assert_eq!(waiting.segments[0].estimated_tokens, 84);
+
+    let invalid = restarted.invalidate_context_display(&id);
+    conversation.context_state.lifecycle_id = invalid.lifecycle_id;
+    conversation.context_state.measurement_seq = invalid.seq;
+    conversation.context_state.request_measurement = Some(invalid.stored());
+    restarted.bind_prepared_context(&id, "after-clear", "reply", "openai", "gpt-4o", &segments, None);
+    assert!(restarted.finish_unreported_context(&id, "after-clear").is_some());
+    assert_eq!(resolve_display(&conversation, restarted.context_measurement(&id).as_ref()).reported_tokens, None);
+}
+
+#[test]
+fn model_switch_back_and_restart_keep_invalidated_measurements_unknown() {
+    use crate::chat::agent::context_measure::resolve_display;
+    use crate::chat::runtime_state::ChatRuntimeState;
+
+    let runtime = ChatRuntimeState::default();
+    let mut conversation = test_conversation_with_messages(Vec::new());
+    let id = conversation.id.clone();
+    runtime.bind_prepared_context(&id, "old", "reply", "openai", "gpt-4o", &[], None);
+    runtime.report_context_tokens(&id, "old", 7_100).unwrap();
+    let invalid = runtime.invalidate_context_display(&id);
+    conversation.model = "other-model".into();
+    conversation.context_state.lifecycle_id = invalid.lifecycle_id;
+    conversation.context_state.measurement_seq = invalid.seq;
+    conversation.context_state.reported_context_tokens = None;
+    conversation.context_state.token_count_source = None;
+    assert!(runtime.report_context_tokens(&id, "old", 99_000).is_none());
+    conversation.model = "gpt-4o".into();
+    assert_eq!(resolve_display(&conversation, runtime.context_measurement(&id).as_ref()).reported_tokens, None);
+
+    let restarted = ChatRuntimeState::default();
+    restarted.seed_context_measurement(&id, invalid.lifecycle_id, invalid.seq, None);
+    restarted.bind_prepared_context(&id, "new", "new-reply", "openai", "gpt-4o", &[], None);
+    let (reported, _) = restarted.report_context_tokens(&id, "new", 12_000).unwrap();
+    assert!(reported.seq > invalid.seq);
+    assert_eq!(resolve_display(&conversation, Some(&reported)).reported_tokens, Some(12_000));
+}
+
+#[test]
+fn review_regression_request_images_have_independent_cost_without_character_inflation() {
+    use super::context::measure_request_segments;
+    use base64::Engine as _;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(64, 64)
+        .write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png.into_inner()));
+    let plain = serde_json::json!({"role":"user","content":[{"type":"text","text":"inspect"}]});
+    let mut with_image = plain.clone();
+    with_image["content"].as_array_mut().unwrap().push(
+        serde_json::json!({"type":"image_url","image_url":{"url":url}})
+    );
+    let plain = measure_request_segments(&[plain], &[], None, "gemini-2.0-flash");
+    let measured = measure_request_segments(&[with_image], &[], None, "gemini-2.0-flash");
+    let before = plain.iter().find(|segment| segment.id == "conversation").unwrap();
+    let after = measured.iter().find(|segment| segment.id == "conversation").unwrap();
+    assert_eq!(after.chars, before.chars);
+    assert_eq!(after.estimated_tokens - before.estimated_tokens, 258);
+}
+
+#[test]
+fn review_regression_branch_selection_invalidates_memory_disk_and_late_reports() {
+    use crate::chat::agent::context_measure::resolve_display;
+    let state = crate::state::test_app_state();
+    let mut first = assistant_with_anchor("first", 1, 100);
+    first.group_id = Some("group".into());
+    first.cache_pair_input = Some(100);
+    first.cache_pair_read = Some(90);
+    let mut second = assistant_with_anchor("second", 2, 100);
+    second.group_id = Some("group".into());
+    second.cache_pair_input = Some(100);
+    second.cache_pair_read = Some(10);
+    let mut conversation = test_conversation_with_messages(vec![first, second]);
+    conversation.group_selections.insert("group".into(), "first".into());
+    let runtime = state.chat_runtime();
+    runtime.bind_prepared_context(&conversation.id, "old", "reply", "openai", "gpt-4o", &[], None);
+    let (live, _) = runtime.report_context_tokens(&conversation.id, "old", 53_000).unwrap();
+    conversation.context_state.measurement_seq = live.seq;
+    conversation.context_state.request_measurement = Some(live.stored());
+    super::mutations::apply_group_selection(&state, &mut conversation, "group".into(), "second".into()).unwrap();
+    assert_eq!(resolve_display(&conversation, runtime.context_measurement(&conversation.id).as_ref()).reported_tokens, None);
+    assert_eq!(conversation.context_state.cache_hit_rate, Some(0.1));
+    assert!(runtime.report_context_tokens(&conversation.id, "old", 99_000).is_none());
+    let restored: Conversation = serde_json::from_slice(&serde_json::to_vec(&conversation).unwrap()).unwrap();
+    assert_eq!(resolve_display(&restored, None).reported_tokens, None);
+    let seq = conversation.context_state.measurement_seq;
+    assert!(seq > live.seq);
+    super::mutations::apply_group_selection(&state, &mut conversation, "group".into(), "second".into()).unwrap();
+    assert_eq!(conversation.context_state.measurement_seq, seq);
+    assert!(super::mutations::apply_group_selection(&state, &mut conversation, "group".into(), "absent".into()).is_err());
+    assert_eq!(conversation.context_state.measurement_seq, seq);
+
+    runtime.bind_prepared_context(&conversation.id, "new", "second", "openai", "gpt-4o", &[], None);
+    runtime.report_context_tokens(&conversation.id, "new", 7_100).unwrap();
+    super::mutations::apply_group_selection(&state, &mut conversation, "group".into(), "second".into()).unwrap();
+    assert_eq!(resolve_display(&conversation, runtime.context_measurement(&conversation.id).as_ref()).reported_tokens, Some(7_100));
+    assert!(runtime.report_context_tokens(&conversation.id, "old", 99_000).is_none());
+    super::mutations::apply_group_selection(&state, &mut conversation, "group".into(), "first".into()).unwrap();
+    assert_eq!(resolve_display(&conversation, runtime.context_measurement(&conversation.id).as_ref()).reported_tokens, None);
+    assert_eq!(conversation.context_state.cache_hit_rate, Some(0.9));
+    assert!(runtime.report_context_tokens(&conversation.id, "new", 99_000).is_none());
+}
+
+#[test]
+fn image_request_estimates_respect_model_detail_without_changing_character_shares() {
+    use super::context::measure_request_segments;
+    use base64::Engine as _;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2048, 2048)
+        .write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let url = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(png.into_inner()));
+    for (model, detail, expected) in [
+        ("gpt-4o", "low", 85),
+        ("gpt-4o", "high", 765),
+        ("gpt-5.5", "low", 308),
+        ("gpt-5.5", "high", 3000),
+        ("gpt-5.5", "original", 4916),
+        ("gpt-5.4-mini", "low", 4916),
+        ("gpt-5.4-mini", "high", 3000),
+        ("gpt-5.4-mini", "original", 4916),
+    ] {
+        let plain = serde_json::json!({"role":"user","content":[{"type":"text","text":"inspect"}]});
+        let mut request = plain.clone();
+        request["content"].as_array_mut().unwrap().push(
+            serde_json::json!({"type":"image_url","image_url":{"url":url,"detail":detail}})
+        );
+        let before = measure_request_segments(&[plain], &[], None, model);
+        let after = measure_request_segments(&[request], &[], None, model);
+        let before = before.iter().find(|segment| segment.id == "conversation").unwrap();
+        let after = after.iter().find(|segment| segment.id == "conversation").unwrap();
+        assert_eq!(after.chars, before.chars, "{model}/{detail}");
+        assert_eq!(after.estimated_tokens - before.estimated_tokens, expected, "{model}/{detail}");
+    }
+}
+
+#[test]
+fn image_request_estimates_use_model_detail_budgets_for_unknown_dimensions() {
+    use super::context::measure_request_segments;
+    for (model, detail, expected) in [
+        ("gpt-4o", "low", 85),
+        ("gpt-4o", "high", 1445),
+        ("gpt-5.5", "low", 308),
+        ("gpt-5.5", "high", 3000),
+        ("gpt-5.5", "original", 12000),
+        ("gpt-5.5", "auto", 12000),
+        ("gpt-5.4", "auto", 3000),
+        ("gpt-5.4", "original", 12000),
+        ("gpt-6-astra", "original", 36000),
+    ] {
+        for url in ["https://example.invalid/image.png", "data:image/png;base64,invalid!"] {
+            let plain = serde_json::json!({"role":"user","content":[]});
+            let request = serde_json::json!({"role":"user","content":[
+                {"type":"image_url","image_url":{"url":url,"detail":detail}}
+            ]});
+            let before = measure_request_segments(&[plain], &[], None, model);
+            let after = measure_request_segments(&[request], &[], None, model);
+            let before = before.iter().find(|segment| segment.id == "conversation").unwrap();
+            let after = after.iter().find(|segment| segment.id == "conversation").unwrap();
+            assert_eq!(after.chars, before.chars);
+            assert_eq!(after.estimated_tokens - before.estimated_tokens, expected, "{model}/{detail}");
+        }
+    }
+}
+
+
+#[test]
+fn image_request_estimates_count_supported_image_blocks_once() {
+    use super::context::measure_request_segments;
+    use base64::Engine as _;
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(1024, 1024)
+        .write_to(&mut png, image::ImageFormat::Png).unwrap();
+    let data = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+    let url = format!("data:image/png;base64,{data}");
+    let plain = serde_json::json!({"role":"user","content":[]});
+    let before = measure_request_segments(&[plain], &[], None, "gpt-5.5");
+    let before = before.iter().find(|segment| segment.id == "conversation").unwrap();
+    for block in [
+        serde_json::json!({"type":"image_url","image_url":{"url":url,"detail":"high"}}),
+        serde_json::json!({"type":"input_image","image_url":url,"detail":"high"}),
+        serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/png","data":data},"detail":"high"}),
+        serde_json::json!({"type":"image","data":data,"mimeType":"image/png","detail":"high"}),
+    ] {
+        let request = serde_json::json!({"role":"user","content":[block]});
+        let measured = measure_request_segments(&[request], &[], None, "gpt-5.5");
+        let after = measured.iter().find(|segment| segment.id == "conversation").unwrap();
+        assert_eq!(after.chars, before.chars);
+        assert_eq!(after.estimated_tokens - before.estimated_tokens, 1229);
+    }
+}
+
+#[test]
+fn image_patch_estimates_fit_dimensions_before_budget_and_preserve_original() {
+    assert_eq!(estimate_image_tokens(None, "gpt-5.5", Some((4096, 512)), Some("high")), 615);
+    assert_eq!(estimate_image_tokens(None, "gpt-6-astra", Some((4096, 512)), Some("high")), 2458);
+    assert_eq!(estimate_image_tokens(None, "gpt-5.5", Some((6400, 6400)), Some("original")), 12000);
+    assert_eq!(estimate_image_tokens(None, "gpt-6-astra", Some((6400, 6400)), Some("original")), 48000);
+    assert_eq!(estimate_image_tokens(None, "gpt-5.5", Some((1, 100_000)), Some("high")), 77);
+}
+
+
+#[test]
+fn resolve_thinking_rejects_off_for_always_on_models() {
+    for model in [
+        "gpt-6-astra",
+        "gpt-6.1-sol",
+        "kimi-k3",
+        "kimi-k2.7-code",
+        "gemini-2.5-pro",
+        "gemini-3.8-flash",
+        "claude-opus-5.5",
+        "grok-4.6",
+    ] {
+        let error = resolve_thinking(Some("off"), true, None, model).unwrap_err();
+        assert!(error.contains("不支持关闭思考"), "{model}: {error}");
+    }
+    assert_eq!(
+        resolve_thinking(Some("off"), true, None, "kimi-k2.6").unwrap(),
+        (false, None)
+    );
+    assert_eq!(
+        resolve_thinking(Some("high"), true, None, "kimi-k2.6").unwrap(),
+        (true, None)
+    );
+}
+
+#[test]
+fn resolve_thinking_checks_stored_levels_and_uses_an_available_default() {
+    assert_eq!(
+        resolve_thinking(Some("off"), true, None, "gpt-4o").unwrap(),
+        (true, None)
+    );
+    let mut provider = test_provider("test", "Test", vec!["custom"]);
+    provider.model_overrides.insert(
+        "custom".into(),
+        crate::settings::ModelInfo {
+            reasoning_efforts: Some(vec!["low".into()]),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        resolve_thinking(None, true, Some(&provider), "custom").unwrap(),
+        (true, Some("low".into()))
+    );
+    assert!(
+        resolve_thinking(Some("max"), true, Some(&provider), "custom")
+            .unwrap_err()
+            .contains("不支持思考强度")
     );
 }

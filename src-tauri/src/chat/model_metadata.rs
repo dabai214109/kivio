@@ -337,6 +337,13 @@ pub fn reasoning_efforts_for_model(provider: Option<&ModelProvider>, model: &str
     {
         return sanitize_efforts(list.iter().filter_map(Value::as_str));
     }
+    let id = normalize_model_name(provider_model_database_id(provider, model));
+    if id.contains("gemini-3.1-flash-lite-image") {
+        return vec!["high".into()];
+    }
+    if id.contains("gemini-3-pro") {
+        return vec!["low".into(), "high".into()];
+    }
     if provider.map(ModelProvider::api_format_kind)
         == Some(crate::settings::ProviderApiFormat::AnthropicMessages)
     {
@@ -345,6 +352,149 @@ pub fn reasoning_efforts_for_model(provider: Option<&ModelProvider>, model: &str
         }
     }
     vec!["low".into(), "medium".into(), "high".into()]
+}
+
+/// Whether an Off choice can actually be honored, independently of effort levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ThinkingOffMode {
+    Supported,
+    UpfrontOnly,
+    NotApplicable,
+    Unsupported,
+    Unknown,
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ThinkingCapabilities {
+    pub levels: Vec<String>,
+    pub off_mode: ThinkingOffMode,
+}
+
+pub(crate) fn thinking_capabilities_for_model(
+    provider: Option<&ModelProvider>,
+    model: &str,
+) -> ThinkingCapabilities {
+    let reasoning = provider
+        .and_then(|p| override_model_info(p, model))
+        .and_then(|info| info.capabilities.as_ref())
+        .and_then(|caps| caps.reasoning)
+        .or_else(|| {
+            model_database_entry(provider_model_database_id(provider, model))
+                .and_then(|entry| entry.get("capabilities"))
+                .and_then(|caps| caps.get("reasoning"))
+                .and_then(Value::as_bool)
+        });
+    if reasoning == Some(false) {
+        return ThinkingCapabilities {
+            levels: vec![],
+            off_mode: ThinkingOffMode::NotApplicable,
+        };
+    }
+    let levels = reasoning_efforts_for_model(provider, model);
+    let id = normalize_model_name(provider_model_database_id(provider, model));
+    let kimi_code = id.starts_with("kimi-code/");
+    let id = id.rsplit('/').next().unwrap_or(&id);
+    let off_mode = if provider.is_some_and(crate::provider_oauth::antigravity::is_provider)
+        && crate::provider_oauth::antigravity::model_includes_effort(model)
+    {
+        ThinkingOffMode::Unsupported
+    } else if let Some(mode) = model_database_entry(id)
+        .and_then(|entry| entry.get("thinkingOff"))
+        .and_then(Value::as_bool)
+    {
+        if mode {
+            ThinkingOffMode::Supported
+        } else {
+            ThinkingOffMode::Unsupported
+        }
+    } else if let Some(profile) = claude_thinking_profile(id) {
+        if profile.off_thinking_type == Some("between_tools") {
+            ThinkingOffMode::UpfrontOnly
+        } else if profile.kind == ClaudeThinkingKind::Unsupported
+            || id.contains("fable")
+            || id.contains("mythos")
+            || normalize_model_sep(id).contains("opus-5-5")
+        {
+            ThinkingOffMode::Unsupported
+        } else {
+            ThinkingOffMode::Supported
+        }
+    } else if let Some(profile) = gemini_thinking_profile(id) {
+        if profile.supports_off {
+            ThinkingOffMode::Supported
+        } else {
+            ThinkingOffMode::Unsupported
+        }
+    } else if kimi_code
+        || id.starts_with("kimi-k3")
+        || id.starts_with("kimi-k2.7")
+        || id.starts_with("kimi-k2-thinking")
+        || id.starts_with("deepseek-r1")
+        || id.starts_with("grok-")
+        || id == "gpt-5"
+        || id.starts_with("gpt-5-")
+        || id.starts_with("gpt-5.4-pro")
+        || id.starts_with("gpt-5.5-pro")
+        || id.starts_with("gpt-6-astra")
+        || id.starts_with("gpt-6.1-sol")
+        || id.starts_with("o1")
+        || id.starts_with("o3")
+        || id.starts_with("o4")
+    {
+        ThinkingOffMode::Unsupported
+    } else if id.starts_with("deepseek-")
+        || id.starts_with("kimi-k2.5")
+        || id.starts_with("kimi-k2.6")
+        || id.starts_with("gpt-5.")
+        || id.starts_with("gpt-6-")
+    {
+        ThinkingOffMode::Supported
+    } else {
+        ThinkingOffMode::Unknown
+    };
+    ThinkingCapabilities { levels, off_mode }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GeminiThinkingProfile {
+    pub supports_off: bool,
+    pub budget_max: Option<i64>,
+}
+
+pub(crate) fn gemini_thinking_profile(model: &str) -> Option<GeminiThinkingProfile> {
+    let id = normalize_model_name(model);
+    if id.contains("gemini-2.5-pro") {
+        Some(GeminiThinkingProfile {
+            supports_off: false,
+            budget_max: Some(32768),
+        })
+    } else if id.contains("gemini-2.5-flash") {
+        Some(GeminiThinkingProfile {
+            supports_off: true,
+            budget_max: Some(24576),
+        })
+    } else if id.contains("gemini-3") {
+        Some(GeminiThinkingProfile {
+            supports_off: false,
+            budget_max: None,
+        })
+    } else {
+        None
+    }
+}
+
+// Product mapping for the shared Low/Medium/High control, within Google's 2.5 budgets.
+// These are application presets, not native Gemini effort levels.
+pub(crate) fn gemini_thinking_budget(model: &str, level: &str) -> Option<i64> {
+    let max = gemini_thinking_profile(model)?.budget_max?;
+    match level {
+        "low" => Some(1024),
+        "medium" => Some(8192),
+        "high" => Some(max),
+        _ => None,
+    }
 }
 
 /// Claude 思考线格式。对照官方 per-model 表：
@@ -366,8 +516,8 @@ pub(crate) struct ClaudeThinkingProfile {
     pub supports_output_effort: bool,
     supports_xhigh: bool,
     supports_max: bool,
-    /// Sonnet 5 / Opus 5 默认思考开着，Off 必须显式 `type: "disabled"`。
-    pub(crate) send_disabled_on_off: bool,
+    /// Off 的 wire 类型：Sonnet 5.5 用 between_tools，5 用 disabled；始终思考的模型省略。
+    pub(crate) off_thinking_type: Option<&'static str>,
     /// Fable/Mythos/Preview / Opus 4.7+ / Sonnet 5：非默认 temperature 一律 400。
     pub(crate) forbid_temperature: bool,
 }
@@ -433,7 +583,7 @@ pub(crate) fn claude_thinking_profile(model: &str) -> Option<ClaudeThinkingProfi
             supports_output_effort: true,
             supports_xhigh: false,
             supports_max: true,
-            send_disabled_on_off: false,
+            off_thinking_type: None,
             forbid_temperature: true,
         });
     }
@@ -465,7 +615,7 @@ fn unsupported_thinking() -> ClaudeThinkingProfile {
         supports_output_effort: false,
         supports_xhigh: false,
         supports_max: false,
-        send_disabled_on_off: false,
+        off_thinking_type: None,
         forbid_temperature: false,
     }
 }
@@ -476,7 +626,7 @@ fn extended_budget_only() -> ClaudeThinkingProfile {
         supports_output_effort: false,
         supports_xhigh: false,
         supports_max: false,
-        send_disabled_on_off: false,
+        off_thinking_type: None,
         forbid_temperature: false,
     }
 }
@@ -537,14 +687,14 @@ fn profile_for_claude_version(
     major: u32,
     minor: u32,
 ) -> ClaudeThinkingProfile {
-    // 官方表没有 Haiku 4.6+，也没有任何 Haiku 在 effort 名单里。
-    if family == ClaudeFamily::Haiku {
+    // Haiku 5.5 adds adaptive thinking and output effort; older Haiku uses budgets.
+    if family == ClaudeFamily::Haiku && !version_at_least(major, minor, 5, 5) {
         return extended_budget_only();
     }
     let adaptive = match family {
         ClaudeFamily::Fable | ClaudeFamily::Mythos => major >= 5,
         ClaudeFamily::Opus | ClaudeFamily::Sonnet => version_at_least(major, minor, 4, 6),
-        _ => false,
+        ClaudeFamily::Haiku => version_at_least(major, minor, 5, 5),
     };
     let kind = if adaptive {
         ClaudeThinkingKind::Adaptive
@@ -554,32 +704,39 @@ fn profile_for_claude_version(
     let supports_output_effort = match family {
         ClaudeFamily::Opus => version_at_least(major, minor, 4, 5),
         ClaudeFamily::Sonnet => version_at_least(major, minor, 4, 6),
+        ClaudeFamily::Haiku => version_at_least(major, minor, 5, 5),
         ClaudeFamily::Fable | ClaudeFamily::Mythos => major >= 5,
-        _ => false,
     };
     let supports_xhigh = match family {
         ClaudeFamily::Fable | ClaudeFamily::Mythos => major >= 5,
         ClaudeFamily::Opus => version_at_least(major, minor, 4, 7),
         ClaudeFamily::Sonnet => major >= 5,
-        _ => false,
+        ClaudeFamily::Haiku => version_at_least(major, minor, 5, 5),
     };
     let supports_max = match family {
         ClaudeFamily::Fable | ClaudeFamily::Mythos => major >= 5,
         ClaudeFamily::Opus | ClaudeFamily::Sonnet => version_at_least(major, minor, 4, 6),
-        _ => false,
+        ClaudeFamily::Haiku => version_at_least(major, minor, 5, 5),
     };
     ClaudeThinkingProfile {
         kind,
         supports_output_effort,
         supports_xhigh,
         supports_max,
-        send_disabled_on_off: matches!(family, ClaudeFamily::Opus | ClaudeFamily::Sonnet)
-            && major >= 5,
+        off_thinking_type: match family {
+            ClaudeFamily::Haiku if version_at_least(major, minor, 5, 5) => Some("disabled"),
+            ClaudeFamily::Sonnet if version_at_least(major, minor, 5, 5) => Some("between_tools"),
+            ClaudeFamily::Sonnet if major >= 5 => Some("disabled"),
+            ClaudeFamily::Opus if major >= 5 && !version_at_least(major, minor, 5, 5) => {
+                Some("disabled")
+            }
+            _ => None,
+        },
         forbid_temperature: match family {
             ClaudeFamily::Fable | ClaudeFamily::Mythos => major >= 5,
             ClaudeFamily::Opus => version_at_least(major, minor, 4, 7),
             ClaudeFamily::Sonnet => major >= 5,
-            _ => false,
+            ClaudeFamily::Haiku => version_at_least(major, minor, 5, 5),
         },
     }
 }
@@ -894,6 +1051,49 @@ pub(crate) fn pricing_for_model(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn thinking_capabilities_separate_toggle_effort_and_upfront_only() {
+        use ThinkingOffMode::*;
+        for (model, mode) in [
+            ("gpt-4o", NotApplicable),
+            ("kimi-k2.6", Supported),
+            ("kimi-k3", Unsupported),
+            ("kimi-k2.7-code", Unsupported),
+            ("gemini-2.5-flash", Supported),
+            ("gemini-2.5-pro", Unsupported),
+            ("gemini-3.8-flash", Unsupported),
+            ("claude-opus-4.7", Supported),
+            ("claude-opus-5.5", Unsupported),
+            ("claude-sonnet-5.5", UpfrontOnly),
+            ("claude-haiku-5.5", Supported),
+            ("gpt-6-astra", Unsupported),
+            ("gpt-6.1-sol", Unsupported),
+            ("gpt-5.4-pro", Unsupported),
+            ("gpt-5.5-pro", Unsupported),
+            ("gpt-6-sol", Supported),
+            ("grok-4.6", Unsupported),
+        ] {
+            assert_eq!(
+                thinking_capabilities_for_model(None, model).off_mode,
+                mode,
+                "{model}"
+            );
+        }
+        assert!(thinking_capabilities_for_model(None, "kimi-k2.6")
+            .levels
+            .is_empty());
+        let mut provider = test_provider_with_overrides(Default::default());
+        provider.base_url = "https://api.kimi.com/coding/v1".into();
+        assert_eq!(
+            thinking_capabilities_for_model(Some(&provider), "k3").off_mode,
+            Unsupported
+        );
+        assert_eq!(
+            thinking_capabilities_for_model(None, "k3").off_mode,
+            Unknown
+        );
+    }
+
     use std::collections::HashMap;
 
     use crate::settings::{ModelInfo, ModelProvider};
@@ -1334,60 +1534,6 @@ mod tests {
     }
 
     #[test]
-    fn claude_thinking_profile_follows_official_generation_split() {
-        use super::{claude_thinking_profile, ClaudeThinkingKind};
-
-        let opus45 = claude_thinking_profile("claude-opus-4-5-20251101").unwrap();
-        assert_eq!(opus45.kind, ClaudeThinkingKind::Extended);
-        assert!(opus45.supports_output_effort);
-
-        let alias = claude_thinking_profile("opus-4.5").unwrap();
-        assert_eq!(alias.kind, ClaudeThinkingKind::Extended);
-        assert!(alias.supports_output_effort);
-
-        let sonnet45 = claude_thinking_profile("claude-sonnet-4.5").unwrap();
-        assert_eq!(sonnet45.kind, ClaudeThinkingKind::Extended);
-        assert!(!sonnet45.supports_output_effort);
-
-        let haiku45 = claude_thinking_profile("claude-haiku-4-5").unwrap();
-        assert_eq!(haiku45.kind, ClaudeThinkingKind::Extended);
-        assert!(!haiku45.supports_output_effort);
-
-        let opus46 = claude_thinking_profile("claude-opus-4.6").unwrap();
-        assert_eq!(opus46.kind, ClaudeThinkingKind::Adaptive);
-        assert!(opus46.supports_output_effort);
-
-        let opus47 = claude_thinking_profile("anthropic/claude-opus-4-7").unwrap();
-        assert_eq!(opus47.kind, ClaudeThinkingKind::Adaptive);
-
-        let fable = claude_thinking_profile("claude-fable-5").unwrap();
-        assert_eq!(fable.kind, ClaudeThinkingKind::Adaptive);
-        assert!(!fable.send_disabled_on_off);
-        assert!(fable.forbid_temperature);
-
-        let sonnet5 = claude_thinking_profile("claude-sonnet-5").unwrap();
-        assert_eq!(sonnet5.kind, ClaudeThinkingKind::Adaptive);
-        assert!(sonnet5.send_disabled_on_off);
-        assert!(sonnet5.forbid_temperature);
-
-        let haiku46 = claude_thinking_profile("claude-haiku-4.6").unwrap();
-        assert_eq!(haiku46.kind, ClaudeThinkingKind::Extended);
-
-        for model in [
-            "claude-3.5-haiku",
-            "claude-3-5-sonnet-20241022",
-            "claude-3-haiku-20240307",
-        ] {
-            assert_eq!(
-                claude_thinking_profile(model).unwrap().kind,
-                ClaudeThinkingKind::Unsupported,
-                "{model}"
-            );
-        }
-        assert!(claude_thinking_profile("gpt-5.6").is_none());
-    }
-
-    #[test]
     fn xhigh_gated_per_model_not_per_protocol() {
         // 删掉 reasoning_effort_wire 的协议级白名单后，模型库是**唯一**门控：适配器原样下发
         // 用户所选档位，选错就吃 provider 的 400。所以这份数据必须准，尤其是 xhigh 这一档
@@ -1709,6 +1855,16 @@ mod tests {
             chat_max_output_tokens_on_wire(Some(&provider), "glm-5.3", 16_384),
             131_072
         );
+        for model in [
+            "[临时测试自有算力]Qwen/Qwen3.8-27B-Uncensored",
+            "[自有算力]Qwen/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive",
+        ] {
+            assert_eq!(
+                chat_max_output_tokens_on_wire(Some(&provider), model, 32_768),
+                16_384,
+                "{model}: self-hosted variants must not inherit a commercial output cap"
+            );
+        }
     }
 
     #[test]

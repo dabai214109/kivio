@@ -66,9 +66,14 @@ pub enum MessagePart {
         /// 外置后的附件文件名（相对于会话附件目录）。**落盘形态**。
         #[serde(default, skip_serializing_if = "Option::is_none")]
         path: Option<String>,
+        /// Preserve OpenAI image sizing through history and provider conversion.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     ImageUrl {
         url: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     ToolCall {
         id: String,
@@ -193,7 +198,8 @@ pub struct GenerateOptions {
     /// 思考开关。UI「Off」时为 false：适配器**必须显式**下发关闭信号
     /// （OpenAI Chat → `reasoning_effort:"none"`；DeepSeek/Kimi → `thinking.type=disabled`；
     /// Responses → `reasoning.effort:"none"`；Anthropic Sonnet 5 / Opus 5 →
-    /// `thinking.type:disabled`；Fable/Mythos 始终开着，Off 只省略字段），
+    /// `thinking.type:disabled`；Sonnet 5.5 → `thinking.type:between_tools`；
+    /// Fable/Mythos/Opus 5.5 始终开着，Off 只省略字段），
     /// 不能靠省略字段——多家默认 effort=high。
     pub thinking_enabled: bool,
     /// 每对话「思考等级」(`"low"|"medium"|"high"|…`)。`None` = 未设档：
@@ -454,6 +460,12 @@ impl GenerateOutput {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamPart {
+    /// Latest request's provider-reported input and output, normalized for cache semantics.
+    /// Never a cumulative bill or local estimate.
+    ContextUsage {
+        input_tokens: u64,
+        output_tokens: u64,
+    },
     TextDelta {
         delta: String,
     },
@@ -526,6 +538,41 @@ impl ModelError {
         }
     }
 
+    /// Errors reported inside an established SSE stream. HTTP failures are
+    /// already retried by api.rs and must not acquire another retry multiplier.
+    pub fn provider_stream_error(message: impl Into<String>) -> Self {
+        let message = message.into();
+        let lower = message.to_ascii_lowercase();
+        let transient = is_missing_stream_terminal_error(&message)
+            || [
+                "overloaded_error",
+                "server_error",
+                "rate_limit_error",
+                "rate_limit_exceeded",
+                "service_unavailable",
+                "internal_server_error",
+                "unavailable",
+                "resource_exhausted",
+            ]
+            .iter()
+            .any(|code| lower.contains(code));
+        Self::with_kind(
+            message,
+            if transient {
+                ModelErrorKind::StreamReadInterrupted
+            } else {
+                ModelErrorKind::Other
+            },
+        )
+    }
+
+    pub fn stream_ended_early(label: &str) -> Self {
+        Self::with_kind(
+            format!("{label} 流式响应读取中断：stream ended without terminal event"),
+            ModelErrorKind::StreamReadInterrupted,
+        )
+    }
+
     pub fn is_stream_read_interrupted(&self) -> bool {
         self.kind == ModelErrorKind::StreamReadInterrupted
     }
@@ -553,9 +600,8 @@ pub fn stream_read_error(label: &str, err: &reqwest::Error) -> ModelError {
     )
 }
 
-/// 中转把 Gemini 等上游包成 Responses 时，常在正文已经流完后再发一条
-/// 「缺 `response.completed` / terminal event」的 error。token 是真的，
-/// 当成硬失败会把已经生成的回答整轮作废。
+/// Recognize relay errors that explicitly say no completion marker arrived.
+/// Partial text alone is not proof of completion; the stream owner may retry.
 pub fn is_missing_stream_terminal_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("without terminal")
@@ -975,15 +1021,20 @@ fn model_message_from_openai_message(message: &Value) -> Option<ModelMessage> {
                                 .and_then(|value| value.get("url"))
                                 .and_then(|value| value.as_str())
                                 .unwrap_or_default();
+                            let detail = item.get("image_url")
+                                .and_then(|value| value.get("detail"))
+                                .and_then(Value::as_str).map(str::to_string);
                             if let Some((mime_type, data)) = parse_data_image_url(url) {
                                 parts.push(MessagePart::Image {
                                     mime_type,
                                     data,
                                     path: None,
+                                    detail,
                                 });
                             } else if !url.is_empty() {
                                 parts.push(MessagePart::ImageUrl {
                                     url: url.to_string(),
+                                    detail,
                                 });
                             }
                         }
@@ -1116,7 +1167,7 @@ fn openai_messages_from_model_message(message: &ModelMessage) -> Vec<Value> {
                 multimodal_parts.push(serde_json::json!({ "type": "text", "text": text }));
             }
             MessagePart::Image {
-                mime_type, data, ..
+                mime_type, data, detail, ..
             } => {
                 // data 为空 = 外置了但没 rehydrate（回放路径漏了读盘）。发个占位符
                 // 而不是 `data:image/png;base64,`，免得让 provider 400。
@@ -1125,16 +1176,24 @@ fn openai_messages_from_model_message(message: &ModelMessage) -> Vec<Value> {
                         serde_json::json!({ "type": "text", "text": MISSING_IMAGE_PLACEHOLDER }),
                     );
                 } else {
+                    let mut image_url = serde_json::json!({"url":format!("data:{mime_type};base64,{data}")});
+                    if let Some(detail) = detail {
+                        image_url["detail"] = serde_json::json!(detail);
+                    }
                     multimodal_parts.push(serde_json::json!({
                         "type": "image_url",
-                        "image_url": { "url": format!("data:{mime_type};base64,{data}") },
+                        "image_url": image_url,
                     }));
                 }
             }
-            MessagePart::ImageUrl { url } => {
+            MessagePart::ImageUrl { url, detail } => {
+                let mut image_url = serde_json::json!({"url":url});
+                if let Some(detail) = detail {
+                    image_url["detail"] = serde_json::json!(detail);
+                }
                 multimodal_parts.push(serde_json::json!({
                     "type": "image_url",
-                    "image_url": { "url": url },
+                    "image_url": image_url,
                 }));
             }
             MessagePart::ToolCall {
@@ -1274,24 +1333,32 @@ fn responses_items_from_model_message(
                 content_parts.push(serde_json::json!({ "type": text_part_type, "text": text }));
             }
             MessagePart::Image {
-                mime_type, data, ..
+                mime_type, data, detail, ..
             } => {
                 if data.is_empty() {
                     content_parts.push(
                         serde_json::json!({ "type": text_part_type, "text": MISSING_IMAGE_PLACEHOLDER }),
                     );
                 } else {
-                    content_parts.push(serde_json::json!({
+                    let mut image = serde_json::json!({
                         "type": "input_image",
                         "image_url": format!("data:{mime_type};base64,{data}"),
-                    }));
+                    });
+                    if let Some(detail) = detail {
+                        image["detail"] = serde_json::json!(detail);
+                    }
+                    content_parts.push(image);
                 }
             }
-            MessagePart::ImageUrl { url } => {
-                content_parts.push(serde_json::json!({
+            MessagePart::ImageUrl { url, detail } => {
+                let mut image = serde_json::json!({
                     "type": "input_image",
                     "image_url": url,
-                }));
+                });
+                if let Some(detail) = detail {
+                    image["detail"] = serde_json::json!(detail);
+                }
+                content_parts.push(image);
             }
             MessagePart::ToolCall {
                 id,
@@ -1706,6 +1773,7 @@ MCP note after the path.";
             content: vec![
                 MessagePart::ImageUrl {
                     url: "data:image/png;base64,AAAA".to_string(),
+                    detail: None,
                 },
                 MessagePart::Text {
                     text: "what is this?".to_string(),
@@ -1718,6 +1786,30 @@ MCP note after the path.";
         assert_eq!(content[0]["type"], "input_image");
         assert_eq!(content[0]["image_url"], "data:image/png;base64,AAAA");
         assert_eq!(content[1]["type"], "input_text");
+    }
+
+    #[test]
+    fn image_detail_survives_history_round_trip_to_openai_wire() {
+        for url in ["data:image/png;base64,AAAA", "https://example.invalid/image.png"] {
+            for detail in [None, Some("low"), Some("high"), Some("original"), Some("auto")] {
+                let mut image_url = serde_json::json!({"url":url});
+                if let Some(detail) = detail {
+                    image_url["detail"] = serde_json::json!(detail);
+                }
+                let messages = model_messages_from_openai_messages(vec![
+                    serde_json::json!({"role":"user","content":[{"type":"image_url","image_url":image_url}]})
+                ]);
+                let restored: Vec<ModelMessage> = serde_json::from_slice(
+                    &serde_json::to_vec(&messages).unwrap(),
+                ).unwrap();
+                let chat = openai_messages_from_model_messages(&restored);
+                let responses = responses_input_from_model_messages(&restored, None);
+                assert_eq!(chat[0]["content"][0]["image_url"]["url"], url);
+                assert_eq!(chat[0]["content"][0]["image_url"].get("detail").and_then(Value::as_str), detail);
+                assert_eq!(responses[0]["content"][0]["image_url"], url);
+                assert_eq!(responses[0]["content"][0].get("detail").and_then(Value::as_str), detail);
+            }
+        }
     }
 
     #[test]

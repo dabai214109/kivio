@@ -223,6 +223,20 @@ pub struct ChatContextUsagePayload {
     pub context_window_tokens: Option<u64>,
     #[serde(default)]
     pub token_count_source: Option<String>,
+    #[serde(default)]
+    pub cache_input_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_read_tokens: Option<u64>,
+    /// Monotonic per conversation. A lower value must not replace a newer meter.
+    #[serde(default)]
+    pub measurement_seq: u64,
+    /// Bumped on model change, compaction, and context clear.
+    #[serde(default)]
+    pub lifecycle_id: u64,
+    /// Request-bound categories. Null leaves the previous categories; an empty array clears them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub segments: Option<Vec<ChatContextUsageSegmentPayload>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, TS, PartialEq, Eq)]
@@ -496,6 +510,7 @@ pub struct ChatContextUsageSegmentPayload {
     pub id: String,
     pub label: String,
     pub estimated_tokens: u64,
+    pub chars: u64,
     pub color: Option<String>,
 }
 
@@ -529,12 +544,15 @@ pub struct ChatContextSummaryPayload {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[ts(rename_all = "camelCase")]
 pub struct ChatContextStatePayload {
+    pub auto_compact_threshold_tokens: Option<u64>,
     pub estimated_input_tokens: u64,
     pub context_window_tokens: Option<u64>,
     pub context_window_estimated: bool,
     pub usage_ratio: Option<f32>,
     pub status: String,
     pub segments: Vec<ChatContextUsageSegmentPayload>,
+    pub reported_context_tokens: Option<u64>,
+    pub cache_hit_rate: Option<f64>,
     pub last_measured_at: i64,
     pub last_compressed_at: Option<i64>,
     pub compressed_message_count: u64,
@@ -549,16 +567,23 @@ pub struct ChatContextStatePayload {
     pub session_output_tokens: Option<u64>,
     pub external_agent_id: Option<String>,
     pub external_model: Option<String>,
+    #[serde(default)]
+    pub measurement_seq: u64,
+    #[serde(default)]
+    pub lifecycle_id: u64,
 }
 
 impl From<&crate::chat::ConversationContextState> for ChatContextStatePayload {
     fn from(state: &crate::chat::ConversationContextState) -> Self {
         Self {
             estimated_input_tokens: state.estimated_input_tokens as u64,
+            auto_compact_threshold_tokens: state.auto_compact_threshold_tokens.map(|v| v as u64),
             context_window_tokens: state.context_window_tokens.map(|value| value as u64),
             context_window_estimated: state.context_window_estimated,
             usage_ratio: state.usage_ratio,
             status: state.status.clone(),
+            reported_context_tokens: state.reported_context_tokens,
+            cache_hit_rate: state.cache_hit_rate,
             segments: state
                 .segments
                 .iter()
@@ -566,6 +591,7 @@ impl From<&crate::chat::ConversationContextState> for ChatContextStatePayload {
                     id: segment.id.clone(),
                     label: segment.label.clone(),
                     estimated_tokens: segment.estimated_tokens as u64,
+                    chars: segment.chars as u64,
                     color: segment.color.clone(),
                 })
                 .collect(),
@@ -605,6 +631,8 @@ impl From<&crate::chat::ConversationContextState> for ChatContextStatePayload {
             session_output_tokens: state.session_output_tokens.map(|value| value as u64),
             external_agent_id: state.external_agent_id.clone(),
             external_model: state.external_model.clone(),
+            measurement_seq: state.measurement_seq,
+            lifecycle_id: state.lifecycle_id,
         }
     }
 }
@@ -690,6 +718,14 @@ pub enum ChatRunEvent {
     ReasoningDelta {
         delta: String,
         segment: Option<ChatSegmentPayload>,
+    },
+    /// Remove only uncommitted output from the model request being retried.
+    /// Counts are Unicode scalar values, not UTF-8 bytes or UTF-16 code units.
+    StreamAttemptDiscarded {
+        text_chars: u32,
+        reasoning_chars: u32,
+        segment_ids: Vec<String>,
+        tool_ids: Vec<String>,
     },
     ToolUpdated {
         tool: ChatToolPayload,
@@ -789,6 +825,7 @@ impl ChatRunEvent {
             self,
             Self::TextDelta { .. }
                 | Self::ReasoningDelta { .. }
+                | Self::StreamAttemptDiscarded { .. }
                 | Self::ToolUpdated { .. }
                 | Self::SubagentUpdated { .. }
                 | Self::ContextUsageUpdated { .. }
@@ -1623,17 +1660,45 @@ impl ChatProtocolHub {
     }
 }
 
+pub(crate) fn truncate_stream_tail(text: &mut String, chars: u32) {
+    let keep = text.chars().count().saturating_sub(chars as usize);
+    let end = text
+        .char_indices()
+        .nth(keep)
+        .map_or(text.len(), |(index, _)| index);
+    text.truncate(end);
+}
+
 fn fold_snapshot(snapshot: &mut ChatRunSnapshot, event: &ChatRunEvent) {
     match event {
         ChatRunEvent::TextDelta { delta, segment } => {
+            if !delta.is_empty() {
+                snapshot.status_note = None;
+            }
             snapshot.content.push_str(delta);
             cap_text_tail(&mut snapshot.content, SNAPSHOT_TEXT_MAX_BYTES);
             upsert_segment(&mut snapshot.segments, segment, delta);
         }
         ChatRunEvent::ReasoningDelta { delta, segment } => {
+            if !delta.is_empty() {
+                snapshot.status_note = None;
+            }
             snapshot.reasoning.push_str(delta);
             cap_text_tail(&mut snapshot.reasoning, SNAPSHOT_TEXT_MAX_BYTES);
             upsert_segment(&mut snapshot.segments, segment, delta);
+        }
+        ChatRunEvent::StreamAttemptDiscarded {
+            text_chars,
+            reasoning_chars,
+            segment_ids,
+            tool_ids,
+        } => {
+            truncate_stream_tail(&mut snapshot.content, *text_chars);
+            truncate_stream_tail(&mut snapshot.reasoning, *reasoning_chars);
+            snapshot
+                .segments
+                .retain(|segment| !segment_ids.contains(&segment.id));
+            snapshot.tools.retain(|tool| !tool_ids.contains(&tool.id));
         }
         ChatRunEvent::ToolUpdated { tool } => {
             if let Some(existing) = snapshot.tools.iter_mut().find(|item| item.id == tool.id) {
@@ -1854,6 +1919,7 @@ fn upsert_segment(
 /// 订阅者时，才跳过主窗 All 的高频事件。按「窗口已打开」跳过会在通道未订上/已死时黑洞。
 /// debug 构建额外广播到全局事件总线,喂 chat probe(probe.rs 靠 `app.listen` 收实时载荷)。
 fn emit_protocol(app: &AppHandle, event: ChatProtocolEvent) {
+    crate::desktop_pet::observe_protocol(app, &event);
     #[cfg(debug_assertions)]
     notify_protocol_debug_sink(&event);
     let conversation_id = event.conversation_id().to_string();
@@ -2222,6 +2288,7 @@ pub fn resolve_session_consent(app: &AppHandle, run_id: &str) {
         .chat_protocol()
         .hub()
         .resolve_session_consent(run_id);
+    crate::desktop_pet::resolve_interaction(app, run_id, None);
 }
 
 pub fn resolve_user_prompt(app: &AppHandle, run_id: &str, tool_call_id: &str) {
@@ -2229,6 +2296,7 @@ pub fn resolve_user_prompt(app: &AppHandle, run_id: &str, tool_call_id: &str) {
         .chat_protocol()
         .hub()
         .resolve_user_prompt(run_id, tool_call_id);
+    crate::desktop_pet::resolve_interaction(app, run_id, Some(tool_call_id));
 }
 
 pub fn emit_conversation_event(
@@ -2332,7 +2400,12 @@ mod tests {
             }),
             serde_json::json!({
                 "type": "context_usage_updated",
-                "usage": {"usedTokens": 10, "contextWindowTokens": 100, "tokenCountSource": "provider_reported"}
+                "usage": {
+                    "usedTokens": 10, "contextWindowTokens": 100,
+                    "tokenCountSource": "provider_context_reported",
+                    "cacheInputTokens": 100, "cacheReadTokens": 88,
+                    "measurementSeq": 0, "lifecycleId": 0
+                }
             }),
             serde_json::json!({
                 "type": "compaction_updated", "phase": "started", "trigger": null,
@@ -2406,8 +2479,10 @@ mod tests {
                 "type": "context_updated",
                 "contextState": {
                     "estimatedInputTokens": 0, "contextWindowTokens": null,
-                    "contextWindowEstimated": false, "usageRatio": null, "status": "idle",
+                    "contextWindowEstimated": false, "autoCompactThresholdTokens": null, "usageRatio": null, "status": "idle",
                     "segments": [], "lastMeasuredAt": 1, "lastCompressedAt": null,
+                    "reportedContextTokens": null, "cacheHitRate": null,
+                    "measurementSeq": 0, "lifecycleId": 0,
                     "compressedMessageCount": 0, "compressionCount": 0, "summary": null,
                     "compactionBoundaries": [], "clearBoundaries": [], "warning": null, "contextSource": null,
                     "tokenCountSource": null, "sessionInputTokens": null,
@@ -2802,6 +2877,60 @@ mod tests {
         assert_eq!(segments[0].tool_call_id.as_deref(), Some("call-1"));
         assert_eq!(segments[1].id, "text");
         assert_eq!(hub.runs["run"].snapshot.content, "answer");
+    }
+
+    #[test]
+    fn retry_rollback_preserves_prior_output_in_replay_snapshot() {
+        let mut hub = ChatProtocolHub::default();
+        hub.register("conv", "run", "message", 0).unwrap();
+        hub.push(
+            "run",
+            ChatRunEvent::TextDelta {
+                delta: "prior🌱失败".into(),
+                segment: None,
+            },
+        )
+        .unwrap();
+        hub.push(
+            "run",
+            ChatRunEvent::ReasoningDelta {
+                delta: "thought🌱".into(),
+                segment: None,
+            },
+        )
+        .unwrap();
+        hub.push(
+            "run",
+            ChatRunEvent::StreamAttemptDiscarded {
+                text_chars: 2,
+                reasoning_chars: 1,
+                segment_ids: vec![],
+                tool_ids: vec![],
+            },
+        )
+        .unwrap();
+        hub.push(
+            "run",
+            ChatRunEvent::StatusNoteUpdated {
+                note: Some("重连 1/4".into()),
+            },
+        )
+        .unwrap();
+        let snapshot = &hub.runs["run"].snapshot;
+        assert_eq!(snapshot.content, "prior🌱");
+        assert_eq!(snapshot.reasoning, "thought");
+        assert_eq!(snapshot.status_note.as_deref(), Some("重连 1/4"));
+        hub.push(
+            "run",
+            ChatRunEvent::TextDelta {
+                delta: "recovered".into(),
+                segment: None,
+            },
+        )
+        .unwrap();
+        let snapshot = &hub.runs["run"].snapshot;
+        assert_eq!(snapshot.content, "prior🌱recovered");
+        assert!(snapshot.status_note.is_none());
     }
 
     #[test]

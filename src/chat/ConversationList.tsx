@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { Archive, Pin } from 'lucide-react'
+import { Archive, Clock, GitBranch, Layers, Pin } from 'lucide-react'
 import type { ChatProject, ChatSet, ConversationListItem } from './types'
 import { i18n, type I18n, type Lang } from '../components/i18n'
 import { chatApi, normalizeAgentRuntime } from './api'
@@ -15,6 +15,19 @@ import {
   type ConversationMenuAnchor,
 } from './ConversationContextMenu'
 import { formatCompactAge, formatRelativeTime } from './sessionLibrary/format'
+import { useGitBadge } from './dock/useGitBadge'
+import { ProjectIcon } from './ProjectIcon'
+
+function ProjectBranch({ workdir }: { workdir: string }) {
+  const { state } = useGitBadge(workdir)
+  if (state?.status !== 'ready' || !state.head) return null
+  return (
+    <span className="ml-auto flex min-w-0 max-w-[45%] items-center gap-1" title={state.head}>
+      <GitBranch size={11} className="shrink-0" aria-hidden="true" />
+      <span className="min-w-0 truncate text-left" dir="rtl"><bdi dir="ltr">{state.head}</bdi></span>
+    </span>
+  )
+}
 
 /** 对话所属分组标签：优先「集 · 名」，否则项目名（按 project_id，退回 folder===项目名）。
  *  与 Sidebar 搜索弹层的显示逻辑一致。无归属时返回空串。 */
@@ -56,10 +69,13 @@ interface ConversationListProps {
   currentConversationId?: string
   generatingConversationIds?: ReadonlySet<string>
   titleGeneratingConversationIds?: ReadonlySet<string>
+  scheduledTaskNamesByConversation?: ReadonlyMap<string, string[]>
   projects: ChatProject[]
   sets: ChatSet[]
   lang: Lang
   compact?: boolean
+  /** Flat sidebar: title first, with optional ownership below. */
+  cardLayout?: boolean
   indent?: boolean
   showAssistantName?: boolean
   // 「最近」平铺列表用：在每条对话右侧显示其所属「集 / 项目」标签（与搜索弹层一致）。
@@ -92,10 +108,12 @@ export const ConversationList = memo(function ConversationList({
   currentConversationId,
   generatingConversationIds = new Set(),
   titleGeneratingConversationIds = new Set(),
+  scheduledTaskNamesByConversation,
   projects,
   sets,
   lang,
   compact = false,
+  cardLayout = false,
   indent = false,
   showAssistantName = true,
   showFolderLabel = false,
@@ -277,7 +295,18 @@ export const ConversationList = memo(function ConversationList({
           const isTitleGenerating = titleGeneratingConversationIds.has(conv.id)
           const isRenaming = renamingId === conv.id
           const isExiting = exitingIds.has(conv.id)
-          const folderLabel = showFolderLabel ? conversationFolderLabel(conv, projects, sets, t) : ''
+          const folderLabel = showFolderLabel || cardLayout ? conversationFolderLabel(conv, projects, sets, t) : ''
+          const setId = conv.set_id ?? conv.setId
+          const ownerSet = setId ? sets.find(item => item.id === setId) : undefined
+          const projectId = conv.project_id ?? conv.projectId
+          const project = !(conv.set_id ?? conv.setId) && cardLayout
+            ? projects.find(item => projectId ? item.id === projectId : item.name === conv.folder)
+            : undefined
+          const projectWorkdir = project ? project.root_path ?? project.rootPath : undefined
+          const scheduledTaskNames = scheduledTaskNamesByConversation?.get(conv.id)
+          const scheduledTasksTitle = scheduledTaskNames
+            ? t.chatConversationScheduledTasks + scheduledTaskNames.join(lang === 'zh' ? '、' : ', ')
+            : ''
           // 分支对话：把「（分支）」后缀从可截断的标题里拆出，做成不缩的固定标签，
           // 避免侧栏窄宽时被省略号吃掉（forked_from 字段判定，不依赖标题文字）。
           const isFork = Boolean(conv.forked_from ?? conv.forkedFrom)
@@ -305,8 +334,8 @@ export const ConversationList = memo(function ConversationList({
                     isDragging ? 'is-dragging ' : ''
                   }${
                     active
-                      ? 'bg-black/[0.07] dark:bg-white/[0.11]'
-                      : 'hover:bg-black/[0.04] dark:hover:bg-white/[0.06]'
+                      ? 'bg-neutral-900/[0.07]'
+                      : cardLayout ? 'hover:bg-neutral-900/[0.025]' : 'hover:bg-neutral-900/[0.04]'
                   }`}
                 >
                   <input
@@ -325,13 +354,15 @@ export const ConversationList = memo(function ConversationList({
                       }
                     }}
                     className={`min-w-0 flex-1 border-0 bg-transparent text-left outline-none focus:ring-0 ${
-                      compact
+                      cardLayout
+                        ? 'h-[58px] px-2.5 pb-[30px] pt-2 text-[13px] leading-5'
+                        : compact
                         ? `${indent ? 'pl-8' : 'pl-2.5'} pr-2 py-1 text-[13px] leading-5`
                         : 'px-3 py-2 text-[13px]'
                     } font-medium ${
                       active
-                        ? 'text-neutral-900 dark:text-neutral-100'
-                        : 'text-neutral-700 dark:text-neutral-300'
+                        ? 'text-neutral-900'
+                        : 'text-neutral-700'
                     }`}
                     placeholder={t.chatLibUntitled}
                   />
@@ -366,12 +397,13 @@ export const ConversationList = memo(function ConversationList({
                   isDragging ? 'is-dragging ' : ''
                 }${
                   active
-                    ? 'bg-black/[0.07] dark:bg-white/[0.11]'
-                    : 'hover:bg-black/[0.04] dark:hover:bg-white/[0.06]'
+                    ? 'bg-neutral-900/[0.07]'
+                    : cardLayout ? 'hover:bg-neutral-900/[0.025]' : 'hover:bg-neutral-900/[0.04]'
                 }`}
               >
               <button
                 type="button"
+                aria-label={cardLayout ? visibleTitle : undefined}
                 onClick={() => onSelectConversation(conv.id, conv)}
                 onDoubleClick={(e) => {
                   e.preventDefault()
@@ -379,13 +411,15 @@ export const ConversationList = memo(function ConversationList({
                   startRename(conv)
                 }}
                 className={`min-w-0 flex-1 text-left font-medium transition-colors ${
-                  compact
+                  cardLayout
+                    ? 'px-2.5 py-2 text-[13px] leading-5'
+                    : compact
                     ? `${indent ? 'pl-8' : 'pl-2.5'} pr-2 py-1 text-[13px] leading-5`
                     : 'px-3 py-2 text-[13px]'
                 } ${
                   active
-                    ? 'text-neutral-900 dark:text-neutral-100'
-                    : 'text-neutral-700 dark:text-neutral-300'
+                    ? 'text-neutral-900'
+                    : 'text-neutral-700'
                 }`}
                 title={
                   isGenerating || isTitleGenerating
@@ -412,7 +446,7 @@ export const ConversationList = memo(function ConversationList({
                       {t.chatForkSuffix}
                     </span>
                   )}
-                  {folderLabel && (
+                  {folderLabel && !cardLayout && (
                     <span
                       className="max-w-[96px] shrink-0 truncate text-[11px] font-normal text-neutral-400 dark:text-neutral-500"
                       title={folderLabel}
@@ -421,17 +455,39 @@ export const ConversationList = memo(function ConversationList({
                     </span>
                   )}
                 </span>
+                {cardLayout && (
+                  <span className={`mt-0.5 flex h-5 min-w-0 items-center gap-1.5 text-[11px] font-normal text-neutral-500 ${scheduledTasksTitle ? 'pr-16' : 'pr-12'}`}>
+                    {folderLabel && <>
+                      {setId
+                        ? <Layers size={14} className="shrink-0" style={ownerSet?.color ? { color: ownerSet.color } : undefined} aria-hidden="true" />
+                        : <ProjectIcon workdir={projectWorkdir} color={project?.color} />}
+                      <span className="min-w-0 flex-1 truncate" title={folderLabel}>
+                        {folderLabel}
+                      </span>
+                      {projectWorkdir && <ProjectBranch workdir={projectWorkdir} />}
+                    </>}
+                  </span>
+                )}
                 {showAssistantName && (conv.assistant_name ?? conv.assistantName) && (
                   <span className="mt-0.5 block truncate text-[11px] font-normal text-neutral-400 dark:text-neutral-500">
                     {(conv.assistant_name ?? conv.assistantName)}
                   </span>
                 )}
               </button>
+              {scheduledTasksTitle && (
+                <span
+                  className={`${cardLayout ? 'absolute right-[54px] bottom-[11.5px] text-neutral-500' : 'mr-1 text-neutral-400 dark:text-neutral-500'} flex shrink-0 items-center`}
+                  title={scheduledTasksTitle}
+                  aria-label={scheduledTasksTitle}
+                >
+                  <Clock size={13} strokeWidth={1.75} aria-hidden="true" />
+                </span>
+              )}
               {/* 行尾：平时短龄；悬停让给 PIN + 归档；生成中优先慢波。
                   短龄叠在槽右侧（置顶时针占左、龄占右）。慢波保持原始 chat-gen-wave。 */}
 
               <div
-                className={`kv-conv-trailing relative mr-1 flex h-[22px] shrink-0 items-center justify-end ${
+                className={`kv-conv-trailing ${cardLayout ? 'absolute right-1.5 bottom-[7px]' : 'relative mr-1'} flex h-[22px] shrink-0 items-center justify-end ${
                   conv.pinned ? 'w-[48px]' : 'w-[44px]'
                 }`}
                 data-busy={isGenerating && !conv.pinned ? '' : undefined}
@@ -439,7 +495,7 @@ export const ConversationList = memo(function ConversationList({
               >
                 {compactAge && (
                   <span
-                    className="kv-conv-age pointer-events-none absolute right-0.5 flex h-full items-center text-[11px] tabular-nums leading-none text-neutral-400 dark:text-neutral-500"
+                    className={`kv-conv-age pointer-events-none absolute right-0.5 flex h-full items-center text-[11px] tabular-nums leading-none ${cardLayout ? 'text-neutral-500' : 'text-neutral-400 dark:text-neutral-500'}`}
                     aria-label={ageLabel || undefined}
                   >
                     {compactAge}
@@ -466,12 +522,10 @@ export const ConversationList = memo(function ConversationList({
                       e.stopPropagation()
                       void onTogglePinConversation(conv.id, !conv.pinned)
                     }}
-                    className={`shrink-0 rounded-md p-0.5 transition-opacity hover:bg-black/[0.06] dark:hover:bg-white/[0.1] ${
+                    className={`shrink-0 rounded-md p-0.5 transition-opacity hover:bg-neutral-900/[0.06] ${
                       conv.pinned
-                        ? 'text-neutral-700 opacity-100 dark:text-neutral-200'
-                        : isGenerating
-                          ? 'text-neutral-400 hover:text-neutral-600 dark:hover:text-neutral-200'
-                          : 'text-neutral-400 opacity-0 group-hover:opacity-100 hover:text-neutral-600 dark:hover:text-neutral-200'
+                        ? 'text-neutral-700 opacity-100'
+                        : `${cardLayout ? 'text-neutral-500' : 'text-neutral-400'} hover:text-neutral-600 ${isGenerating ? '' : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'}`
                     }`}
                     aria-label={conv.pinned ? t.chatUnpin : t.chatPin}
                     title={conv.pinned ? t.chatUnpin : t.chatPin}
@@ -485,10 +539,10 @@ export const ConversationList = memo(function ConversationList({
                       e.stopPropagation()
                       beginArchive(conv, index)
                     }}
-                    className={`shrink-0 rounded-md p-0.5 text-neutral-400 transition-opacity hover:bg-black/[0.06] hover:text-neutral-600 dark:hover:bg-white/[0.1] dark:hover:text-neutral-200 ${
+                    className={`shrink-0 rounded-md p-0.5 ${cardLayout ? 'text-neutral-500' : 'text-neutral-400'} transition-opacity hover:bg-neutral-900/[0.06] hover:text-neutral-600 ${
                       isGenerating && !conv.pinned
                         ? ''
-                        : 'opacity-0 group-hover:opacity-100'
+                        : 'opacity-0 group-hover:opacity-100 group-focus-within:opacity-100'
                     }`}
                     aria-label={t.chatLibArchive}
                     title={t.chatLibArchive}

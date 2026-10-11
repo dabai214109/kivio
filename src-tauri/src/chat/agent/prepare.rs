@@ -151,7 +151,6 @@ pub fn build_chat_system_prompt(
     memory_prompt: Option<&str>,
     agent_plan_prompt: Option<&str>,
     agent_ask_user_prompt: Option<&str>,
-    agent_todo_prompt: Option<&str>,
     project_context: Option<&ProjectPromptContext>,
     workbench_dir: Option<&str>,
     knowledge_base_prompt: Option<&str>,
@@ -175,7 +174,6 @@ pub fn build_chat_system_prompt(
         memory_prompt,
         agent_plan_prompt,
         agent_ask_user_prompt,
-        agent_todo_prompt,
         project_context,
         workbench_dir,
         knowledge_base_prompt,
@@ -307,6 +305,11 @@ fn computer_control_system_prompt(
         lines.push(
             "- Browser interaction: prefer Playwright CLI over generic web tools; activate the `playwright-cli` skill before using it.",
         );
+        lines.push(if chat_tools.playwright_extension_token.is_empty() {
+            "- To control the user's existing browser through the Playwright extension, first ask for its PLAYWRIGHT_MCP_EXTENSION_TOKEN (unless already provided). Save it with kivio_configure action=playwright_extension_token and token=<user-provided value>, or direct the user to Settings > Computer Control > Playwright CLI. Never echo tokens or put them in shell commands."
+        } else {
+            "- Playwright extension token is configured. Kivio injects it into direct playwright-cli / @playwright/cli commands, including background runs. Use `playwright-cli attach --extension=chrome` for the user's existing Chrome browser (use the actual browser name for other browsers); this CLI requires an explicit extension value. Do not read, echo or copy the token into command arguments. If authentication fails, ask for the current token from that browser profile and update it with kivio_configure action=playwright_extension_token."
+        });
     }
 
     if skill_available("cua-driver") {
@@ -352,7 +355,6 @@ pub fn build_chat_system_prompt_with_segments(
     memory_prompt: Option<&str>,
     agent_plan_prompt: Option<&str>,
     agent_ask_user_prompt: Option<&str>,
-    agent_todo_prompt: Option<&str>,
     project_context: Option<&ProjectPromptContext>,
     workbench_dir: Option<&str>,
     knowledge_base_prompt: Option<&str>,
@@ -545,13 +547,6 @@ pub fn build_chat_system_prompt_with_segments(
                 ask_user,
             );
         }
-    }
-
-    if let Some(todo) = agent_todo_prompt
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        append_context_segment(&mut prompt, &mut segments, "agent_todo", "Agent todo", todo);
     }
 
     // Per-conversation workbench path (`…/conv_xxx`) is the only system-prompt
@@ -801,6 +796,7 @@ fn append_context_segment(
         id: id.to_string(),
         label: label.to_string(),
         estimated_tokens: estimate_tokens(trimmed),
+        chars: trimmed.encode_utf16().count(),
         color: context_segment_color(id).map(str::to_string),
     });
 }
@@ -830,11 +826,33 @@ pub fn merge_context_segments(segments: Vec<ContextUsageSegment>) -> Vec<Context
         }
         if let Some(existing) = merged.iter_mut().find(|item| item.id == segment.id) {
             existing.estimated_tokens += segment.estimated_tokens;
+            existing.chars += segment.chars;
         } else {
             merged.push(segment);
         }
     }
     merged
+}
+
+/// Count serialized JSON characters without allocating another copy of tool/message content.
+pub(crate) fn context_json_chars(value: &serde_json::Value) -> usize {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            // Count UTF-8 leading bytes; supplementary code points occupy two UTF-16 units.
+            self.0 += bytes.iter().map(|byte| match byte {
+                0x00..=0x7f | 0xc0..=0xef => 1,
+                0xf0..=0xf7 => 2,
+                _ => 0,
+            }).sum::<usize>();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)
+        .expect("JSON Value serialization to an infallible character counter");
+    counter.0
 }
 
 pub fn context_segment_color(id: &str) -> Option<&'static str> {
@@ -845,7 +863,6 @@ pub fn context_segment_color(id: &str) -> Option<&'static str> {
         "runtime_context" => Some("#3E8B60"),
         "memory_l1" => Some("#4F9A9A"),
         "agent_plan" => Some("#8A724C"),
-        "agent_todo" => Some("#5F7C5A"),
         "tool_definitions" => Some("#7553CF"),
         "skills" => Some("#BD8A3E"),
         "mcp" => Some("#B04B8D"),
@@ -872,11 +889,9 @@ pub fn estimate_tokens(text: &str) -> usize {
 
 /// content-part `type` 值：图片部件（估算记 0 token——图片按 provider 的 tile 计费，
 /// 而非 base64 体积；把 base64 长度算进 token 会把估算打爆几个数量级）。
-/// **务必保持 0**：上下文用量条（`compute_context_state`）已用
-/// `estimate_image_attachment_tokens`（按图片真实尺寸/tile）**另行**累加图片 token，
-/// `count_tokens_in_value` 委托本函数、对内联图片返回 0 正是为了**不重复计**。
-/// 若在此给图片一个非 0 常量，用量条会双重计数；而 L2 循环内估算对内联图片的欠计
-/// 由 auto 触发路径（usage_ratio 已含图片）兜住，无需在此 hedge。
+/// Display measurement adds image costs separately in `measure_request_segments`,
+/// using image dimensions rather than base64 bytes. Keep this text estimate at
+/// zero to avoid counting the same image twice; budget anchors remain separate.
 pub(crate) const IMAGE_PART_TYPES: [&str; 3] = ["image_url", "input_image", "image"];
 /// content-part `type` 值：文本部件（按其 `text` 字段估算）。
 pub(crate) const TEXT_PART_TYPES: [&str; 2] = ["text", "input_text"];
@@ -1301,7 +1316,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &[],
         );
 
@@ -1337,7 +1351,6 @@ mod tests {
                 None,
                 "",
                 false,
-                None,
                 None,
                 None,
                 None,
@@ -1431,7 +1444,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Some("/Users/me/Kivio/workspace/conv_abc"),
             None,
             None,
@@ -1499,7 +1511,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Some("/Users/me/Kivio/workspace/conv_abc"),
             None,
             None,
@@ -1547,7 +1558,6 @@ mod tests {
                 None,
                 "",
                 false,
-                None,
                 None,
                 None,
                 None,
@@ -1614,7 +1624,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &[],
         );
 
@@ -1647,7 +1656,6 @@ mod tests {
             None,
             "",
             false,
-            None,
             None,
             None,
             None,
@@ -1688,7 +1696,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             Some("/Users/me/Obsidian/MyVault"),
             &[],
         );
@@ -1722,7 +1729,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &[],
         );
 
@@ -1745,7 +1751,6 @@ mod tests {
             Some("   "),
             "",
             false,
-            None,
             None,
             None,
             None,
@@ -1980,7 +1985,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &[],
         );
 
@@ -2033,7 +2037,6 @@ mod tests {
             None,
             None,
             None,
-            None,
             &[],
         );
         assert!(prompt.contains("Speak like a careful editor."), "{prompt}");
@@ -2062,7 +2065,6 @@ mod tests {
             None,
             "",
             true,
-            None,
             None,
             None,
             None,
@@ -2126,7 +2128,6 @@ mod tests {
             sources.is_chat_runtime,
             None,
             sources.agent_plan_prompt.as_deref(),
-            None,
             None,
             None,
             None,

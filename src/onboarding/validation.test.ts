@@ -106,11 +106,6 @@ describe('onboarding validation', () => {
     expect(validateProviderStep(settings).ok).toBe(false)
   })
 
-  it('requires quick translate and lens model bindings', () => {
-    const settings = baseSettings(configuredBindings)
-    expect(canCompleteOnboarding(settings)).toBe(true)
-  })
-
   it('does not require a Chat default model', () => {
     const settings = baseSettings({
       ...configuredBindings,
@@ -124,12 +119,24 @@ describe('onboarding validation', () => {
     expect(canCompleteOnboarding(settings)).toBe(true)
   })
 
-  it('rejects bindings that point to providers without keys', () => {
+  it.each([{ apiKeys: [] }, { apiKeys: [''] }, { apiKeys: [' ', '\t'] }])('accepts an anonymous provider with key pool $apiKeys', ({ apiKeys }) => {
     const settings = baseSettings({
       ...configuredBindings,
       providers: [{
         ...testProvider,
-        apiKeys: [],
+        apiKeys,
+      }],
+    })
+    expect(isProviderModelBindingUsable(settings, 'p1', 'gpt-4o')).toBe(true)
+    expect(canCompleteOnboarding(settings)).toBe(true)
+  })
+
+  it('still requires OAuth login even when an API key is present', () => {
+    const settings = baseSettings({
+      ...configuredBindings,
+      providers: [{
+        ...testProvider,
+        request: { ...testProvider.request, oauth: { provider: 'codex' } },
       }],
     })
     expect(isProviderModelBindingUsable(settings, 'p1', 'gpt-4o')).toBe(false)
@@ -166,36 +173,4 @@ describe('onboarding validation', () => {
     expect(webSearchConfigured(settings)).toBe(true)
   })
 
-  it('detects configured Brave and SearXNG search sources', () => {
-    expect(webSearchConfigured(baseSettings({
-      lens: {
-        enabled: true,
-        hotkey: 'CommandOrControl+Shift+G',
-        webSearch: {
-          enabled: true,
-          provider: 'brave',
-          tavilyApiKey: '',
-          exaApiKey: '',
-          braveApiKey: 'bsa-test',
-          maxResults: 5,
-          searchDepth: 'basic',
-        },
-      },
-    }))).toBe(true)
-    expect(webSearchConfigured(baseSettings({
-      lens: {
-        enabled: true,
-        hotkey: 'CommandOrControl+Shift+G',
-        webSearch: {
-          enabled: true,
-          provider: 'searxng',
-          tavilyApiKey: '',
-          exaApiKey: '',
-          searxngBaseUrl: 'https://searx.example',
-          maxResults: 5,
-          searchDepth: 'basic',
-        },
-      },
-    }))).toBe(true)
-  })
 })

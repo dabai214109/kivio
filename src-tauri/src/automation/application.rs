@@ -195,6 +195,19 @@ impl AgentHost for WorkflowAgentHost {
         }
     }
 
+    fn discard_stream_attempt(
+        &self,
+        _run_id: &str,
+        text_chars: u32,
+        _reasoning_chars: u32,
+        _segment_ids: Vec<String>,
+        _tool_ids: Vec<String>,
+    ) {
+        if let Ok(mut text) = self.text.lock() {
+            crate::chat::protocol::truncate_stream_tail(&mut text, text_chars);
+        }
+    }
+
     fn emit_tool_record(
         &self,
         _conversation_id: &str,
@@ -291,6 +304,7 @@ impl ToolExecutor for WorkflowToolExecutor {
                 tool_call_id: Some(ctx.tool_call_id.to_string()),
                 run_id: ctx.run_id.to_string(),
                 generation: ctx.generation,
+                round: ctx.round,
                 depth: ctx.depth,
             };
             crate::mcp::registry::call_tool(
@@ -407,7 +421,7 @@ async fn run_builtin_agent_node(
     let (provider_id, model) = resolve_kivio_model(&settings, spec)?;
     let provider = settings
         .get_provider(&provider_id)
-        .filter(|p| p.enabled && p.has_credentials())
+        .filter(|p| p.enabled && p.authentication_ready())
         .cloned()
         .ok_or_else(|| {
             "Configure a chat provider and model in Settings before running an Agent step"
@@ -489,7 +503,6 @@ async fn run_builtin_agent_node(
         None,
         None,
         None,
-        None,
         workdir_str.as_deref(),
         None,
         obsidian_vault_path,
@@ -546,9 +559,11 @@ async fn run_builtin_agent_node(
         retry_attempts,
         assistant_snapshot: None,
         provider_tools_fallback_system_prompt: system_prompt,
+        initial_cache_usage: None,
         initial_anchor_total_tokens: None,
         initial_anchor_trailing_estimate: 0,
         skill_project_cwd: workdir,
+        todo_state: Default::default(),
     };
 
     let outcome = run_agent_loop(config, &host, &executor).await;
@@ -695,6 +710,8 @@ fn workflow_user_message(content: String) -> ChatMessage {
         stream_outcome: None,
         usage: None,
         anchor_usage: None,
+        cache_pair_input: None,
+        cache_pair_read: None,
         group_id: None,
         provider_id: None,
         model: None,

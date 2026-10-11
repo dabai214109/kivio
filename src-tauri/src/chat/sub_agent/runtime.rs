@@ -31,6 +31,10 @@ impl Status {
 pub struct Profile {
     pub provider_id: String,
     pub model: String,
+    #[serde(default)]
+    pub thinking_enabled: Option<bool>,
+    #[serde(default)]
+    pub thinking_level: Option<String>,
     pub agent_type: String,
     pub system_prompt: String,
     pub tool_names: Vec<String>,
@@ -220,7 +224,7 @@ impl Runtime {
         self.control.lock().unwrap_or_else(|e| e.into_inner())
     }
     fn path(&self, id: &str) -> Result<PathBuf, String> {
-        uuid::Uuid::parse_str(id).map_err(|_| "Invalid child identifier".to_string())?;
+        uuid::Uuid::parse_str(id).map_err(|_| "Invalid child id: use the child UUID returned by agent or agent_control list, not the child name or execution_id".to_string())?;
         Ok(self.root.join(format!("{id}.json")))
     }
     fn read(&self, id: &str) -> Result<Record, String> {
@@ -563,6 +567,7 @@ impl Runtime {
             return Err("User stopped this child; explicit user continuation required".into());
         }
         if record.messages.iter().any(|m| m.id == key) {
+            enqueue(&mut record, key, sender, text)?;
             return Ok((record, false));
         }
         if record.current().status == Status::Stopping
@@ -993,8 +998,13 @@ fn execution(parent_run: &str, prompt: &str) -> Execution {
     }
 }
 fn enqueue(record: &mut Record, key: &str, sender: &str, text: &str) -> Result<(), String> {
-    if key.is_empty() || text.trim().is_empty() || text.len() > 100_000 {
-        return Err("Message requires an identifier and 1–100000 bytes of text".into());
+    if key.trim().is_empty() {
+        return Err("message_id is required for durable delivery; it is a message retry key, not id or execution_id".into());
+    }
+    if text.trim().is_empty() || text.len() > 100_000 {
+        return Err(
+            "message must contain nonblank instructions and be at most 100000 UTF-8 bytes".into(),
+        );
     }
     if let Some(message) = record.messages.iter().find(|m| m.id == key) {
         return if message.text == text && message.sender == sender {
@@ -1030,7 +1040,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let runtime = Runtime::open(dir.path().into()).unwrap();
         let child = runtime
-            .start("conv", "parent", "k", "A", Profile::default(), "Inspect")
+            .start(
+                "conv",
+                "parent",
+                "k",
+                "A",
+                Profile {
+                    thinking_enabled: Some(true),
+                    thinking_level: Some("medium".into()),
+                    ..Profile::default()
+                },
+                "Inspect",
+            )
             .unwrap();
         let output = WorkerOutput {
             result: Err("response interrupted".into()),
@@ -1045,6 +1066,8 @@ mod tests {
             .unwrap();
         let reopened = Runtime::open(dir.path().into()).unwrap();
         let saved = reopened.get("conv", &child.id).unwrap();
+        assert_eq!(saved.profile.thinking_enabled, Some(true));
+        assert_eq!(saved.profile.thinking_level.as_deref(), Some("medium"));
         assert_eq!(saved.current().result.as_deref(), Some("Read evidence"));
         assert_eq!(saved.current().usage.as_ref().unwrap()["input_tokens"], 12);
         assert_eq!(

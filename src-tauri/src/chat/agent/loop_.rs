@@ -20,6 +20,58 @@ use super::stop::patch_system_message;
 use super::synthesis::{synthesis_step, SynthesisFlow};
 use super::types::{AgentRunConfig, AgentRunResult};
 
+/// Appends a todo reminder before the next model step when `chat::todo` says one is
+/// due. It goes into both histories, so it is persisted and replayed like a steer and
+/// later steps (and turns) see it was already sent.
+fn append_todo_reminder(config: &AgentRunConfig<'_>, state: &mut RunState) {
+    if !todo_exposed(state) {
+        return;
+    }
+    let current = current_todo_state(config, state);
+    if let Some(reminder) =
+        crate::chat::todo::reminder_for_next_step(&state.runtime_messages, &current)
+    {
+        state.runtime_messages.push(reminder.clone());
+        state.generated_api_messages.push(reminder);
+    }
+}
+
+/// At the final answer: when this run did work (wrote the list or called tools) but
+/// the list still has open items, absorb the answer and append a reminder so the
+/// model closes the list out before the turn ends. Once per run. Returns whether the
+/// loop should take another step.
+fn todo_final_check_continues(config: &AgentRunConfig<'_>, state: &mut RunState) -> bool {
+    if state.todo_final_check_sent || !todo_exposed(state) || state.tool_records.is_empty() {
+        return false;
+    }
+    let Some(reminder) =
+        crate::chat::todo::final_check_reminder(&current_todo_state(config, state))
+    else {
+        return false;
+    };
+    state.todo_final_check_sent = true;
+    if let Some(message) = state.planning_final_message.take() {
+        absorb_final_answer(state, message);
+    }
+    state.runtime_messages.push(reminder.clone());
+    state.generated_api_messages.push(reminder);
+    true
+}
+
+fn todo_exposed(state: &RunState) -> bool {
+    state.tools.iter().any(|tool| {
+        tool.source == "native" && crate::chat::todo::is_agent_todo_tool_name(&tool.name)
+    })
+}
+
+fn current_todo_state(
+    config: &AgentRunConfig<'_>,
+    state: &RunState,
+) -> crate::chat::types::AgentTodoState {
+    crate::chat::todo::latest_recorded_state(&state.tool_records)
+        .unwrap_or_else(|| config.todo_state.clone())
+}
+
 /// Immutable per-run environment shared by every loop phase.
 pub(crate) struct LoopEnv<'a> {
     pub(crate) config: &'a AgentRunConfig<'a>,
@@ -62,6 +114,8 @@ pub(crate) struct RunState {
     /// 第一次遇到时 planning 返回 `RetryEmptyResponse` 原地重试；已重试过则照旧走
     /// FinalAnswer → finalize 报 "empty assistant response"。
     pub(crate) planning_empty_retried: bool,
+    /// The end-of-turn todo check (`todo_final_check_continues`) already ran this run.
+    pub(crate) todo_final_check_sent: bool,
     /// 待注入的用户插话本地队列（对齐 pi `PendingMessageQueue`）：信箱一次取空后暂存在
     /// 这里，`inject_steering_messages` 每个轮次边界只弹一条（one-at-a-time），剩余的由
     /// 后续边界与 FinalAnswer 边界的 `steering_pending` 检查保证送达。
@@ -71,6 +125,7 @@ pub(crate) struct RunState {
     pub(crate) skill_cache: skills::SkillRunCache,
     /// 本轮全部模型调用（规划/合成/压缩摘要）的 usage 累计；provider 不报则保持 None。
     pub(crate) usage: Option<crate::chat::model::ModelUsage>,
+    pub(crate) cache_pairs: Option<(u64, u64)>,
     /// 本轮**最后一次**模型调用的 usage（真实用量锚点，与累计 `usage` 区分——累计是多步之和、
     /// 会虚高数倍，不能当锚点）。`maybe_compact_send_view` 据此把上下文占用锚定到 provider
     /// 实报值，只对锚点之后新增的消息做字符估算（对齐 pi/opencode 的 ground-truth 口径）。
@@ -87,11 +142,15 @@ pub(crate) struct RunState {
     /// 把压缩后的完整历史回传到 `AgentRunResult.compacted_history`，让跨轮调用方
     /// 用压缩后的历史替换其累积副本（压缩真正跨轮生效，而非仅当轮发送视图瘦身）。
     pub(crate) compacted: bool,
-    /// Anti-thrashing 计数（Gap 2，Layer 3）：连续多少轮「需要压缩（超预算）但压缩没能减小
-    /// 上下文」（摘要调用失败/为空/无可摘要旧段）。在 `maybe_compact_send_view` 里维护——
-    /// 压成功并降到预算内则清零，否则递增。达到 `COMPACTION_THRASH_LIMIT` 时规划循环优雅收尾
-    /// （用已收集的工具结果降级），而不是反复触发压缩并连续失败后才报错。
-    pub(crate) compaction_unresolved_rounds: u32,
+    /// Consecutive automatic compaction failures (ZCode circuit breaker). Seeded from the
+    /// host so the pause outlives a run; a success resets it.
+    pub(crate) auto_compact_failures: u32,
+    pub(crate) tool_batches_since_compact: u32,
+    /// Consecutive successful compactions that refilled within a few tool batches.
+    pub(crate) rapid_refills: u32,
+    /// Set when the rapid-refill breaker trips; planning then ends the turn gracefully
+    /// with the gathered tool results instead of compacting again.
+    pub(crate) compaction_blocked: bool,
     pub(crate) pending_compaction_boundary: Option<crate::chat::types::CompactionBoundaryRecord>,
     /// L2 压缩产出的落盘 summary（与 boundary 同期生成）。run 结束时由 `attach_usage`
     /// 挂到 `AgentRunResult.compaction_summary`，commands.rs 据此写回 `context_state.summary`
@@ -111,11 +170,6 @@ pub(crate) struct RunState {
     pub(crate) tool_schema_tokens_cache: Option<(u64, usize)>,
 }
 
-/// 连续「需要压缩但压不下去」多少轮后停止工具循环、优雅收尾（Gap 2，Layer 3 anti-thrashing）。
-/// 取 2：给压缩一次重试机会（provider 偶发抖动可能第二轮成功），第二次仍失败则判定压缩无能为力，
-/// 不再硬撑——避免实测里出现的「压缩连续失败 6+ 次后才超窗报错」。
-pub(crate) const COMPACTION_THRASH_LIMIT: u32 = 2;
-
 impl RunState {
     /// 把单次模型调用的 usage 累加进本轮总账；缺失实报时清除当前锚点。
     /// 同时把这次调用记为**真实用量锚点**（`last_step_usage`）——累计 `usage` 是多步之和不能当
@@ -123,10 +177,34 @@ impl RunState {
     /// 而在 `rounds.rs` push 完该次响应后设——保证 trailing = 锚点响应**之后**新增（对齐 pi、避免
     /// 与锚点里的 output 双算）。
     /// 使用独立精简输入的 recovery 必须清除锚点，它的实报不代表完整运行上下文。
-    pub(crate) fn merge_usage(&mut self, next: Option<crate::chat::model::ModelUsage>) {
-        self.last_step_usage = next.clone();
-        self.initial_anchor_valid = false;
-        let Some(next) = next else { return };
+    /// `display` is false for a reduced recovery prompt: its bill still counts,
+    /// but it is not the context meter or the budget anchor.
+    pub(crate) fn merge_usage(
+        &mut self,
+        next: Option<crate::chat::model::ModelUsage>,
+        env: &LoopEnv<'_>,
+        display: bool,
+    ) {
+        let main_display = display && env.config.depth == 0;
+        if display {
+            self.last_step_usage = next.clone();
+            self.initial_anchor_valid = false;
+        }
+        let Some(next) = next else {
+            if main_display {
+                env.host.finish_unreported_context(&env.config.conversation_id);
+            }
+            return;
+        };
+        if main_display {
+            super::context_measure::accumulate_cache_pair(
+                &mut self.cache_pairs,
+                &next,
+                &env.config.provider.api_format,
+            );
+            env.host
+                .note_context_cache(&env.config.conversation_id, self.cache_pairs);
+        }
         let total = self.usage.get_or_insert_with(Default::default);
         let add = |slot: &mut Option<u64>, value: Option<u64>| {
             if let Some(value) = value {
@@ -142,6 +220,27 @@ impl RunState {
             next.cache_creation_input_tokens,
         );
         add(&mut total.reasoning_tokens, next.reasoning_tokens);
+        if !main_display {
+            return;
+        }
+        let api_format = env.config.provider.api_format.as_str();
+        if let Some(used) = super::context_estimate::prompt_tokens(&next, api_format)
+            .map(|input| input.saturating_add(next.output_tokens.unwrap_or(0)))
+        {
+            let cache = super::context_measure::combine_cache(
+                env.config.initial_cache_usage,
+                self.cache_pairs,
+            );
+            env.host.emit_context_usage_live(
+                &env.config.conversation_id,
+                used,
+                Some("provider_context_reported"),
+                None,
+                cache,
+            );
+        } else {
+            env.host.finish_unreported_context(&env.config.conversation_id);
+        }
     }
 }
 
@@ -245,15 +344,20 @@ pub async fn run_agent_loop(
         planning_final_message: None,
         planning_final_streamed: false,
         planning_empty_retried: false,
+        todo_final_check_sent: false,
         pending_steering: std::collections::VecDeque::new(),
         pending_follow_up: std::collections::VecDeque::new(),
         skill_cache: skills::SkillRunCache::default(),
         usage: None,
+        cache_pairs: None,
         last_step_usage: None,
         runtime_len_at_last_call: 0,
         initial_anchor_valid: true,
         compacted: false,
-        compaction_unresolved_rounds: 0,
+        auto_compact_failures: host.auto_compact_failures(&config.conversation_id),
+        tool_batches_since_compact: 0,
+        rapid_refills: 0,
+        compaction_blocked: false,
         pending_compaction_boundary: None,
         pending_compaction_summary: None,
         generated_images: Vec::new(),
@@ -374,6 +478,7 @@ pub async fn run_agent_loop(
                     .into_iter()
                     .filter(|message| message["subagent_parent_persisted"] != true),
             );
+            append_todo_reminder(&config, &mut state);
 
             let planned = match planning_step(&env, &mut state, round).await? {
                 PlanningStepOutcome::FinalAnswer => {
@@ -412,6 +517,34 @@ pub async fn run_agent_loop(
                         inject_follow_up_messages(&env, &mut state, round).await?;
                         continue;
                     }
+                    let child_activity = host
+                        .wait_for_child_results(
+                            &config.conversation_id,
+                            &config.run_id,
+                            config.generation,
+                        )
+                        .await?;
+                    if !host.is_generation_active(&config.conversation_id, config.generation) {
+                        if let Some(hooks) = hooks {
+                            hooks.cancel();
+                        }
+                        let result = cancelled_run_result_from_state(&env, &mut state);
+                        return Ok(attach_usage(result, &mut state));
+                    }
+                    if child_activity {
+                        if let Some(message) = state.planning_final_message.take() {
+                            absorb_final_answer(&mut state, message);
+                        }
+                        // Follow-ups can arrive while waiting, after the check
+                        // above. Inject them before the next model request.
+                        if follow_up_pending(&env, &mut state) {
+                            inject_follow_up_messages(&env, &mut state, round).await?;
+                        }
+                        continue;
+                    }
+                    if todo_final_check_continues(&config, &mut state) {
+                        continue;
+                    }
                     break;
                 }
                 PlanningStepOutcome::ToolsUnsupported => break,
@@ -435,7 +568,9 @@ pub async fn run_agent_loop(
             turn.end_message();
 
             match run_tool_round(&env, &mut state, round, planned).await {
-                ToolRoundOutcome::Continue => {}
+                ToolRoundOutcome::Continue => {
+                    state.tool_batches_since_compact += 1;
+                }
                 ToolRoundOutcome::RoundLimit => break,
                 ToolRoundOutcome::Cancelled(result) => {
                     if let Some(hooks) = hooks {
@@ -532,12 +667,18 @@ pub async fn run_agent_loop(
 /// `compacted_history`，供跨轮调用方替换其累积历史（finalize 构造器们也不感知压缩）。
 fn attach_usage(mut result: AgentRunResult, state: &mut RunState) -> AgentRunResult {
     result.usage = state.usage.take();
+    result.cache_pairs = state.cache_pairs.take();
     result.last_step_usage = state.last_step_usage.take();
     if state.compacted {
         let mut history = std::mem::take(&mut state.runtime_messages);
         let final_message =
             super::stop::final_assistant_api_message(&result.content, result.reasoning.as_deref());
         history.push(final_message);
+        if let Some(summary) = &mut state.pending_compaction_summary {
+            if let Some(replay) = &mut summary.replay {
+                replay.messages = super::compaction::replacement_body(&history);
+            }
+        }
         result.compacted_history = Some(history);
     }
     result.compaction_boundary = state.pending_compaction_boundary.take();

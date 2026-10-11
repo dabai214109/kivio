@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ReactNo
 import { createPortal } from 'react-dom'
 import { Check, ChevronDown, ExternalLink, X } from 'lucide-react'
 import { formatHotkey, getPlatform, type SelectOption } from './utils'
-import { Button } from '../components/Button'
+import { Button, IconButton } from '../components/Button'
 import { copyToClipboard, readClipboardText } from '../utils/clipboard'
 import { TextEditContextMenu } from './TextEditContextMenu'
 
@@ -15,6 +15,8 @@ function useSelectMenuRect(
   value: string,
   optionsLength: number,
   triggerRef: RefObject<HTMLElement | null>,
+  minWidth = 0,
+  compact = false,
 ) {
   const [menuRect, setMenuRect] = useState<{
     left: number
@@ -28,20 +30,24 @@ function useSelectMenuRect(
     const trigger = triggerRef.current
     if (!trigger) return
     const rect = trigger.getBoundingClientRect()
+    const width = minWidth ? Math.min(Math.max(rect.width, minWidth), window.innerWidth - MENU_MARGIN * 2) : rect.width
+    const anchorLeft = compact ? rect.right - width : rect.left
+    const left = minWidth ? Math.max(MENU_MARGIN, Math.min(anchorLeft, window.innerWidth - width - MENU_MARGIN)) : rect.left
     const viewportH = window.innerHeight
     const spaceBelow = viewportH - rect.bottom - MENU_GAP - MENU_MARGIN
     const spaceAbove = rect.top - MENU_GAP - MENU_MARGIN
     // 默认向下展开；下方空间不足且上方更宽裕时向上翻转。
-    const flipUp = spaceBelow < MENU_MAX_HEIGHT && spaceAbove > spaceBelow
+    const desiredHeight = Math.min(MENU_MAX_HEIGHT, optionsLength * (compact ? 24 : 28) + 10)
+    const flipUp = spaceBelow < desiredHeight && spaceAbove > spaceBelow
     const available = Math.max(flipUp ? spaceAbove : spaceBelow, 0)
-    const maxHeight = Math.max(Math.min(MENU_MAX_HEIGHT, available), 80)
+    const maxHeight = Math.min(MENU_MAX_HEIGHT, available)
     if (flipUp) {
       // 用 bottom 定位让菜单底边贴着按钮向上生长，避免 top 计算后恒等于 MENU_MARGIN 导致飞到窗口顶部。
-      setMenuRect({ left: rect.left, bottom: viewportH - rect.top + MENU_GAP, width: rect.width, maxHeight })
+      setMenuRect({ left, bottom: viewportH - rect.top + MENU_GAP, width, maxHeight })
     } else {
-      setMenuRect({ left: rect.left, top: rect.bottom + MENU_GAP, width: rect.width, maxHeight })
+      setMenuRect({ left, top: rect.bottom + MENU_GAP, width, maxHeight })
     }
-  }, [triggerRef])
+  }, [triggerRef, minWidth, compact, optionsLength])
 
   useLayoutEffect(() => {
     if (open) updateMenuRect()
@@ -114,6 +120,7 @@ function SelectMenuPortal({
   options,
   value,
   onPick,
+  compact = false,
 }: {
   open: boolean
   triggerRef: RefObject<HTMLElement | null>
@@ -122,13 +129,23 @@ function SelectMenuPortal({
   options: SelectOption[]
   value: string
   onPick: (value: string) => void
+  compact?: boolean
 }) {
+  useLayoutEffect(() => {
+    if (!open) return
+    const menu = menuRef.current
+    const selected = menu?.querySelector<HTMLElement>('[aria-selected="true"]')
+    if (menu && selected) {
+      menu.scrollTop = Math.max(0, selected.offsetTop - (menu.clientHeight - selected.offsetHeight) / 2)
+    }
+  }, [open, value, menuRect.maxHeight, menuRef])
+
   if (!open) return null
   return createPortal(
     <div
       ref={menuRef as React.RefObject<HTMLDivElement>}
       role="listbox"
-      className="kv-select-menu fixed z-[1000] overflow-y-auto custom-scrollbar"
+      className={`kv-select-menu ${compact ? 'sm' : ''} fixed z-[1000] overflow-y-auto custom-scrollbar`}
       style={{ left: menuRect.left, top: menuRect.top, bottom: menuRect.bottom, width: menuRect.width, maxHeight: menuRect.maxHeight }}
       data-tauri-drag-region="false"
     >
@@ -159,12 +176,18 @@ function SelectMenuPortal({
 /**
  * 下拉选择 — 自绘菜单，避免 macOS 原生 select 的系统高亮/勾选反馈和受控状态不同步。
  */
-export function Select({ value, onChange, options, className = '', disabled: disabledProp = false, title, ariaLabel }: {
+export function Select({ value, onChange, options, className = '', disabled: disabledProp = false, title, ariaLabel, triggerIcon, triggerLabel, size = 'md' }: {
   value: string
   onChange: (v: string) => void
   options: SelectOption[]
   className?: string
   disabled?: boolean
+  /** 紧凑工具栏使用图标触发器，选项菜单仍显示完整名称。 */
+  triggerIcon?: ReactNode
+  /** 图标工具栏同时显示当前范围时使用；菜单保留完整选项名称。 */
+  triggerLabel?: string
+  /** 文本工具栏触发器及其菜单的尺寸；小号菜单右侧对齐。 */
+  size?: 'md' | 'sm'
   /** 覆盖触发按钮的原生 tooltip（默认显示当前选中项）。 */
   title?: string
   /** 无可关联原生 label 时，为触发按钮提供可访问名称。 */
@@ -177,38 +200,63 @@ export function Select({ value, onChange, options, className = '', disabled: dis
   const displayLabel = selected?.label || value
   const displayTitle = selected?.title || displayLabel
   const disabled = disabledProp || options.length === 0
-  const { menuRect, updateMenuRect } = useSelectMenuRect(open, value, options.length, triggerRef)
+  const compact = size === 'sm'
+  const { menuRect, updateMenuRect } = useSelectMenuRect(open, value, options.length, triggerRef, triggerIcon || triggerLabel !== undefined ? (compact ? 156 : 200) : 0, compact)
   useSelectMenuOpen(open, setOpen, triggerRef, menuRef, updateMenuRect)
+
+  const triggerProps = {
+    ref: (node: HTMLButtonElement | null) => {
+      triggerRef.current = node
+      // Recheck after each commit: portalled options bypass a disabled fieldset.
+      if (open && node?.matches(':disabled')) setOpen(false)
+    },
+    disabled,
+    onClick: (event: React.MouseEvent<HTMLButtonElement>) => {
+      if (!event.currentTarget.matches(':disabled')) setOpen(v => !v)
+    },
+    onKeyDown: (event: React.KeyboardEvent<HTMLButtonElement>) => {
+      if (event.currentTarget.matches(':disabled')) return
+      if (event.key === 'ArrowDown' || event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault()
+        setOpen(true)
+      }
+    },
+    'aria-haspopup': 'listbox' as const,
+    'aria-expanded': open,
+    title: title ?? displayTitle,
+    'data-tauri-drag-region': 'false',
+  }
 
   return (
     <div className={`relative ${className}`}>
-      <button
-        ref={triggerRef}
-        type="button"
-        disabled={disabled}
-        onClick={() => setOpen(v => !v)}
-        onKeyDown={(event) => {
-          if (event.key === 'ArrowDown' || event.key === 'Enter' || event.key === ' ') {
-            event.preventDefault()
-            setOpen(true)
-          }
-        }}
-        className="kv-select kv-select-button relative h-[30px] w-full min-w-0 max-w-none text-left disabled:cursor-not-allowed disabled:opacity-50"
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        aria-label={ariaLabel}
-        title={title ?? displayTitle}
-        data-tauri-drag-region="false"
-      >
-        <span className="block truncate">{displayLabel}</span>
-        <ChevronDown
-          size={14}
-          strokeWidth={2.25}
-          className={`absolute right-2.5 top-1/2 -translate-y-1/2 text-neutral-400 dark:text-neutral-500 transition-transform ${open ? 'rotate-180' : ''}`}
-        />
-      </button>
+      {triggerLabel !== undefined ? (
+        <Button {...triggerProps} variant="ghost" size={size} className="max-w-full min-w-0" aria-label={ariaLabel}>
+          {triggerIcon && <span className="flex shrink-0 items-center">{triggerIcon}</span>}
+          <span className="min-w-0 truncate">{triggerLabel}</span>
+          <ChevronDown size={14} className={`shrink-0 transition-transform ${open ? 'rotate-180' : ''}`} aria-hidden="true" />
+        </Button>
+      ) : triggerIcon ? (
+        <IconButton {...triggerProps} size="sm" label={ariaLabel ?? displayLabel}>
+          {triggerIcon}
+        </IconButton>
+      ) : (
+        <button
+          {...triggerProps}
+          type="button"
+          className="kv-select kv-select-button relative h-[30px] w-full min-w-0 max-w-none text-left disabled:cursor-not-allowed disabled:opacity-50"
+          aria-label={ariaLabel}
+        >
+          <span className="block truncate">{displayLabel}</span>
+          <ChevronDown
+            size={14}
+            strokeWidth={2.25}
+            className={`absolute right-2.5 top-1/2 -translate-y-1/2 text-neutral-400 dark:text-neutral-500 transition-transform ${open ? 'rotate-180' : ''}`}
+          />
+        </button>
+      )}
 
       <SelectMenuPortal
+        compact={compact}
         open={open}
         triggerRef={triggerRef}
         menuRef={menuRef}
@@ -216,6 +264,7 @@ export function Select({ value, onChange, options, className = '', disabled: dis
         options={options}
         value={value}
         onPick={(next) => {
+          if (triggerRef.current?.matches(':disabled')) return
           onChange(next)
           setOpen(false)
           triggerRef.current?.focus()
@@ -334,19 +383,27 @@ export function Input({ value, onChange, type = 'text', placeholder = '', classN
  * 多行文本输入 — 默认 sans
  */
 export function TextArea({
+  variant = 'default',
+  maxRows,
   value,
   onChange,
   placeholder = '',
   rows = 2,
   mono = false,
+  className = '',
+  onContextMenu,
+  ...props
 }: {
   value: string
   onChange: (v: string) => void
   placeholder?: string
   rows?: number
   mono?: boolean
-}) {
-  const ref = useRef<HTMLTextAreaElement>(null)
+  variant?: 'default' | 'plain'
+  /** 设置后随内容增长，rows 为最小行数，maxRows 为上限。 */
+  maxRows?: number
+} & Omit<React.TextareaHTMLAttributes<HTMLTextAreaElement>, 'value' | 'onChange'>) {
+  const ref = useRef<HTMLTextAreaElement | null>(null)
   const caretRef = useRef<{ start: number; end: number } | null>(null)
   const [menu, setMenu] = useState<{ left: number; top: number; start: number; end: number } | null>(null)
 
@@ -359,7 +416,33 @@ export function TextArea({
     el.setSelectionRange(caret.start, caret.end)
   }, [value])
 
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el || maxRows === undefined) return
+    const resize = () => {
+      const style = getComputedStyle(el)
+      const line = parseFloat(style.lineHeight)
+      const inset = parseFloat(style.paddingTop) + parseFloat(style.paddingBottom)
+        + parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth)
+      el.style.height = '0px'
+      const height = Math.max(line * rows + inset, Math.min(el.scrollHeight + parseFloat(style.borderTopWidth) + parseFloat(style.borderBottomWidth), line * Math.max(rows, maxRows) + inset))
+      el.style.height = `${height}px`
+    }
+    resize()
+    if (typeof ResizeObserver === 'undefined') return
+    let width = el.clientWidth
+    const observer = new ResizeObserver(() => {
+      if (el.clientWidth === width) return
+      width = el.clientWidth
+      resize()
+    })
+    observer.observe(el)
+    return () => observer.disconnect()
+  }, [value, rows, maxRows])
+
   const applyEdit = (next: string, start: number, end: number) => {
+    const el = ref.current
+    if (!el || el.matches(':disabled') || el.readOnly) return
     caretRef.current = { start, end }
     onChange(next)
   }
@@ -367,14 +450,22 @@ export function TextArea({
   return (
     <>
       <textarea
-        ref={ref}
+        ref={node => {
+          ref.current = node
+          // Ancestor fieldset changes are visible only after the DOM commit.
+          if (menu && node?.matches(':disabled')) setMenu(null)
+        }}
+        {...props}
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder={placeholder}
         rows={rows}
-        className={`kv-textarea custom-scrollbar w-full ${mono ? 'mono' : ''}`}
+        className={`kv-textarea custom-scrollbar w-full ${variant === 'plain' ? 'plain' : ''} ${mono ? 'mono' : ''} ${className}`}
+        style={{ ...props.style, ...(maxRows === undefined ? {} : { resize: 'none' }) }}
         data-tauri-drag-region="false"
         onContextMenu={(event) => {
+          onContextMenu?.(event)
+          if (event.defaultPrevented || event.currentTarget.matches(':disabled')) return
           event.preventDefault()
           event.stopPropagation()
           const el = event.currentTarget
@@ -389,6 +480,8 @@ export function TextArea({
       {menu && (
         <TextEditContextMenu
           anchor={{ left: menu.left, top: menu.top }}
+          portalTarget={ref.current?.closest('dialog[open]') ?? document.body}
+          readOnly={props.readOnly || ref.current?.matches(':disabled')}
           hasSelection={menu.end > menu.start}
           onCut={() => {
             const { start, end } = menu
@@ -463,16 +556,20 @@ export function FieldBlock({
   description,
   children,
   className = '',
+  htmlFor,
 }: {
   label: ReactNode
   description?: string
   children: ReactNode
   className?: string
+  htmlFor?: string
 }) {
   return (
     <div className={`py-2 ${className}`}>
       <div className="mb-2">
-        <div className="kv-row-label">{label}</div>
+        {htmlFor
+          ? <label className="kv-row-label" htmlFor={htmlFor}>{label}</label>
+          : <div className="kv-row-label">{label}</div>}
         {description && <p className="kv-row-desc">{description}</p>}
       </div>
       {children}
@@ -508,7 +605,7 @@ export function SliderField({ label, value, min, max, step = 1, onChange, hint, 
     <div className="kv-row-stack">
       <div className="flex items-center justify-between gap-3">
         <span className="kv-row-label">{label}</span>
-        <span className="rounded-md border border-zinc-200 bg-white px-2 py-0.5 font-mono text-xs text-zinc-700 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-200">
+        <span className="rounded-md border border-zinc-200 bg-neutral-50 px-2 py-0.5 font-mono text-xs text-zinc-700">
           {value}{suffix}
         </span>
       </div>

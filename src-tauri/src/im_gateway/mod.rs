@@ -1032,6 +1032,7 @@ async fn ensure_conversation(gateway: &Arc<Gateway>, session_key: &str) -> Optio
         &gateway.app,
         state.inner(),
         None, None, None, None, None, None,
+        false, // reuse_blank（上游 3.1.1）：后台创建者必须拥有全新会话
     )
     .await
     {
@@ -1061,7 +1062,8 @@ async fn run_turn(app: &AppHandle, conv_id: &str, content: &str, timeout_sec: u6
         Vec::new(),
         None,
         None,
-        // plan_message_id：上游 2.9.9 新增的第 8 参，无头发送无计划消息。
+        // plan_message_id（上游 2.9.9）/ user_message_id（上游 3.1.1）：无头发送均传 None。
+        None,
         None,
     );
     let mut send = Box::pin(send);

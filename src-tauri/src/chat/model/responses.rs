@@ -34,6 +34,24 @@ use super::{
 /// 「关闭思考」不经这里：`resolve_thinking` 把 UI `off` 变成 `(enabled=false, level=None)`，
 /// 适配器在 `!thinking_enabled` 分支直接发 `reasoning.effort: "none"`。本函数只映射
 /// 真正的等级字符串（`low/medium/high/xhigh/max`，以及偶发透传的 `minimal`/`none`）。
+/// Codex CLI 身份下，请求体补齐成真实 Codex 的形状：它无条件发
+/// `include: [reasoning.encrypted_content]`、`parallel_tool_calls`，`prompt_cache_key` 是会话
+/// UUID 且与头里的 `session_id` 相同。只换 UA 不换体，网关一眼就能看出是伪装。
+/// 不改 `reasoning`（档位由用户选）、不编造会话（一次性调用没有缓存键）。
+fn apply_codex_cli_body(body: &mut Value, request: &GenerateRequest) {
+    if body.get("include").is_none() {
+        body["include"] = serde_json::json!(["reasoning.encrypted_content"]);
+    }
+    if body.get("tools").is_some() {
+        body["parallel_tool_calls"] = Value::Bool(true);
+    }
+    if body.get("prompt_cache_key").is_some() {
+        body["prompt_cache_key"] = Value::String(crate::provider_request::session_uuid(
+            request.metadata.conversation_id.as_deref(),
+        ));
+    }
+}
+
 fn xai_reasoning_effort(effort: &str) -> Option<&'static str> {
     match effort.trim().to_ascii_lowercase().as_str() {
         "none" | "off" => Some("none"),
@@ -160,19 +178,21 @@ impl OpenAiResponsesProvider<'_> {
             &self.provider.id,
             &self.provider.api_keys,
             |key| {
-                let req = crate::api::attach_json_body(
-                    crate::provider_request::apply(
-                        self.state
-                            .client_for(self.provider)
-                            .post(self.responses_url())
-                            .bearer_auth(key)
-                            .header(ACCEPT_ENCODING, "identity"),
-                        self.provider,
-                        request.metadata.conversation_id.as_deref(),
-                    ),
-                    body,
-                    self.provider.compress_request_body,
+                let mut req = self
+                    .state
+                    .client_for(self.provider)
+                    .post(self.responses_url())
+                    .header(ACCEPT_ENCODING, "identity");
+                req = crate::provider_request::apply_api_key_auth(
+                    req,
+                    crate::settings::ProviderApiFormat::OpenAiResponses,
+                    key,
                 );
+                for (name, value) in self.extra_header_pairs(&request.metadata, body) {
+                    req = req.header(name, value);
+                }
+                let req =
+                    crate::api::attach_json_body(req, body, self.provider.compress_request_body);
                 let req = if stream {
                     req
                 } else {
@@ -346,7 +366,7 @@ impl OpenAiResponsesProvider<'_> {
             ..Default::default()
         };
 
-        loop {
+        'stream: loop {
             let chunk = response.chunk().await.map_err(|err| {
                 let model_error = stream_read_error(&label, &err);
                 self.record_usage_failure(
@@ -388,11 +408,35 @@ impl OpenAiResponsesProvider<'_> {
                         started_at,
                         started.elapsed(),
                     );
-                    return Err(ModelError::new(err));
+                    return Err(ModelError::provider_stream_error(err));
+                }
+                // response.completed/incomplete includes final usage and is
+                // authoritative even if a proxy never closes the HTTP body.
+                if state.finish_reason.is_some() {
+                    break 'stream;
                 }
             }
         }
 
+        if state.finish_reason.is_none() {
+            let err = ModelError::stream_ended_early(&label);
+            self.record_usage_failure(
+                &request,
+                &label,
+                started_at,
+                started.elapsed(),
+                &err.to_string(),
+            );
+            self.record_debug_failure(
+                &request,
+                &label,
+                true,
+                &err.to_string(),
+                started_at,
+                started.elapsed(),
+            );
+            return Err(err);
+        }
         let output = state.finish(sink)?;
         self.record_usage_success(
             &request,
@@ -593,6 +637,12 @@ impl OpenAiResponsesProvider<'_> {
                 }
             }
         }
+        // 无状态：我们每轮都自带完整 input、从不用 previous_response_id，服务端存的副本没人用
+        // （`store` 默认 true）。pi 与 Codex 官方都无条件发 false，这里不再只在思考分支里发。
+        body["store"] = Value::Bool(false);
+        if crate::provider_request::is_codex_identity(self.provider) && !is_xai {
+            apply_codex_cli_body(&mut body, request);
+        }
         if let Some(overrides) = request.options.provider_options.as_object() {
             for (key, value) in overrides {
                 body[key] = value.clone();
@@ -605,11 +655,12 @@ impl OpenAiResponsesProvider<'_> {
     }
 
     /// 重建本次请求实际会带的 headers（脱敏后）供请求调试面板展示。镜像发送路径：
-    /// bearer_auth(key) + Accept-Encoding identity + JSON content-type。
+    /// bearer_auth(key) + Accept-Encoding identity + JSON content-type + `extra_header_pairs`。
     /// Authorization 用首个 key（正常发送用的也是它）派生脱敏预览。
     fn debug_request_headers(
         &self,
         metadata: &crate::chat::model::RequestMetadata,
+        body: &Value,
     ) -> std::collections::BTreeMap<String, String> {
         let mut headers = std::collections::BTreeMap::new();
         if let Some(key) = self.provider.preferred_api_key() {
@@ -617,13 +668,28 @@ impl OpenAiResponsesProvider<'_> {
         }
         headers.insert("Accept-Encoding".to_string(), "identity".to_string());
         headers.insert("Content-Type".to_string(), "application/json".to_string());
-        for (name, value) in crate::provider_request::header_pairs(
-            self.provider,
-            metadata.conversation_id.as_deref(),
-        ) {
+        for (name, value) in self.extra_header_pairs(metadata, body) {
             headers.insert(name, value);
         }
         crate::chat::request_debug::sanitize_headers(headers)
+    }
+
+    /// 发送路径与请求调试面板共用的附加头：会话亲和头（与 Chat Completions 一致）+
+    /// CLI 身份 / 自定义 / OAuth 头 + 缺省 UA / Accept。
+    /// Codex 身份不发亲和头：真实 Codex 不带 `x-session-id`，而且值是 `conv_*`，
+    /// 和身份头里的 UUID `session_id` 摆在一起就露馅了。
+    /// Accept 按**最终请求体**的 `stream` 取值：Codex OAuth 会把体强制改成流式。
+    fn extra_header_pairs(
+        &self,
+        metadata: &crate::chat::model::RequestMetadata,
+        body: &Value,
+    ) -> Vec<(String, String)> {
+        crate::provider_request::model_header_pairs(
+            self.provider,
+            metadata.conversation_id.as_deref(),
+            !crate::provider_request::is_codex_identity(self.provider),
+            body["stream"] == true,
+        )
     }
 
     /// 记录一次成功调用到请求调试缓冲。开关关时首行短路（零开销）。
@@ -639,6 +705,7 @@ impl OpenAiResponsesProvider<'_> {
         if !self.state.request_debug_enabled() {
             return;
         }
+        let body = self.request_body(request, stream);
         let record = crate::chat::request_debug::build_debug_record(
             crate::chat::request_debug::DebugRecordArgs {
                 provider: self.provider,
@@ -648,8 +715,8 @@ impl OpenAiResponsesProvider<'_> {
                 duration_ms: duration.as_millis() as u64,
                 status: "success",
                 url: self.responses_url(),
-                headers: self.debug_request_headers(&request.metadata),
-                body: self.request_body(request, stream),
+                headers: self.debug_request_headers(&request.metadata, &body),
+                body,
                 stream,
                 response: crate::chat::request_debug::RequestDebugResponse::from_output(
                     output,
@@ -673,6 +740,7 @@ impl OpenAiResponsesProvider<'_> {
         if !self.state.request_debug_enabled() {
             return;
         }
+        let body = self.request_body(request, stream);
         let record = crate::chat::request_debug::build_debug_record(
             crate::chat::request_debug::DebugRecordArgs {
                 provider: self.provider,
@@ -682,8 +750,8 @@ impl OpenAiResponsesProvider<'_> {
                 duration_ms: duration.as_millis() as u64,
                 status: "error",
                 url: self.responses_url(),
-                headers: self.debug_request_headers(&request.metadata),
-                body: self.request_body(request, stream),
+                headers: self.debug_request_headers(&request.metadata, &body),
+                body,
                 stream,
                 response: crate::chat::request_debug::RequestDebugResponse::from_error(
                     error,
@@ -816,13 +884,6 @@ struct ResponsesStreamState {
 }
 
 impl ResponsesStreamState {
-    fn has_usable_output(&self) -> bool {
-        !self.text.trim().is_empty()
-            || !self.reasoning.trim().is_empty()
-            || !self.tool_calls.is_empty()
-            || !self.images.is_empty()
-    }
-
     fn partial_mut(&mut self, item_id: &str) -> Option<&mut ResponsesToolPartial> {
         self.tool_calls
             .iter_mut()
@@ -1265,6 +1326,11 @@ fn handle_responses_stream_event(
         "response.completed" | "response.incomplete" => {
             if let Some(response) = value.get("response") {
                 if let Some(usage) = model_usage_from_openai_value(response) {
+                    if let Some(input_tokens) = usage.input_tokens {
+                        sink.emit(StreamPart::ContextUsage {
+                            input_tokens, output_tokens: usage.output_tokens.unwrap_or(0),
+                        })?;
+                    }
                     state.usage = Some(usage);
                 }
                 if let Some(status) = response.get("status").and_then(Value::as_str) {
@@ -1303,11 +1369,6 @@ fn handle_responses_stream_event(
         }
         "response.failed" | "error" => {
             let message = responses_stream_error_text(value);
-            // Gemini 等上游常不发 response.completed；中转会在正文已经流完后补一条
-            // 「缺终态」error。有可用输出时当成功收尾，别把已经生成的回答整轮作废。
-            if super::is_missing_stream_terminal_error(&message) && state.has_usable_output() {
-                return Ok(None);
-            }
             return Ok(Some(message));
         }
         _ => {}
@@ -1361,7 +1422,7 @@ fn output_from_sse_body(body: &str) -> Result<GenerateOutput, ModelError> {
     let mut sink = DiscardSink;
     for line in body.split('\n') {
         if let Some(err) = process_sse_line(line, &mut state, &mut sink)? {
-            return Err(ModelError::new(err));
+            return Err(ModelError::provider_stream_error(err));
         }
     }
     state.finish(&mut sink)
@@ -1710,7 +1771,7 @@ fn responses_error_message(error: &Value) -> String {
 
 /// `response.failed` 把原因放在 `response.error`；OpenAI 的 `type: error` 事件把
 /// `message` 放在顶层；部分中转把 `error` 直接写成字符串。三条都要读到，否则缺终态
-/// 的那条文案会变成笼统的 "Responses stream failed"，后面的 salvage 对不上。
+/// 的那条文案会变成笼统的 "Responses stream failed"，无法正确识别可重试错误。
 fn responses_stream_error_text(value: &Value) -> String {
     let nested = value
         .get("response")
@@ -1720,14 +1781,25 @@ fn responses_stream_error_text(value: &Value) -> String {
         if let Some(text) = error.as_str().map(str::trim).filter(|s| !s.is_empty()) {
             return text.to_string();
         }
-        return responses_error_message(error);
+        let message = responses_error_message(error);
+        return match error
+            .get("code")
+            .or_else(|| error.get("type"))
+            .and_then(Value::as_str)
+        {
+            Some(code) => format!("{message} ({code})"),
+            None => message,
+        };
     }
     value
         .get("message")
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(str::to_string)
+        .map(|message| match value.get("code").and_then(Value::as_str) {
+            Some(code) => format!("{message} ({code})"),
+            None => message.to_string(),
+        })
         .unwrap_or_else(|| "Responses stream failed".to_string())
 }
 
@@ -1966,6 +2038,132 @@ mod tests {
         assert_eq!(body["prompt_cache_key"], "conv_abc");
         assert!(body.get("prompt_cache_retention").is_none());
         assert_eq!(body["input"][0]["role"], "user");
+    }
+
+    fn codex_identity_case(
+        cli_identity: &str,
+        thinking: bool,
+    ) -> (Value, std::collections::BTreeMap<String, String>) {
+        let state = crate::state::AppState::new_headless(
+            crate::settings::Settings::default(),
+            std::env::temp_dir(),
+        );
+        let mut provider = ModelProvider {
+            id: "test".into(),
+            name: "Relay".into(),
+            api_keys: vec!["sk-test".into()],
+            api_key_legacy: None,
+            base_url: "https://relay.example/v1".into(),
+            available_models: vec!["gpt-5.5".into()],
+            enabled_models: vec!["gpt-5.5".into()],
+            enabled: true,
+            api_format: "openai_responses".into(),
+            model_overrides: Default::default(),
+            compress_request_body: false,
+            request: Default::default(),
+            active_key_index: 0,
+        };
+        provider.request.cli_identity = cli_identity.into();
+        provider.request.prompt_caching = Some(true);
+        let request = GenerateRequest {
+            model: "gpt-5.5".into(),
+            system: "sys".into(),
+            messages: vec![ModelMessage {
+                role: ModelRole::User,
+                content: vec![MessagePart::Text { text: "hi".into() }],
+            }],
+            tools: vec![crate::chat::model::ModelTool {
+                id: "read".into(),
+                name: "read".into(),
+                description: "read".into(),
+                source: "native".into(),
+                server_id: None,
+                server_name: None,
+                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                sensitive: false,
+            }],
+            options: GenerateOptions {
+                thinking_enabled: thinking,
+                ..Default::default()
+            },
+            metadata: crate::chat::model::RequestMetadata {
+                conversation_id: Some("conv_abc".into()),
+                ..Default::default()
+            },
+        };
+        let adapter = OpenAiResponsesProvider::new(&state, &provider, 1);
+        (
+            adapter.request_body(&request, false),
+            adapter
+                .debug_request_headers(&request.metadata, &adapter.request_body(&request, false)),
+        )
+    }
+
+    #[test]
+    fn plain_responses_sends_store_false_and_session_headers() {
+        // 关思考的普通调用也要无状态，不再只在思考分支里发。
+        let (body, headers) = codex_identity_case("", false);
+        assert_eq!(body["store"], false, "{body}");
+        assert!(body.get("parallel_tool_calls").is_none());
+        assert_eq!(body["prompt_cache_key"], "conv_abc");
+        assert_eq!(headers["x-session-id"], "conv_abc");
+        assert!(headers["User-Agent"].starts_with("Kivio/"));
+        assert_eq!(headers["Accept"], "application/json");
+    }
+
+    #[test]
+    fn accept_follows_final_body_stream_flag() {
+        let state = crate::state::AppState::new_headless(
+            crate::settings::Settings::default(),
+            std::env::temp_dir(),
+        );
+        let provider = ModelProvider {
+            id: "test".into(),
+            name: "Relay".into(),
+            api_keys: vec!["sk-test".into()],
+            api_key_legacy: None,
+            base_url: "https://relay.example/v1".into(),
+            available_models: vec!["gpt-5.5".into()],
+            enabled_models: vec!["gpt-5.5".into()],
+            enabled: true,
+            api_format: "openai_responses".into(),
+            model_overrides: Default::default(),
+            compress_request_body: false,
+            request: Default::default(),
+            active_key_index: 0,
+        };
+        let adapter = OpenAiResponsesProvider::new(&state, &provider, 1);
+        let metadata = Default::default();
+        // SSE 请求不能报 Accept: application/json（Codex OAuth 会把体强制改成 stream:true）。
+        let streaming = serde_json::json!({ "stream": true });
+        assert_eq!(
+            adapter.debug_request_headers(&metadata, &streaming)["Accept"],
+            "text/event-stream"
+        );
+        assert_eq!(
+            adapter.debug_request_headers(&metadata, &serde_json::json!({}))["Accept"],
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn codex_identity_aligns_responses_body_with_headers() {
+        let (body, headers) = codex_identity_case("codex", false);
+        let session = crate::provider_request::session_uuid(Some("conv_abc"));
+        // prompt_cache_key 与头里的 session_id 同值，且是 UUID。
+        assert_eq!(body["prompt_cache_key"], session.as_str());
+        assert_eq!(headers["session_id"], session);
+        assert_eq!(headers["originator"], "codex_cli_rs");
+        assert!(!headers.contains_key("x-session-id"), "{headers:?}");
+        assert!(!headers.contains_key("x-session-affinity"), "{headers:?}");
+        assert_eq!(body["store"], false);
+        assert_eq!(body["parallel_tool_calls"], true);
+        assert_eq!(
+            body["include"],
+            serde_json::json!(["reasoning.encrypted_content"])
+        );
+        // 不擅自改用户选的思考档位。
+        assert_eq!(body["reasoning"]["effort"], "none");
     }
 
     #[test]
@@ -2757,40 +2955,48 @@ mod tests {
         assert_eq!(output.finish_reason.as_deref(), Some("stop"));
     }
 
-    /// A terminal `response.failed` event in the SSE body surfaces as a `ModelError`.
+    /// Both official top-level error codes and nested relay codes preserve
+    /// their retryability; unknown errors remain failures without auto-replay.
     #[test]
     fn sse_body_fallback_surfaces_provider_error() {
-        let body = concat!(
-            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"boom\"}}}\n",
-        );
-        let err = output_from_sse_body(body).expect_err("should error");
-        assert!(err.to_string().contains("boom"));
+        for (event, retryable) in [
+            (
+                serde_json::json!({"type":"response.failed","response":{"error":{"message":"boom"}}}),
+                false,
+            ),
+            (
+                serde_json::json!({"type":"error","code":"server_error","message":"boom"}),
+                true,
+            ),
+            (
+                serde_json::json!({"type":"response.failed","response":{"error":{"code":"server_error","message":"boom"}}}),
+                true,
+            ),
+            (
+                serde_json::json!({"type":"error","code":"invalid_api_key","message":"boom"}),
+                false,
+            ),
+        ] {
+            let err =
+                output_from_sse_body(&format!("data: {event}\n")).expect_err("provider failure");
+            assert!(err.to_string().contains("boom"));
+            assert_eq!(err.is_stream_read_interrupted(), retryable, "{event}");
+        }
     }
 
-    /// 中转在正文已经流完后补一条「缺 response.completed」error：token 是真的，当成功收尾。
+    /// Partial text cannot prove completion; relay missing-terminal errors must retry.
     #[test]
-    fn missing_completed_event_after_text_is_success() {
-        let nested = concat!(
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\n",
-            "data: {\"type\":\"error\",\"error\":{\"message\":\"stream ended without terminal event or completed response\"}}\n",
-        );
-        let nested_output = output_from_sse_body(nested).expect("should keep streamed text");
-        assert_eq!(nested_output.text, "你好");
-        assert_eq!(nested_output.finish_reason.as_deref(), Some("stop"));
-
-        let top_level = concat!(
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\n",
-            "data: {\"type\":\"error\",\"message\":\"stream ended without terminal event or completed response\"}\n",
-        );
-        let top_level_output = output_from_sse_body(top_level).expect("top-level error message");
-        assert_eq!(top_level_output.text, "你好");
-
-        let failed = concat!(
-            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}\n",
-            "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"stream ended without terminal event or completed response\"}}}\n",
-        );
-        let failed_output = output_from_sse_body(failed).expect("response.failed after text");
-        assert_eq!(failed_output.text, "你好");
+    fn missing_completed_event_after_text_is_interrupted() {
+        for error in [
+            serde_json::json!({"type":"error","error":{"message":"stream ended without terminal event or completed response"}}),
+            serde_json::json!({"type":"error","message":"stream ended without terminal event or completed response"}),
+            serde_json::json!({"type":"response.failed","response":{"error":{"message":"stream ended without terminal event or completed response"}}}),
+        ] {
+            let body = format!("data: {{\"type\":\"response.output_text.delta\",\"delta\":\"你好\"}}\ndata: {error}\n");
+            let err =
+                output_from_sse_body(&body).expect_err("partial stream must not count as success");
+            assert!(err.is_stream_read_interrupted(), "{err}");
+        }
     }
 
     /// 没有可用输出时，同一条缺终态 error 仍是失败——不能把空流当成成功。

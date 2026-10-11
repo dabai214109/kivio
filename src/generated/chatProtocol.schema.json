@@ -152,6 +152,21 @@
     "ChatContextStatePayload": {
       "additionalProperties": false,
       "properties": {
+        "autoCompactThresholdTokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cacheHitRate": {
+          "format": "double",
+          "type": [
+            "number",
+            "null"
+          ]
+        },
         "clearBoundaries": {
           "items": {
             "$ref": "#/$defs/ChatContextClearBoundaryPayload"
@@ -218,6 +233,26 @@
         "lastMeasuredAt": {
           "format": "int64",
           "type": "integer"
+        },
+        "lifecycleId": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "measurementSeq": {
+          "default": 0,
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "reportedContextTokens": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
         },
         "segments": {
           "items": {
@@ -356,11 +391,53 @@
     "ChatContextUsagePayload": {
       "additionalProperties": false,
       "properties": {
+        "cacheInputTokens": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "cacheReadTokens": {
+          "default": null,
+          "format": "uint64",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
         "contextWindowTokens": {
           "format": "uint64",
           "minimum": 0,
           "type": [
             "integer",
+            "null"
+          ]
+        },
+        "lifecycleId": {
+          "default": 0,
+          "description": "Bumped on model change, compaction, and context clear.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "measurementSeq": {
+          "default": 0,
+          "description": "Monotonic per conversation. A lower value must not replace a newer meter.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
+        "segments": {
+          "description": "Request-bound categories. Null leaves the previous categories; an empty array clears them.",
+          "items": {
+            "$ref": "#/$defs/ChatContextUsageSegmentPayload"
+          },
+          "type": [
+            "array",
             "null"
           ]
         },
@@ -385,6 +462,11 @@
     "ChatContextUsageSegmentPayload": {
       "additionalProperties": false,
       "properties": {
+        "chars": {
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        },
         "color": {
           "type": [
             "string",
@@ -406,7 +488,8 @@
       "required": [
         "id",
         "label",
-        "estimatedTokens"
+        "estimatedTokens",
+        "chars"
       ],
       "type": "object"
     },
@@ -1038,6 +1121,80 @@
           "required": [
             "type",
             "delta",
+            "protocolVersion",
+            "scope",
+            "conversationId",
+            "runId",
+            "messageId",
+            "seq",
+            "baseRevision"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "Remove only uncommitted output from the model request being retried.\nCounts are Unicode scalar values, not UTF-8 bytes or UTF-16 code units.",
+          "properties": {
+            "baseRevision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "conversationId": {
+              "type": "string"
+            },
+            "messageId": {
+              "type": "string"
+            },
+            "protocolVersion": {
+              "const": 1,
+              "type": "integer"
+            },
+            "reasoningChars": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "runId": {
+              "type": "string"
+            },
+            "scope": {
+              "const": "run",
+              "type": "string"
+            },
+            "segmentIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "textChars": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "toolIds": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": {
+              "const": "stream_attempt_discarded",
+              "type": "string"
+            }
+          },
+          "required": [
+            "type",
+            "textChars",
+            "reasoningChars",
+            "segmentIds",
+            "toolIds",
             "protocolVersion",
             "scope",
             "conversationId",

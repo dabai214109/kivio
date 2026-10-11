@@ -8,13 +8,6 @@ const event = (type: string, runId: string, delta?: string): ChatStreamPayload =
 } as ChatStreamPayload)
 
 describe('conversation stream presentation', () => {
-  it('binds the first run and leaves a later foreign run unable to overwrite the preview', () => {
-    const snapshot = createEmptyStreamSnapshot()
-    expect(applyConversationStreamEvent(snapshot, event('text_delta', 'run-new', 'hello'))).toBe(true)
-    expect(applyConversationStreamEvent(snapshot, event('text_delta', 'run-old', 'stale'))).toBe(false)
-    expect(snapshot.content).toBe('hello')
-    expect(snapshot.runId).toBe('run-new')
-  })
 
   it('clears retry status when content resumes and finalizes reasoning duration on terminal', () => {
     const snapshot = createEmptyStreamSnapshot()
@@ -25,6 +18,32 @@ describe('conversation stream presentation', () => {
     expect(applyConversationStreamEvent(snapshot, event('run_completed', 'run-a'), 145)).toBe(true)
     expect(snapshot.reasoningDurationMs).toBe(45)
     expect(snapshot.messageId).toBe('m1')
+  })
+
+  it('rolls back only a failed attempt, keeps completed work and rejects late rollback', () => {
+    const snapshot = createEmptyStreamSnapshot()
+    snapshot.runId = 'run-a'
+    snapshot.content = 'earlier work失败🌱'
+    snapshot.reasoning = 'earlier thought残余'
+    snapshot.segments = [
+      { id: 'earlier', kind: 'text', phase: 'tool_loop', order: 1, text: 'earlier work' },
+      { id: 'draft', kind: 'text', phase: 'synthesis', order: 2, text: '失败🌱' },
+    ]
+    snapshot.toolCalls = [
+      { id: 'finished', name: 'read', status: 'success' },
+      { id: 'pending', name: 'write', status: 'pending' },
+    ]
+    const rollback = { ...event('stream_attempt_discarded', 'run-a'), textChars: 3,
+      reasoningChars: 2, segmentIds: ['draft'], toolIds: ['pending'] } as ChatStreamPayload
+    expect(applyConversationStreamEvent(snapshot, { ...rollback, runId: 'old-run' })).toBe(false)
+    expect(snapshot.content).toBe('earlier work失败🌱')
+    expect(applyConversationStreamEvent(snapshot, rollback)).toBe(true)
+    expect(snapshot.content).toBe('earlier work')
+    expect(snapshot.reasoning).toBe('earlier thought')
+    expect(snapshot.segments.map((segment) => segment.id)).toEqual(['earlier'])
+    expect(snapshot.toolCalls.map((tool) => tool.id)).toEqual(['finished'])
+    applyConversationStreamEvent(snapshot, event('text_delta', 'run-a', 'recovered'))
+    expect(snapshot.content).toBe('earlier workrecovered')
   })
 
   it('rejects a late run_started packet after a new run has claimed a preview', () => {

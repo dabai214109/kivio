@@ -740,7 +740,7 @@ mod tests {
     fn oauth_destination_and_protocol_are_bound_before_credentials_are_read() {
         let mut p = provider();
         assert!(validate_provider(&p).is_ok());
-        assert!(p.has_credentials());
+        assert!(p.authentication_ready());
         for base in [
             "http://chatgpt.com/backend-api/codex",
             "https://chatgpt.com.evil.test/backend-api/codex",
@@ -755,7 +755,7 @@ mod tests {
         assert!(validate_provider(&p).is_err());
         p.request.oauth.as_mut().unwrap().credential_id = None;
         p.api_keys = vec!["old-api-key".into()];
-        assert!(!p.has_credentials());
+        assert!(!p.authentication_ready());
     }
     #[test]
     fn codex_account_headers_override_custom_headers_without_duplicates() {
@@ -783,6 +783,15 @@ mod tests {
         );
         assert!(pairs.contains(&("originator".into(), "kivio".into())));
         assert!(pairs.contains(&("ChatGPT-Account-Id".into(), "account-123".into())));
+
+        // 同时选了 Codex 身份：OAuth 的 originator / UA 覆盖身份预设，配套的 version 不留。
+        p.request.cli_identity = "codex".into();
+        let pairs = crate::provider_request::header_pairs(&p, None);
+        assert!(pairs.contains(&("originator".into(), "kivio".into())));
+        assert!(!pairs.iter().any(|(k, _)| k.eq_ignore_ascii_case("version")));
+        assert!(pairs
+            .iter()
+            .any(|(k, v)| k == "User-Agent" && v.starts_with("Kivio/")));
     }
     #[tokio::test]
     #[ignore = "Uses temporary synthetic credentials in the native OS credential store"]

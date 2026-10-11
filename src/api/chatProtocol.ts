@@ -27,7 +27,10 @@ const MAX_PENDING_EVENTS = 500
 const ajv = new Ajv2020({
   allErrors: true,
   strict: false,
-  formats: { float: true, uint8: true, uint32: true, uint64: true, int64: true },
+  formats: {
+    float: true, uint8: true, uint32: true, uint64: true, int64: true,
+    double: { type: 'number', validate: Number.isFinite },
+  },
 })
 const validateEvent = ajv.compile(schema)
 const validateSync = ajv.compile(syncSchema)
@@ -345,6 +348,9 @@ function applySnapshot(snapshot: ChatRunSnapshot) {
   }
   for (const warning of snapshot.warnings) {
     dispatch(syntheticEnvelope(snapshot, warning), restored)
+  }
+  if (snapshot.statusNote) {
+    dispatch(syntheticEnvelope(snapshot, { type: 'status_note_updated', note: snapshot.statusNote }), restored)
   }
   if (snapshot.terminal) dispatch(syntheticEnvelope(snapshot, snapshot.terminal), restored)
 }

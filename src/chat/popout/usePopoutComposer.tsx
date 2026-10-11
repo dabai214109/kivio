@@ -11,13 +11,12 @@ import { isPluginManagedServer, preservePluginManagedServers } from '../../setti
 import { i18n, type Lang } from '../../components/i18n'
 import { hasEnabledNativeBuiltinTool, hasEnabledSkillRuntime } from '../../api/chatTools'
 import { chatApi, type AgentRuntimeConfig } from '../api'
-import { insertTextIntoComposer } from '../composerInsert'
-import { mergeCompactionContextState } from '../compactionBoundary'
-import { applyLiveContextUsage } from '../contextPanel'
-import { mergeClearContextState } from '../contextClearBoundary'
+import { setGoalDraftMode, useGoalDraft } from '../goalPresentation'
+import { keepNewerContextMeasurement, mergeContextMeasurement } from '../contextPanel'
 import { ContextIndicator } from '../ContextIndicator'
 import { dockApi } from '../dock/api'
 import { useTauriEvent } from '../hooks/useTauriEvent'
+import { keepNewerTodoState } from '../agentTodoState'
 import type { InputBarProps } from '../InputBar'
 import {
   deriveDshPresetModes,
@@ -98,7 +97,10 @@ function applyConversationMeta(
   setConversation((prev) => {
     if (!prev || prev.id !== updated.id) return updated
     if (updated.revision < prev.revision) return prev
-    return { ...updated, messages: prev.messages }
+    return {
+      ...keepNewerContextMeasurement(keepNewerTodoState(updated, prev), prev),
+      messages: prev.messages,
+    }
   })
 }
 
@@ -170,15 +172,16 @@ export function usePopoutComposer({
     ?? 'act'
   const currentGoal = conversation?.goal_state ?? conversation?.goalState
   const goalActive = !!currentGoal && !['completed', 'cancelled'].includes(currentGoal.status)
+  const goalDraft = useGoalDraft(conversationId)
   const composerModes = useMemo(
     () => derivePermissionModes({
       target: 'composer',
       agentRuntime: runtime,
       agents: detectedExternalAgents,
       agentPlanMode: activeAgentPlanMode,
-      goalActive,
+      goalActive: goalActive || goalDraft,
     }),
-    [runtime, detectedExternalAgents, activeAgentPlanMode, goalActive],
+    [runtime, detectedExternalAgents, activeAgentPlanMode, goalActive, goalDraft],
   )
   const composerPresets = useMemo(
     () => deriveDshPresetModes(runtime, dshCustomPresets),
@@ -191,7 +194,7 @@ export function usePopoutComposer({
 
   const patchContextState = useCallback((nextState: ConversationContextState) => {
     setContextState((prev) => {
-      const merged = mergeClearContextState(prev, mergeCompactionContextState(prev, nextState))
+      const merged = mergeContextMeasurement(prev, { kind: 'snapshot', state: nextState })
       setConversation((current) => current
         ? { ...current, context_state: merged, contextState: merged }
         : current)
@@ -380,8 +383,7 @@ export function usePopoutComposer({
     if (payload.conversationId !== conversationIdRef.current) return
     if (payload.live) {
       setContextState((prev) => {
-        const next = applyLiveContextUsage(prev, payload.live!)
-        if (!next || next === prev) return prev
+        const next = mergeContextMeasurement(prev, { kind: 'live', usage: payload.live! })
         setConversation((current) => current
           ? { ...current, context_state: next, contextState: next }
           : current)
@@ -397,13 +399,17 @@ export function usePopoutComposer({
   useTauriEvent(api.onChatCompaction, (payload) => {
     if (payload.conversationId !== conversationIdRef.current) return
     if (payload.trigger !== 'manual') {
-      setContextCompressing(payload.phase === 'started')
+      setContextCompressing(payload.phase === 'started' || payload.phase === 'retrying')
     }
   }, [])
 
   const handleRefreshContext = useCallback(() => {
     void refreshContextStats()
   }, [refreshContextStats])
+
+  const handleStopCompression = useCallback(() => {
+    void chatApi.cancelStream(conversationId).catch((err) => setContextError(String(err)))
+  }, [conversationId])
 
   const handleCompressContext = useCallback(async () => {
     if (contextCompressing) return
@@ -544,7 +550,7 @@ export function usePopoutComposer({
       return
     }
     if (value === 'goal') {
-      if (!goalActive) insertTextIntoComposer('/goal ')
+      if (!goalActive) setGoalDraftMode(conversationId, true)
       return
     }
     if (goalActive) {
@@ -552,6 +558,7 @@ export function usePopoutComposer({
       setConversation(paused)
     }
     await handleAgentPlanModeChange(value as AgentPlanMode)
+    setGoalDraftMode(conversationId, false)
   }, [conversationId, goalActive, handleAgentPlanModeChange, runtime, setConversation, usesExternalRuntime])
 
   const handleExternalPresetChange = useCallback(async (preset: string) => {
@@ -633,6 +640,7 @@ export function usePopoutComposer({
         usesExternalRuntime={usesExternalRuntime}
         onRefresh={handleRefreshContext}
         onCompress={handleCompressContext}
+        onStopCompression={handleStopCompression}
         onClear={usesExternalRuntime ? undefined : handleClearContext}
         lang={lang}
       />
@@ -645,6 +653,7 @@ export function usePopoutComposer({
       displayMessages,
       handleClearContext,
       handleCompressContext,
+      handleStopCompression,
       handleRefreshContext,
       lang,
       streaming,
@@ -655,6 +664,8 @@ export function usePopoutComposer({
   const usageSlot = useMemo(
     () => (
       <SessionUsageStrip
+        conversationId={conversation?.id}
+        generating={streaming}
         messages={displayMessages}
         lang={lang}
         apiFormats={providerApiFormats}
@@ -672,13 +683,14 @@ export function usePopoutComposer({
       lang,
       providerApiFormats,
       runtime.externalAgentId,
+      streaming,
       usesExternalRuntime,
     ],
   )
 
   return {
     onSend: send,
-    disabled,
+    disabled: disabled || contextCompressing,
     onCancel,
     cancelVisible,
     cancelling,

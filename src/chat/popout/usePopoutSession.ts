@@ -10,6 +10,8 @@ import {
   type AgentRuntimeConfig,
 } from '../api'
 import { useTauriEvent } from '../hooks/useTauriEvent'
+import { keepNewerTodoState, patchTodoState } from '../agentTodoState'
+import { keepNewerContextMeasurement } from '../contextPanel'
 import { userPromptEventToRecord } from '../streamApply'
 import { createChatExecutionOwner } from '../chatExecutionOwner'
 import { createChatStreamLifecycleOwner, type StreamLifecycleResult } from '../chatStreamLifecycleOwner'
@@ -62,7 +64,7 @@ export function usePopoutSession(conversationId: string, lang: Lang) {
   const acceptPersistedConversation = useCallback((next: Conversation) => {
     setConversation((current) => current?.id === next.id && current.revision > next.revision
       ? current
-      : next)
+      : keepNewerContextMeasurement(keepNewerTodoState(next, current), current))
   }, [])
 
   useEffect(() => {
@@ -73,7 +75,7 @@ export function usePopoutSession(conversationId: string, lang: Lang) {
     setLoadError('')
     void chatApi.getConversation(conversationId).then((conv) => {
       if (cancelled) return
-      setConversation(conv)
+      acceptPersistedConversation(conv)
       void syncChatProtocol(conversationId).catch(() => {})
     }).catch((err) => {
       if (cancelled) return
@@ -91,7 +93,7 @@ export function usePopoutSession(conversationId: string, lang: Lang) {
       previewOwner.dispose()
       resetStreamStore()
     }
-  }, [conversationId, executionOwner, previewOwner])
+  }, [acceptPersistedConversation, conversationId, executionOwner, previewOwner])
 
   // The preview is replaced only after React commits the authoritative twin.
   useEffect(() => {
@@ -212,7 +214,7 @@ export function usePopoutSession(conversationId: string, lang: Lang) {
     if (payload.conversationId !== conversationIdRef.current) return
     const todoState = payload.todoState as AgentTodoState
     setConversation((current) => current
-      ? { ...current, agent_todo_state: todoState, agentTodoState: todoState }
+      ? patchTodoState(current, todoState, payload.revision)
       : current)
   }, [])
 
@@ -289,7 +291,7 @@ export function usePopoutSession(conversationId: string, lang: Lang) {
       const startedAt = Date.now()
       lease = executionOwner.begin({
         conversationId, kind: 'send', startedAt, claim,
-        optimistic: { content: trimmed, attachments, stored: conv.messages },
+        optimistic: { content: trimmed, attachments },
         group: fanOut ? {
           groupId: `grp-local-${startedAt}`,
           arms: replyArms.map((ref) => ({ providerId: ref.provider_id, model: ref.model })),
@@ -372,23 +374,23 @@ export function usePopoutSession(conversationId: string, lang: Lang) {
 
   const handleModelChange = useCallback(async (providerId: string, model: string) => {
     const next = await chatApi.updateConversation(conversationId, { providerId, model })
-    setConversation(next)
-  }, [conversationId])
+    acceptPersistedConversation(next)
+  }, [acceptPersistedConversation, conversationId])
 
   const handleThinkingLevelChange = useCallback(async (level: ThinkingLevel | null) => {
     const next = await chatApi.updateConversation(conversationId, { thinkingLevel: level })
-    setConversation(next)
-  }, [conversationId])
+    acceptPersistedConversation(next)
+  }, [acceptPersistedConversation, conversationId])
 
   const handleRuntimeChange = useCallback(async (runtime: AgentRuntimeConfig) => {
     if (conversation && agentRuntimesEqual(normalizeAgentRuntime(conversation), runtime)) return
     const goal = conversation?.goal_state ?? conversation?.goalState
     if (goal && !['completed', 'cancelled', 'paused'].includes(goal.status)) {
-      setConversation(await chatApi.pauseGoal(conversationId))
+      acceptPersistedConversation(await chatApi.pauseGoal(conversationId))
     }
     const next = await chatApi.setAgentRuntime(conversationId, runtime)
-    setConversation(next)
-  }, [conversation, conversationId])
+    acceptPersistedConversation(next)
+  }, [acceptPersistedConversation, conversation, conversationId])
 
   const handleExternalModelChange = useCallback(async (model: string, reasoning?: string | null) => {
     const current = normalizeAgentRuntime(conversation)
@@ -420,14 +422,14 @@ export function usePopoutSession(conversationId: string, lang: Lang) {
     continueWhenActive = false,
   ) => {
     const updated = await mutation(conversationId)
-    setConversation(updated)
+    acceptPersistedConversation(updated)
     const goal = updated.goal_state ?? updated.goalState
     if (continueWhenActive && goal && (goal.status === 'active' || goal.status === 'verifying')) {
-      void chatApi.continueGoal(conversationId).then(setConversation).catch((error) => {
+      void chatApi.continueGoal(conversationId).then(acceptPersistedConversation).catch((error) => {
         setStreamCoarse({ streamError: error instanceof Error ? error.message : String(error) })
       })
     }
-  }, [conversationId])
+  }, [acceptPersistedConversation, conversationId])
 
   const displayMessages = executionOwner.overlayMessages(conversation?.id, conversation?.messages ?? [])
 

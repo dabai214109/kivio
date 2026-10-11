@@ -6,7 +6,9 @@ use std::{
     },
 };
 
+use super::agent::context_measure::LiveContextMeasurement;
 use super::agent::SteeringMessage;
+use super::types::ContextUsageSegment;
 
 /// Process-local ownership for Chat run coordination.
 ///
@@ -17,6 +19,9 @@ use super::agent::SteeringMessage;
 pub(crate) struct ChatRuntimeState {
     next_generation: AtomicU64,
     runs: Mutex<ChatRunIndexes>,
+    /// Signalled whenever a conversation's last reply slot is retired, so a
+    /// queued send can retry its atomic reservation instead of polling.
+    reply_idle: tokio::sync::Notify,
     popout_create_lock: tokio::sync::Mutex<()>,
     conversation_create_lock: tokio::sync::Mutex<()>,
 }
@@ -28,6 +33,8 @@ struct ChatRunIndexes {
     pending_steering: HashMap<String, Vec<SteeringMessage>>,
     pending_follow_up: HashMap<String, Vec<SteeringMessage>>,
     pending_goal_user_queue: HashSet<String>,
+    auto_compact_failures: HashMap<String, u32>,
+    context_measurements: HashMap<String, LiveContextMeasurement>,
 }
 
 impl ChatRuntimeState {
@@ -62,9 +69,14 @@ impl ChatRuntimeState {
         run_id: &str,
         generation: u64,
     ) {
-        let mut indexes = self.indexes();
-        retire_generation(&mut indexes, conversation_id, generation);
-        retire_reply(&mut indexes, conversation_id, run_id);
+        let idle = {
+            let mut indexes = self.indexes();
+            retire_generation(&mut indexes, conversation_id, generation);
+            retire_reply(&mut indexes, conversation_id, run_id)
+        };
+        if idle {
+            self.reply_idle.notify_waiters();
+        }
     }
 
     pub(crate) fn is_generation_active(&self, conversation_id: &str, generation: u64) -> bool {
@@ -151,12 +163,186 @@ impl ChatRuntimeState {
     }
 
     pub(crate) fn forget_conversation(&self, conversation_id: &str) {
+        {
+            let mut indexes = self.indexes();
+            indexes.active_generations.remove(conversation_id);
+            indexes.active_replies.remove(conversation_id);
+            indexes.pending_steering.remove(conversation_id);
+            indexes.pending_follow_up.remove(conversation_id);
+            indexes.pending_goal_user_queue.remove(conversation_id);
+            indexes.auto_compact_failures.remove(conversation_id);
+            indexes.context_measurements.remove(conversation_id);
+        }
+        self.reply_idle.notify_waiters();
+    }
+
+    pub(crate) fn context_measurement(&self, conversation_id: &str) -> Option<LiveContextMeasurement> {
+        self.indexes()
+            .context_measurements
+            .get(conversation_id)
+            .cloned()
+    }
+
+    /// Raise the stored floor to the persisted snapshot. Never lowers a newer in-memory report.
+    /// An empty slot copies the disk measurement so a refresh cannot hide a valid report.
+    pub(crate) fn seed_context_measurement(
+        &self,
+        conversation_id: &str,
+        lifecycle_id: u64,
+        seq: u64,
+        stored: Option<&crate::chat::types::ContextRequestMeasurement>,
+    ) {
         let mut indexes = self.indexes();
-        indexes.active_generations.remove(conversation_id);
-        indexes.active_replies.remove(conversation_id);
-        indexes.pending_steering.remove(conversation_id);
-        indexes.pending_follow_up.remove(conversation_id);
-        indexes.pending_goal_user_queue.remove(conversation_id);
+        let slot = indexes
+            .context_measurements
+            .entry(conversation_id.to_string())
+            .or_default();
+        if lifecycle_id > slot.lifecycle_id {
+            *slot = Default::default();
+            slot.lifecycle_id = lifecycle_id;
+        }
+        if slot.request_id.is_empty() && slot.seq <= seq {
+            slot.seq = seq;
+            slot.lifecycle_id = lifecycle_id;
+            if let Some(stored) = stored.filter(|stored| {
+                stored.lifecycle_id == lifecycle_id && stored.seq == seq
+            }) {
+                slot.provider_id = stored.provider_id.clone();
+                slot.model = stored.model.clone();
+                slot.reported_tokens = stored.reported_tokens;
+                slot.segments = stored.segments.clone();
+                slot.categories_published = true;
+            }
+        }
+    }
+
+    pub(crate) fn bind_prepared_context(
+        &self,
+        conversation_id: &str,
+        request_id: &str,
+        message_id: &str,
+        provider_id: &str,
+        model: &str,
+        segments: &[ContextUsageSegment],
+        run_cache: Option<(u64, u64)>,
+    ) -> LiveContextMeasurement {
+        let mut indexes = self.indexes();
+        let slot = indexes
+            .context_measurements
+            .entry(conversation_id.to_string())
+            .or_default();
+        let previous = slot.stored();
+        slot.last_reported = (previous.reported_tokens.is_some()
+            && previous.provider_id == provider_id
+            && previous.model == model)
+            .then_some(previous);
+        slot.seq = slot.seq.saturating_add(1);
+        slot.request_id = request_id.to_string();
+        slot.message_id = message_id.to_string();
+        slot.provider_id = provider_id.to_string();
+        slot.model = model.to_string();
+        slot.segments = segments.to_vec();
+        // Never attach an earlier request's report to newly measured material.
+        slot.reported_tokens = None;
+        slot.categories_published = false;
+        slot.report_received = false;
+        slot.run_cache = run_cache;
+        slot.clone()
+    }
+
+    /// Apply a provider report only to the request currently bound. A late report
+    /// after invalidation or a newer bind is ignored. Categories ride the first
+    /// report of the request; later deltas only move the token count.
+    pub(crate) fn report_context_tokens(
+        &self,
+        conversation_id: &str,
+        run_id: &str,
+        tokens: u64,
+    ) -> Option<(LiveContextMeasurement, bool)> {
+        let mut indexes = self.indexes();
+        let slot = indexes.context_measurements.get_mut(conversation_id)?;
+        if slot.request_id != run_id || run_id.is_empty() {
+            return None;
+        }
+        slot.seq = slot.seq.saturating_add(1);
+        slot.reported_tokens = Some(tokens);
+        slot.last_reported = None;
+        slot.report_received = true;
+        let include_segments = !slot.categories_published;
+        slot.categories_published = true;
+        Some((slot.clone(), include_segments))
+    }
+
+    /// Publish unknown only if this lifecycle has never received a valid report.
+    /// A request without usage otherwise leaves the last coherent report visible.
+    pub(crate) fn finish_unreported_context(
+        &self,
+        conversation_id: &str,
+        run_id: &str,
+    ) -> Option<LiveContextMeasurement> {
+        let mut indexes = self.indexes();
+        let slot = indexes.context_measurements.get_mut(conversation_id)?;
+        if slot.request_id != run_id || run_id.is_empty() || slot.report_received
+            || slot.stored().reported_tokens.is_some()
+        {
+            return None;
+        }
+        slot.seq = slot.seq.saturating_add(1);
+        slot.reported_tokens = None;
+        Some(slot.clone())
+    }
+
+    pub(crate) fn note_context_run_cache(
+        &self,
+        conversation_id: &str,
+        run_id: &str,
+        run_cache: Option<(u64, u64)>,
+    ) {
+        let mut indexes = self.indexes();
+        if let Some(slot) = indexes.context_measurements.get_mut(conversation_id) {
+            if !run_id.is_empty() && slot.request_id == run_id {
+                slot.run_cache = run_cache;
+            }
+        }
+    }
+
+    pub(crate) fn invalidate_context_display(&self, conversation_id: &str) -> LiveContextMeasurement {
+        let mut indexes = self.indexes();
+        let slot = indexes
+            .context_measurements
+            .entry(conversation_id.to_string())
+            .or_default();
+        slot.lifecycle_id = slot.lifecycle_id.saturating_add(1);
+        slot.seq = slot.seq.saturating_add(1);
+        slot.reported_tokens = None;
+        slot.segments.clear();
+        slot.last_reported = None;
+        slot.request_id.clear();
+        slot.message_id.clear();
+        slot.run_cache = None;
+        slot.clone()
+    }
+
+
+    /// Consecutive automatic compaction failures, kept for the life of the process like
+    /// ZCode's per-session circuit breaker.
+    pub(crate) fn auto_compact_failures(&self, conversation_id: &str) -> u32 {
+        self.indexes()
+            .auto_compact_failures
+            .get(conversation_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn set_auto_compact_failures(&self, conversation_id: &str, failures: u32) {
+        let mut indexes = self.indexes();
+        if failures == 0 {
+            indexes.auto_compact_failures.remove(conversation_id);
+        } else {
+            indexes
+                .auto_compact_failures
+                .insert(conversation_id.to_string(), failures);
+        }
     }
 
     pub(crate) fn try_begin_reply(&self, conversation_id: &str, run_id: &str) -> bool {
@@ -189,8 +375,29 @@ impl ChatRuntimeState {
     }
 
     pub(crate) fn end_reply(&self, conversation_id: &str, run_id: &str) {
-        let mut indexes = self.indexes();
-        retire_reply(&mut indexes, conversation_id, run_id);
+        let idle = {
+            let mut indexes = self.indexes();
+            retire_reply(&mut indexes, conversation_id, run_id)
+        };
+        if idle {
+            self.reply_idle.notify_waiters();
+        }
+    }
+
+    /// Waits until the conversation has no reply at all, then takes the same
+    /// atomic send reservation as `try_reserve_send`. Waiters re-check after
+    /// every idle signal, so a user send that wins the race simply queues this
+    /// one behind it again.
+    pub(crate) async fn reserve_send_when_idle(&self, conversation_id: &str, run_id: &str) {
+        loop {
+            let notified = self.reply_idle.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.try_reserve_send(conversation_id, run_id) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub(crate) async fn lock_popout_creation(&self) -> tokio::sync::MutexGuard<'_, ()> {
@@ -224,13 +431,18 @@ fn retire_generation(indexes: &mut ChatRunIndexes, conversation_id: &str, genera
     }
 }
 
-fn retire_reply(indexes: &mut ChatRunIndexes, conversation_id: &str, run_id: &str) {
+/// Returns true when this retired the conversation's last reply slot.
+fn retire_reply(indexes: &mut ChatRunIndexes, conversation_id: &str, run_id: &str) -> bool {
     if let Some(runs) = indexes.active_replies.get_mut(conversation_id) {
-        runs.remove(run_id);
+        if !runs.remove(run_id) {
+            return false;
+        }
         if runs.is_empty() {
             indexes.active_replies.remove(conversation_id);
+            return true;
         }
     }
+    false
 }
 
 #[cfg(test)]
@@ -268,6 +480,34 @@ mod tests {
         assert!(runtime.try_reserve_send("a", "send"));
     }
 
+    #[tokio::test]
+    async fn queued_send_waits_for_every_reply_then_reserves() {
+        let runtime = std::sync::Arc::new(ChatRuntimeState::default());
+        assert!(runtime.try_begin_reply("a", "run-1"));
+        assert!(runtime.try_begin_reply("a", "run-2"));
+
+        let waiter = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.reserve_send_when_idle("a", "queued").await }
+        });
+        tokio::task::yield_now().await;
+        runtime.end_reply("a", "run-1");
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished(), "one reply is still running");
+
+        runtime.end_reply("a", "run-2");
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("idle signal must wake the queued send")
+            .unwrap();
+        assert!(
+            !runtime.try_reserve_send("a", "user"),
+            "queued send now owns the conversation"
+        );
+        runtime.end_reply("a", "queued");
+        assert!(runtime.try_reserve_send("a", "user"));
+    }
+
     #[test]
     fn forget_clears_only_one_conversation_runtime() {
         let runtime = ChatRuntimeState::default();
@@ -275,13 +515,19 @@ mod tests {
         let b = runtime.begin_generation("b");
         assert!(runtime.try_begin_reply("a", "run-a"));
         runtime.set_goal_user_queue_pending("a", true);
+        runtime.set_auto_compact_failures("a", 3);
+        runtime.set_auto_compact_failures("b", 2);
 
         runtime.forget_conversation("a");
 
         assert!(!runtime.is_generation_active("a", a));
         assert!(!runtime.has_active_reply("a"));
         assert!(!runtime.has_goal_user_queue_pending("a"));
+        assert_eq!(runtime.auto_compact_failures("a"), 0);
         assert!(runtime.is_generation_active("b", b));
+        assert_eq!(runtime.auto_compact_failures("b"), 2);
+        runtime.set_auto_compact_failures("b", 0);
+        assert_eq!(runtime.auto_compact_failures("b"), 0);
     }
 
     #[test]
@@ -346,5 +592,20 @@ mod tests {
         assert!(!runtime.has_active_reply("conversation"));
         assert!(!runtime.has_pending_input("conversation"));
         assert!(runtime.try_reserve_send("conversation", "next"));
+    }
+
+    #[test]
+    fn late_cache_report_cannot_overwrite_new_branch_request() {
+        let runtime = ChatRuntimeState::default();
+        runtime.bind_prepared_context("conversation", "old", "first", "openai", "gpt-4o", &[], Some((100, 90)));
+        runtime.invalidate_context_display("conversation");
+        runtime.bind_prepared_context("conversation", "new", "second", "openai", "gpt-4o", &[], Some((100, 10)));
+        // This callback belongs to the old run, which has already lost ownership.
+        runtime.note_context_run_cache("conversation", "old", Some((100, 90)));
+        let (reported, _) = runtime.report_context_tokens("conversation", "new", 7_100).unwrap();
+        assert_eq!(reported.run_cache, Some((100, 10)));
+        runtime.note_context_run_cache("conversation", "new", Some((200, 30)));
+        let (reported, _) = runtime.report_context_tokens("conversation", "new", 8_000).unwrap();
+        assert_eq!(reported.run_cache, Some((200, 30)));
     }
 }

@@ -103,36 +103,35 @@ impl OpenAiChatProvider<'_> {
         stream: bool,
         label: &str,
     ) -> Result<reqwest::Response, String> {
-        let anonymous = self.provider.is_opencode_free();
         if crate::chat::video::has_video(request) {
             crate::chat::video::validate_request(self.provider, request)
                 .map_err(|e| e.to_string())?;
             crate::chat::video::validate_body(body).map_err(|e| e.to_string())?;
         }
-        if anonymous && !crate::opencode_free::is_free_model(&request.model) {
+        if self.provider.is_opencode_free() && !crate::opencode_free::is_free_model(&request.model) {
             return Err("OpenCode Free only supports free models; refresh the model list".into());
         }
-        let keys = if anonymous {
-            vec![String::new()]
-        } else {
-            self.provider.api_keys.clone()
-        };
         send_with_failover(
             self.state,
             label,
             self.retry_attempts,
             &self.provider.id,
-            &keys,
+            &self.provider.api_keys,
             |key| {
                 let req = self
                     .state
                     .client_for(self.provider)
                     .post(self.chat_completions_url());
-                let req = if anonymous { req } else { req.bearer_auth(key) };
+                let req = crate::provider_request::apply_api_key_auth(
+                    req,
+                    crate::settings::ProviderApiFormat::OpenAiChat,
+                    key,
+                );
                 let req = crate::api::attach_json_body(
                     self.with_session_headers(
                         req.header(ACCEPT_ENCODING, "identity"),
                         &request.metadata,
+                        stream,
                     ),
                     body,
                     self.provider.compress_request_body,
@@ -256,7 +255,13 @@ impl OpenAiChatProvider<'_> {
         let mut images: Vec<GeneratedImageData> = Vec::new();
 
         loop {
-            let chunk = response.chunk().await.map_err(|err| {
+            let chunk_result = response.chunk().await;
+            // finish_reason commits this model response. Losing the optional
+            // usage/DONE tail must not replay an already completed request.
+            if chunk_result.is_err() && finish_reason.is_some() {
+                break;
+            }
+            let chunk = chunk_result.map_err(|err| {
                 let model_error = stream_read_error(&label, &err);
                 self.record_usage_failure(
                     &request,
@@ -330,7 +335,20 @@ impl OpenAiChatProvider<'_> {
                     Ok(value) => value,
                     Err(_) => continue,
                 };
+                if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
+                    let message = format!("{label} stream error: {error}");
+                    sink.emit(StreamPart::Error {
+                        message: message.clone(),
+                    })?;
+                    return Err(ModelError::provider_stream_error(message));
+                }
                 if let Some(next_usage) = model_usage_from_stream_value(&value) {
+                    if let Some(input_tokens) = next_usage.input_tokens {
+                        sink.emit(StreamPart::ContextUsage {
+                            input_tokens,
+                            output_tokens: next_usage.output_tokens.unwrap_or(0),
+                        })?;
+                    }
                     usage = Some(next_usage);
                 }
                 if let Some(reason) = openai_stream_finish_reason(&value) {
@@ -361,6 +379,25 @@ impl OpenAiChatProvider<'_> {
             }
         }
 
+        if finish_reason.is_none() {
+            let err = ModelError::stream_ended_early(&label);
+            self.record_usage_failure(
+                &request,
+                &label,
+                started_at,
+                started.elapsed(),
+                &err.to_string(),
+            );
+            self.record_debug_failure(
+                &request,
+                &label,
+                true,
+                &err.to_string(),
+                started_at,
+                started.elapsed(),
+            );
+            return Err(err);
+        }
         let tool_calls = finish_tool_call_partials(&mut tool_partials, sink)?;
         let reason = finish_reason.unwrap_or_else(|| "done".to_string());
         sink.emit(StreamPart::Finish {
@@ -405,40 +442,33 @@ impl OpenAiChatProvider<'_> {
         )
     }
 
-    /// 会话亲和头（对齐 opencode）：同一对话每轮带同一 id。会话亲和型代理据此把请求
-    /// 稳定路由到同一上游会话（不再靠前缀指纹猜，杜绝串台/复用脏会话）；正经 provider
-    /// 忽略未知头，无副作用。发送与请求调试记录共用 `session_header_pairs`，杜绝漂移。
-    /// 供应商「请求配置」里的 CLI 身份头与自定义头也在这里叠上（同名时自定义优先）。
+    /// 会话亲和头 + 供应商「请求配置」的 CLI 身份头 / 自定义头 + 缺省 UA / Accept，
+    /// 由 `provider_request::model_header_pairs` 统一装配（同名只留一条，自定义优先）。
     fn with_session_headers(
         &self,
         request: reqwest::RequestBuilder,
         metadata: &crate::chat::model::RequestMetadata,
+        stream: bool,
     ) -> reqwest::RequestBuilder {
-        // 先把会话头与请求配置的头合成一份「同名只留一条」的清单再贴：reqwest 的
-        // `.header()` 是 append，分两轮贴会让用户自定义的 x-session-id 与我们自己的并存。
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        for (name, value) in session_header_pairs(metadata) {
-            crate::provider_request::upsert_pair(&mut pairs, name.to_string(), value);
-        }
-        for (name, value) in crate::provider_request::header_pairs(
+        let mut request = request;
+        for (name, value) in crate::provider_request::model_header_pairs(
             self.provider,
             metadata.conversation_id.as_deref(),
+            true,
+            stream,
         ) {
-            crate::provider_request::upsert_pair(&mut pairs, name, value);
-        }
-        let mut request = request;
-        for (name, value) in pairs {
             request = request.header(name, value);
         }
         request
     }
 
     /// 重建本次请求实际会带的 headers（脱敏后）供请求调试面板展示。静态头（Authorization/
-    /// Accept-Encoding/Content-Type）与发送路径一一对应；动态会话头共用 `session_header_pairs`，
-    /// 故与真实发送零漂移。Authorization 用首个 key（正常发送用的也是它）派生脱敏预览。
+    /// Accept-Encoding/Content-Type）与发送路径一一对应；其余头与发送路径共用
+    /// `model_header_pairs`，故与真实发送零漂移。Authorization 用首个 key 派生脱敏预览。
     fn debug_request_headers(
         &self,
         metadata: &crate::chat::model::RequestMetadata,
+        stream: bool,
     ) -> std::collections::BTreeMap<String, String> {
         let mut headers = std::collections::BTreeMap::new();
         if let Some(key) = self.provider.preferred_api_key() {
@@ -446,20 +476,12 @@ impl OpenAiChatProvider<'_> {
         }
         headers.insert("Accept-Encoding".to_string(), "identity".to_string());
         headers.insert("Content-Type".to_string(), "application/json".to_string());
-        // 先按大小写不敏感合成一份，再折进 BTreeMap。BTreeMap 的 key 是大小写敏感的：
-        // 用户把自定义头写成 `X-Session-Id`（不在保留名单里，允许覆盖）时，发送路径会
-        // upsert 成一条，直接往 map 里塞会显示成两条——正是本模块要杜绝的那种不一致。
-        let mut pairs: Vec<(String, String)> = Vec::new();
-        for (name, value) in session_header_pairs(metadata) {
-            crate::provider_request::upsert_pair(&mut pairs, name.to_string(), value);
-        }
-        for (name, value) in crate::provider_request::header_pairs(
+        for (name, value) in crate::provider_request::model_header_pairs(
             self.provider,
             metadata.conversation_id.as_deref(),
+            true,
+            stream,
         ) {
-            crate::provider_request::upsert_pair(&mut pairs, name, value);
-        }
-        for (name, value) in pairs {
             headers.insert(name, value);
         }
         crate::chat::request_debug::sanitize_headers(headers)
@@ -487,7 +509,7 @@ impl OpenAiChatProvider<'_> {
                 duration_ms: duration.as_millis() as u64,
                 status: "success",
                 url: self.chat_completions_url(),
-                headers: self.debug_request_headers(&request.metadata),
+                headers: self.debug_request_headers(&request.metadata, stream),
                 body: self.request_body(request, stream),
                 stream,
                 response: crate::chat::request_debug::RequestDebugResponse::from_output(
@@ -521,7 +543,7 @@ impl OpenAiChatProvider<'_> {
                 duration_ms: duration.as_millis() as u64,
                 status: "error",
                 url: self.chat_completions_url(),
-                headers: self.debug_request_headers(&request.metadata),
+                headers: self.debug_request_headers(&request.metadata, stream),
                 body: self.request_body(request, stream),
                 stream,
                 response: crate::chat::request_debug::RequestDebugResponse::from_error(
@@ -600,14 +622,24 @@ impl OpenAiChatProvider<'_> {
         //   （其 reasoning_effort 只认 low/high/max，没有 none）。开思考也显式
         //   `enabled`：官方样例都带；省略目前靠默认 enabled，默认一旦改掉就会
         //   和 GPT 没要 summary 一样空等无思维链。
+        // - Hyper 的 DeepSeek 也使用原生开关；实测 none 仍返回 reasoning_content。
         // - 其余 OpenAI 兼容端（含代理 / OpenAI 自家）：`reasoning_effort: "none"`。
+        let model_id = request.model.to_ascii_lowercase();
+        let model_id = model_id.rsplit('/').next().unwrap_or(&model_id);
+        let kimi_always_on = model_id.starts_with("kimi-k3") || model_id.starts_with("kimi-k2.7");
+        let native_thinking_switch =
+            (utils::provider_supports_thinking_field(&self.provider.base_url) && !kimi_always_on)
+                || (model_id.starts_with("deepseek-")
+                    && reqwest::Url::parse(&self.provider.base_url)
+                        .ok()
+                        .is_some_and(|url| url.host_str() == Some("hyper.charm.land")));
         if !request.options.thinking_enabled {
-            if utils::provider_supports_thinking_field(&self.provider.base_url) {
+            if native_thinking_switch {
                 body["thinking"] = serde_json::json!({ "type": "disabled" });
             } else {
                 body["reasoning_effort"] = Value::String("none".to_string());
             }
-        } else if utils::provider_supports_thinking_field(&self.provider.base_url) {
+        } else if native_thinking_switch {
             body["thinking"] = serde_json::json!({ "type": "enabled" });
         }
         // 思考等级 → OpenAI Chat `reasoning_effort`，原样下发（档位由模型库 reasoningEfforts 门控）。
@@ -769,24 +801,6 @@ fn request_label(request: &GenerateRequest, fallback: &str) -> String {
         .is_empty()
         .then(|| fallback.to_string())
         .unwrap_or_else(|| request.metadata.label.clone())
-}
-
-/// 会话亲和头键值对。发送路径（`with_session_headers`）与请求调试记录
-/// （`debug_request_headers`）共用此单一来源，保证记录的头与真实发送零漂移。
-fn session_header_pairs(
-    metadata: &crate::chat::model::RequestMetadata,
-) -> Vec<(&'static str, String)> {
-    match metadata
-        .conversation_id
-        .as_deref()
-        .filter(|id| !id.is_empty())
-    {
-        Some(id) => vec![
-            ("x-session-id", id.to_string()),
-            ("x-session-affinity", id.to_string()),
-        ],
-        None => Vec::new(),
-    }
 }
 
 fn invalid_response(label: &str, raw: &str) -> ModelError {
@@ -1350,6 +1364,15 @@ mod tests {
         thinking_enabled: bool,
         base_url: &str,
     ) -> Value {
+        build_openai_model_body(thinking_level, thinking_enabled, base_url, "gpt-5")
+    }
+
+    fn build_openai_model_body(
+        thinking_level: Option<&str>,
+        thinking_enabled: bool,
+        base_url: &str,
+        model: &str,
+    ) -> Value {
         let state =
             AppState::new_headless(crate::settings::Settings::default(), std::env::temp_dir());
         let provider = ModelProvider {
@@ -1369,7 +1392,7 @@ mod tests {
         };
         let adapter = OpenAiChatProvider::new(&state, &provider, 1);
         let request = GenerateRequest {
-            model: "gpt-5".into(),
+            model: model.into(),
             system: "sys".into(),
             messages: vec![ModelMessage {
                 role: ModelRole::User,
@@ -1463,6 +1486,20 @@ mod tests {
     }
 
     #[test]
+    fn hyper_deepseek_uses_native_thinking_switch() {
+        let base = "https://hyper.charm.land/v1";
+        let off = build_openai_model_body(None, false, base, "deepseek-v4-flash");
+        assert_eq!(off["thinking"]["type"], "disabled", "body: {off}");
+        assert!(off.get("reasoning_effort").is_none(), "body: {off}");
+        let on = build_openai_model_body(Some("high"), true, base, "deepseek-v4-flash");
+        assert_eq!(on["thinking"]["type"], "enabled", "body: {on}");
+        assert_eq!(on["reasoning_effort"], "high", "body: {on}");
+        let other = build_openai_model_body(None, false, base, "gpt-5");
+        assert_eq!(other["reasoning_effort"], "none", "body: {other}");
+        assert!(other.get("thinking").is_none(), "body: {other}");
+    }
+
+    #[test]
     fn thinking_off_uses_thinking_disabled_on_deepseek_and_kimi() {
         // DeepSeek / Kimi 官方 Chat Completions：开关是 thinking.type，不是
         // reasoning_effort:"none"（官方 schema 的 effort 只有 low/high/max）。
@@ -1476,6 +1513,19 @@ mod tests {
         let kimi = build_openai_body_with(None, false, "https://api.moonshot.cn/v1");
         assert_eq!(kimi["thinking"]["type"], "disabled", "body: {kimi}");
         assert!(kimi.get("reasoning_effort").is_none(), "body: {kimi}");
+    }
+
+    #[test]
+    fn kimi_international_endpoint_respects_model_thinking_contract() {
+        let base = "https://api.moonshot.ai/v1";
+        let off = build_openai_model_body(None, false, base, "kimi-k2.6");
+        assert_eq!(off["thinking"]["type"], "disabled", "body: {off}");
+        assert!(off.get("reasoning_effort").is_none());
+        let k3 = build_openai_model_body(Some("low"), true, base, "kimi-k3");
+        assert!(k3.get("thinking").is_none(), "body: {k3}");
+        assert_eq!(k3["reasoning_effort"], "low");
+        let code = build_openai_model_body(None, true, base, "kimi-k2.7-code");
+        assert!(code.get("thinking").is_none(), "body: {code}");
     }
 
     #[test]

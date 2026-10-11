@@ -18,6 +18,7 @@ mod image_prep;
 pub(crate) mod interaction_state;
 pub mod knowledge_base;
 mod mcp_image_feedback;
+pub mod media_station;
 pub mod memory;
 pub mod model;
 pub mod model_metadata;
@@ -33,12 +34,14 @@ pub mod repository;
 pub mod request_debug;
 pub(crate) mod route_contract;
 pub(crate) mod runtime_state;
+pub(crate) mod slash_commands;
 pub mod storage;
 pub mod sub_agent;
 pub mod todo;
 pub mod types;
 pub(crate) mod video;
 mod video_analysis;
+pub(crate) mod video_generation;
 mod vision;
 pub mod workflow_hooks;
 
@@ -50,12 +53,12 @@ pub use types::*;
 // 结果」的调用统一用 `chat::agent::planning::call_chat_completion_message_streamed`
 // （或要 usage/引用时用 `call_chat_completion_output_with_usage`，它内部也已走流式）。
 
-pub(crate) fn format_chat_missing_api_key_error(provider_name: &str) -> String {
+pub(crate) fn format_chat_login_required_error(provider_name: &str) -> String {
     let provider = provider_name.trim();
     if provider.is_empty() {
-        "Chat 模型供应商缺少 API Key，请到设置 > 模型中填写后再发送。".to_string()
+        "Chat 模型供应商需要账号登录，请到设置 > 模型中登录后再发送。".to_string()
     } else {
-        format!("Chat 模型供应商「{provider}」缺少 API Key，请到设置 > 模型中填写后再发送。")
+        format!("Chat 模型供应商「{provider}」需要账号登录，请到设置 > 模型中登录后再发送。")
     }
 }
 

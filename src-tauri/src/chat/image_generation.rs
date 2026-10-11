@@ -62,6 +62,12 @@ pub(crate) struct InputImage {
     base64: String,
 }
 
+impl InputImage {
+    pub(crate) fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.mime_type, self.base64)
+    }
+}
+
 struct GeneratedImage {
     mime_type: String,
     base64: String,
@@ -408,12 +414,6 @@ fn validate_provider(provider: &ModelProvider) -> Result<(), String> {
             return Err("Mixer image generation requires an OpenAI-compatible provider".to_string())
         }
     }
-    if !provider.has_credentials() {
-        return Err(format!(
-            "Image generation provider `{}` has no API key configured",
-            provider.name
-        ));
-    }
     Ok(())
 }
 
@@ -447,7 +447,11 @@ async fn generate_with_images_api(
         &provider.api_keys,
         |key| {
             crate::provider_request::apply(
-                state.client_for(provider).post(&url).bearer_auth(key),
+                crate::provider_request::apply_api_key_auth(
+                    state.client_for(provider).post(&url),
+                    crate::settings::ProviderApiFormat::OpenAiChat,
+                    key,
+                ),
                 provider,
                 None,
             )
@@ -491,7 +495,11 @@ async fn generate_with_images_edits(
             &provider.api_keys,
             |key| {
                 crate::provider_request::apply(
-                    state.client_for(provider).post(&url).bearer_auth(key),
+                    crate::provider_request::apply_api_key_auth(
+                        state.client_for(provider).post(&url),
+                        crate::settings::ProviderApiFormat::OpenAiChat,
+                        key,
+                    ),
                     provider,
                     None,
                 )
@@ -548,7 +556,11 @@ async fn post_images_json(
         &provider.api_keys,
         |key| {
             crate::provider_request::apply(
-                state.client_for(provider).post(url).bearer_auth(key),
+                crate::provider_request::apply_api_key_auth(
+                    state.client_for(provider).post(url),
+                    crate::settings::ProviderApiFormat::OpenAiChat,
+                    key,
+                ),
                 provider,
                 None,
             )
@@ -690,7 +702,11 @@ async fn generate_with_openrouter_chat(
         &provider.api_keys,
         |key| {
             crate::provider_request::apply(
-                state.client_for(provider).post(&url).bearer_auth(key),
+                crate::provider_request::apply_api_key_auth(
+                    state.client_for(provider).post(&url),
+                    crate::settings::ProviderApiFormat::OpenAiChat,
+                    key,
+                ),
                 provider,
                 None,
             )
@@ -781,10 +797,11 @@ async fn generate_with_gemini_native(
             &provider.api_keys,
             |key| {
                 crate::provider_request::apply(
-                    state
-                        .client_for(provider)
-                        .post(&url)
-                        .header("x-goog-api-key", key),
+                    crate::provider_request::apply_api_key_auth(
+                        state.client_for(provider).post(&url),
+                        crate::settings::ProviderApiFormat::Gemini,
+                        key,
+                    ),
                     provider,
                     None,
                 )
@@ -1650,7 +1667,7 @@ fn collect_mixer_input_images(
     drafts: &[crate::chat::ChatMessage],
     arguments: &Value,
 ) -> Result<Vec<InputImage>, String> {
-    let artifact_ids = string_list_arg(arguments, "artifact_ids");
+    let artifact_ids = crate::chat::artifacts::input_artifact_ids(arguments)?;
     let paths = string_list_arg(arguments, "paths");
     let mut images = Vec::new();
     let mut missing = Vec::new();
